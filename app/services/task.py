@@ -225,6 +225,17 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         logger.info("\n\n## correcting subtitle")
         subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
 
+    try:
+        from app.custom.subtitle_optimizer import optimize_srt_file
+
+        optimize_result = optimize_srt_file(
+            subtitle_path=subtitle_path,
+            aspect=getattr(params, "video_aspect", "9:16"),
+        )
+        logger.info(f"subtitle optimizer result: {optimize_result}")
+    except Exception as exc:
+        logger.warning(f"subtitle optimizer skipped: {str(exc)}")
+
     subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
     if not subtitle_lines:
         logger.warning(f"subtitle file is invalid: {subtitle_path}")
