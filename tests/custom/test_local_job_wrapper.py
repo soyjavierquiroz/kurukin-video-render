@@ -48,6 +48,12 @@ def make_spec(asset_files=None):
     }
 
 
+def make_preset_spec():
+    spec = make_spec()
+    spec["subtitle_style_preset"] = "clean_center_bold"
+    return spec
+
+
 class TestLocalJobWrapper(unittest.TestCase):
     def write_spec(self, directory, spec):
         spec_path = Path(directory) / "job.json"
@@ -60,6 +66,13 @@ class TestLocalJobWrapper(unittest.TestCase):
         for filename in filenames:
             (assets_dir / filename).write_text("dummy", encoding="utf-8")
         return assets_dir
+
+    def write_fonts(self, directory, filenames):
+        fonts_dir = Path(directory) / "fonts"
+        fonts_dir.mkdir()
+        for filename in filenames:
+            (fonts_dir / filename).write_text("dummy", encoding="utf-8")
+        return fonts_dir
 
     def test_build_pending_job_generates_local_materials(self):
         spec = make_spec()
@@ -79,6 +92,47 @@ class TestLocalJobWrapper(unittest.TestCase):
             ],
         )
         self.assertNotIn("selectedAssets", pending_job)
+
+    def test_build_pending_job_applies_clean_center_bold_preset(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fonts_dir = self.write_fonts(tmp_dir, ["BeVietnamPro-Bold.ttf"])
+            spec = make_preset_spec()
+            ordered_assets = [
+                {"file": "clip-01.mp4", "label": "intro", "order": 1},
+                {"file": "clip-02.mp4", "label": "support", "order": 2},
+            ]
+
+            pending_job = local_job_wrapper.build_pending_job(
+                spec,
+                ordered_assets,
+                fonts_dir=fonts_dir,
+            )
+
+        self.assertFalse(pending_job["text_background_color"])
+        self.assertEqual(pending_job["subtitle_position"], "center")
+        self.assertEqual(pending_job["stroke_width"], 3)
+        self.assertEqual(pending_job["font_name"], "BeVietnamPro-Bold.ttf")
+        self.assertIn("resolved_subtitle_style", pending_job["runner"])
+        self.assertEqual(
+            pending_job["runner"]["resolved_subtitle_style"]["font_name"],
+            "BeVietnamPro-Bold.ttf",
+        )
+        self.assertNotIn("subtitle_style_preset", pending_job)
+        self.assertNotIn("subtitle_style_overrides", pending_job)
+
+    def test_build_pending_job_without_preset_keeps_previous_subtitle_values(self):
+        spec = make_spec()
+        ordered_assets = [
+            {"file": "clip-01.mp4", "label": "intro", "order": 1},
+            {"file": "clip-02.mp4", "label": "support", "order": 2},
+        ]
+
+        pending_job = local_job_wrapper.build_pending_job(spec, ordered_assets)
+
+        self.assertEqual(pending_job["subtitle_position"], "bottom")
+        self.assertEqual(pending_job["font_size"], 60)
+        self.assertEqual(pending_job["stroke_width"], 1.5)
+        self.assertNotIn("resolved_subtitle_style", pending_job["runner"])
 
     def test_selected_assets_are_ordered_by_order(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

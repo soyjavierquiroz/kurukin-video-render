@@ -14,9 +14,15 @@ import sys
 import time
 from typing import Any
 
+try:
+    from scripts import subtitle_style_presets
+except ImportError:  # pragma: no cover - used when executed as scripts/local_job_wrapper.py
+    import subtitle_style_presets  # type: ignore
+
 
 DEFAULT_QUEUE_DIR = "/opt/moneyprinterturbo/storage/nightly_jobs"
 DEFAULT_LOCAL_VIDEOS_DIR = "/opt/moneyprinterturbo/storage/local_videos"
+DEFAULT_FONTS_DIR = "/opt/moneyprinterturbo/resource/fonts"
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png"}
 ALLOWED_VIDEO_ASPECTS = {"9:16", "16:9"}
 
@@ -210,10 +216,28 @@ def validate_job_spec(
 def build_pending_job(
     spec: dict[str, Any],
     ordered_assets: list[dict[str, Any]],
+    fonts_dir: str | Path = DEFAULT_FONTS_DIR,
 ) -> dict[str, Any]:
     video = spec.get("video")
     if not isinstance(video, dict):
         raise LocalJobWrapperError("video is required and must be a JSON object")
+
+    preset_requested = spec.get("subtitle_style_preset")
+    overrides_requested = spec.get("subtitle_style_overrides")
+    try:
+        resolved_preset, normalized_overrides, resolved_style = (
+            subtitle_style_presets.resolve_subtitle_style(
+                preset_requested,
+                overrides_requested,
+                fonts_dir=fonts_dir,
+            )
+        )
+    except subtitle_style_presets.SubtitleStylePresetError as exc:
+        raise LocalJobWrapperError(str(exc)) from exc
+
+    styled_video = dict(video)
+    if resolved_style:
+        styled_video.update(resolved_style)
 
     pending_job: dict[str, Any] = {}
     job_id = spec.get("job_id")
@@ -227,7 +251,12 @@ def build_pending_job(
         "source": "local_job_wrapper",
         "selectedAssets": ordered_assets,
     }
-    pending_job.update(video)
+    if preset_requested is not None or overrides_requested is not None:
+        pending_job["runner"]["subtitle_style_preset"] = resolved_preset
+        pending_job["runner"]["subtitle_style_overrides"] = normalized_overrides
+        pending_job["runner"]["resolved_subtitle_style"] = resolved_style or {}
+
+    pending_job.update(styled_video)
     pending_job["video_source"] = "local"
     pending_job["video_materials"] = [
         {
@@ -238,6 +267,8 @@ def build_pending_job(
         for asset in ordered_assets
     ]
     pending_job.pop("selectedAssets", None)
+    pending_job.pop("subtitle_style_preset", None)
+    pending_job.pop("subtitle_style_overrides", None)
     return pending_job
 
 
@@ -305,6 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--print-payload", action="store_true")
     parser.add_argument("--queue-dir", default=DEFAULT_QUEUE_DIR)
     parser.add_argument("--local-videos-dir", default=DEFAULT_LOCAL_VIDEOS_DIR)
+    parser.add_argument("--fonts-dir", default=DEFAULT_FONTS_DIR)
     parser.add_argument("--min-width", default=480, type=positive_int)
     parser.add_argument("--min-height", default=480, type=positive_int)
     parser.add_argument("--skip-media-probe", action="store_true")
@@ -322,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             min_height=args.min_height,
             skip_media_probe=args.skip_media_probe,
         )
-        pending_job = build_pending_job(spec, ordered_assets)
+        pending_job = build_pending_job(spec, ordered_assets, fonts_dir=args.fonts_dir)
 
         if args.print_payload:
             json.dump(pending_job, sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
