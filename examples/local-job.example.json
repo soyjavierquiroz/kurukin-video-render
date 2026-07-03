@@ -1,6 +1,7 @@
 {
   "job_id": "relaciones-local-demo-001",
   "description": "Demo usando assets locales seleccionados",
+  "subtitle_style_preset": "clean_center_bold",
   "selectedAssets": [
     {
       "file": "clip-01.mp4",
