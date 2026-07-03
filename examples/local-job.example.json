@@ -1,0 +1,37 @@
+{
+  "job_id": "relaciones-local-demo-001",
+  "description": "Demo usando assets locales seleccionados",
+  "selectedAssets": [
+    {
+      "file": "clip-01.mp4",
+      "label": "intro",
+      "order": 1
+    },
+    {
+      "file": "clip-02.mp4",
+      "label": "support",
+      "order": 2
+    }
+  ],
+  "video": {
+    "video_subject": "La importancia de escoger bien a tu pareja",
+    "video_script": "Escoger bien a tu pareja puede cambiar por completo el rumbo de tu vida.",
+    "video_aspect": "9:16",
+    "video_concat_mode": "sequential",
+    "video_transition_mode": "None",
+    "video_clip_duration": 3,
+    "video_count": 1,
+    "voice_name": "es-MX-DaliaNeural-Female",
+    "voice_volume": 1.0,
+    "voice_rate": 1.0,
+    "bgm_type": "none",
+    "bgm_volume": 0.2,
+    "subtitle_enabled": true,
+    "subtitle_position": "bottom",
+    "font_size": 60,
+    "stroke_color": "#000000",
+    "stroke_width": 1.5,
+    "n_threads": 2,
+    "paragraph_number": 1
+  }
+}
