@@ -1,0 +1,18 @@
+{
+  "job_id": "kurukin-nightly-example",
+  "video_subject": "Tres ideas simples para ahorrar energia en casa",
+  "video_script": "Ahorrar energia no tiene que ser complicado. Apaga las luces que no uses, desconecta cargadores cuando terminen su trabajo y aprovecha la luz natural durante el dia. Pequenos habitos diarios pueden reducir el consumo y hacer tu casa mas eficiente.",
+  "video_terms": [
+    "energy saving home",
+    "natural light apartment",
+    "turning off lights"
+  ],
+  "video_aspect": "9:16",
+  "video_source": "pexels",
+  "voice_name": "es-MX-DaliaNeural-Female",
+  "bgm_type": "none",
+  "subtitle_enabled": true,
+  "subtitle_position": "bottom",
+  "font_size": 60,
+  "n_threads": 2
+}
