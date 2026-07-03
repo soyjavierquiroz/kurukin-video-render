@@ -17,8 +17,11 @@ services:
         "--server.showEmailPrompt=False"
       ]
     volumes:
-      - ./config.toml:/MoneyPrinterTurbo/config.toml
+      - ./config.toml:/MoneyPrinterTurbo/config.toml:ro
+      - ./app:/MoneyPrinterTurbo/app:ro
       - ./storage:/MoneyPrinterTurbo/storage
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
     restart: unless-stopped
 
   api:
@@ -28,6 +31,9 @@ services:
       - "127.0.0.1:18080:8080"
     command: ["python3", "main.py"]
     volumes:
-      - ./config.toml:/MoneyPrinterTurbo/config.toml
+      - ./config.toml:/MoneyPrinterTurbo/config.toml:ro
+      - ./app:/MoneyPrinterTurbo/app:ro
       - ./storage:/MoneyPrinterTurbo/storage
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
     restart: unless-stopped
