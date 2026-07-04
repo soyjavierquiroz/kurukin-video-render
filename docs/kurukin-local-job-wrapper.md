@@ -30,6 +30,8 @@ Encolar en otra cola o validar contra otra carpeta de assets:
 ```bash
 python3 scripts/local_job_wrapper.py examples/local-job.example.json --enqueue --queue-dir storage/nightly_jobs
 python3 scripts/local_job_wrapper.py examples/local-job.example.json --enqueue --local-videos-dir storage/local_videos
+python3 scripts/local_job_wrapper.py examples/local-job.example.json --enqueue --local-audios-dir storage/local_audios
+python3 scripts/local_job_wrapper.py examples/local-job.example.json --enqueue --local-subtitles-dir storage/local_subtitles
 python3 scripts/local_job_wrapper.py examples/local-job.example.json --enqueue --fonts-dir resource/fonts
 ```
 
@@ -47,6 +49,10 @@ El JSON debe ser un objeto con:
 - `description`: string opcional.
 - `selectedAssets`: lista no vacia de objetos con `file`; `label` y `order` son
   metadatos opcionales.
+- `audio`: objeto opcional. `audio.file` apunta a un archivo dentro de
+  `storage/local_audios` o de `--local-audios-dir`.
+- `subtitles`: objeto opcional. `subtitles.mode` acepta `whisper`,
+  `custom_srt` o `none`.
 - `video`: objeto con la configuracion MoneyPrinterTurbo. `video_subject`,
   `video_script` y `video_aspect` son requeridos.
 - `subtitle_style_preset`: string opcional para aplicar un look de subtitulos.
@@ -55,6 +61,99 @@ El JSON debe ser un objeto con:
 
 `selectedAssets` se ordena por `order` cuando existe. Si ningun asset tiene
 `order`, se mantiene el orden original.
+
+## Audio y subtitulos propios
+
+El wrapper soporta audio propio como contrato formal sin cambiar el rol de
+MoneyPrinterTurbo: sigue siendo el render worker. Por defecto busca:
+
+- Videos en `storage/local_videos`.
+- Audios en `storage/local_audios`.
+- Subtitulos SRT en `storage/local_subtitles`.
+
+Ejemplo con audio propio y Whisper real sin correccion contra `video_script`:
+
+```json
+{
+  "audio": { "file": "audio-prueba.mp3" },
+  "subtitles": {
+    "mode": "whisper",
+    "correction_enabled": false,
+    "optimize": true
+  },
+  "video": {}
+}
+```
+
+Ejemplo con SRT propio optimizado para vertical:
+
+```json
+{
+  "audio": { "file": "audio-prueba.mp3" },
+  "subtitles": {
+    "mode": "custom_srt",
+    "file": "audio-prueba.srt",
+    "optimize": true
+  },
+  "video": {}
+}
+```
+
+Ejemplo con SRT propio literal:
+
+```json
+{
+  "audio": { "file": "audio-prueba.mp3" },
+  "subtitles": {
+    "mode": "custom_srt",
+    "file": "audio-prueba.srt",
+    "optimize": false
+  },
+  "video": {}
+}
+```
+
+Ejemplo sin subtitulos:
+
+```json
+{
+  "audio": { "file": "audio-prueba.mp3" },
+  "subtitles": { "mode": "none" },
+  "video": {}
+}
+```
+
+Reglas:
+
+- `audio.file` debe ser solo nombre de archivo. Extensiones permitidas:
+  `.mp3`, `.wav`, `.m4a`, `.aac`, `.flac`, `.ogg`.
+- `subtitles.file` debe ser solo nombre de archivo con extension `.srt`.
+- No se aceptan rutas absolutas, `../`, `/` ni `\` en esos nombres.
+- Si `audio.file` existe, el payload MoneyPrinterTurbo recibe
+  `custom_audio_file: "storage/local_audios/<file>"`.
+- `subtitles.mode = "whisper"` activa subtitulos, desactiva correccion por
+  defecto y respeta `subtitles.correction_enabled` si se envia explicitamente.
+- `subtitles.mode = "custom_srt"` activa subtitulos, envia
+  `custom_subtitle_file: "storage/local_subtitles/<file>"` y nunca corrige
+  contra `video_script`.
+- `subtitles.mode = "none"` envia `subtitle_enabled: false`.
+- `subtitles.optimize` controla `subtitle_optimization_enabled`; el default es
+  `true`. Con `true`, el SRT puede adaptarse a formato vertical. Con `false`,
+  el SRT se respeta literal.
+- Los campos legacy `video.custom_audio_file` y `video.custom_subtitle_file`
+  siguen soportados. Si chocan con `audio.file` o `subtitles.file`, el wrapper
+  falla salvo que resuelvan al mismo archivo.
+
+Prioridad efectiva de subtitulos:
+
+1. `custom_srt`, si existe.
+2. `whisper`, si se pide y hay audio propio o audio generado.
+3. Edge/TTS normal del core.
+
+Importante: si `subtitles.mode = "whisper"` y
+`subtitles.correction_enabled = true`, `video_script` debe ser el transcript
+real del audio. Si se envia un placeholder, la correccion puede reemplazar el
+texto de Whisper por ese placeholder. `custom_srt` nunca pasa por esa correccion.
 
 ## Presets de subtitulos
 
@@ -78,6 +177,9 @@ Presets disponibles:
 
 - `clean_center_bold`: subtitulo blanco, sin fondo, borde negro, centrado,
   `font_size` 72 y `stroke_width` 3.
+- `clean_center_bold_safe`: subtitulo blanco, sin fondo, borde negro, centrado,
+  `font_size` 54 y `stroke_width` 2. Recomendado para 9:16 cuando el texto
+  debe quedar centrado sin cortes visuales.
 - `clean_bottom_bold`: igual que `clean_center_bold`, pero abajo y con
   `font_size` 66.
 - `boxed_bottom`: subtitulo blanco abajo, caja negra rectangular,
@@ -88,6 +190,7 @@ Presets disponibles:
 Aliases:
 
 - `center_white_black_outline` apunta a `clean_center_bold`.
+- `safe_center_white_black_outline` apunta a `clean_center_bold_safe`.
 - `bottom_white_black_outline` apunta a `clean_bottom_bold`.
 
 Los presets resuelven la fuente contra `--fonts-dir` usando esta preferencia:
@@ -98,8 +201,12 @@ Los presets resuelven la fuente contra `--fonts-dir` usando esta preferencia:
 4. `MicrosoftYaHeiBold.ttc`
 5. `STHeitiMedium.ttc`
 
-Montserrat no viene incluido en este repo ni se descarga. En el entorno local
-actual, el fallback esperado es `BeVietnamPro-Bold.ttf`.
+Montserrat no viene incluido en este repo ni se descarga. Para usarlo, Javier
+debe subir un archivo licenciado/local llamado `Montserrat-Bold.ttf` a
+`resource/fonts` y confirmar que el contenedor lo ve en
+`/MoneyPrinterTurbo/resource/fonts/Montserrat-Bold.ttf`. No commitear archivos
+de fuente externos. Si Montserrat no existe, el fallback esperado es
+`BeVietnamPro-Bold.ttf`.
 
 `subtitle_style_overrides` solo puede modificar:
 
@@ -179,6 +286,9 @@ El job pendiente conserva metadatos para el runner:
 `selectedAssets` queda dentro de `runner`, no como key raiz. Esto importa porque
 `nightly_runner.py` elimina `job_id`, `description`, `notes` y `runner` antes de
 enviar el payload final a MoneyPrinterTurbo.
+
+`audio` y `subtitles` tampoco quedan como keys raiz. Su metadata queda dentro de
+`runner.audio` y `runner.subtitles`.
 
 `subtitle_style_preset` y `subtitle_style_overrides` tampoco quedan como keys
 raiz del job pendiente. La metadata de estilo se conserva dentro de `runner`.

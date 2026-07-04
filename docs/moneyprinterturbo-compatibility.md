@@ -33,6 +33,9 @@ Campos criticos:
 - `video_source`
 - `video_materials`
 - `custom_audio_file`
+- `custom_subtitle_file`
+- `subtitle_correction_enabled`
+- `subtitle_optimization_enabled`
 - `video_language`
 - `voice_name`
 - `voice_volume`
@@ -118,15 +121,25 @@ El core a proteger en sync upstream incluye:
 - `config.example.toml`
 - compose/Dockerfiles/runtime mounts.
 
-En esta rama de documentacion no se modifica core.
+En esta rama ya existen patches controlados sobre core y herramientas locales;
+mantenerlos visibles al comparar contra upstream.
 
 ## Patches actuales
 
-- `subtitle_optimizer hook`: `task.generate_subtitle()` intenta importar `app.custom.subtitle_optimizer.optimize_srt_file()` y optimiza `subtitle.srt` despues de Edge/Whisper/correccion.
+- `custom audio/subtitle contract`: `app/models/schema.py` expone
+  `custom_subtitle_file`, `subtitle_correction_enabled` y
+  `subtitle_optimization_enabled`; `app/services/task.py` usa SRT propio antes
+  de Edge/Whisper, permite saltar `subtitle.correct()` y permite omitir el
+  optimizer por request.
+- `subtitle_optimizer hook`: `task.generate_subtitle()` intenta importar `app.custom.subtitle_optimizer.optimize_srt_file()` y optimiza `subtitle.srt` despues de SRT propio, Edge o Whisper cuando `subtitle_optimization_enabled` esta activo.
 - `runtime local app mount`: compose local monta codigo local para iterar sin rebuild pesado.
 - `local_job_wrapper`: `scripts/local_job_wrapper.py` valida specs Kurukin, assets locales, orden, preset de subtitulos y genera payload MoneyPrinterTurbo local.
 - `nightly_runner`: `scripts/nightly_runner.py` procesa cola filesystem, hace submit al API, poll de estado, artifacts y lock de ejecucion.
 - `subtitle_style_presets`: `scripts/subtitle_style_presets.py` resuelve presets como `clean_center_bold` y valida overrides permitidos.
+- `subtitle visual padding / safe text clip`: `app/services/video.py` agrega
+  margen transparente a subtitulos sin fondo para evitar cortes de stroke,
+  acentos y descenders en `TextClip`; `clean_center_bold_safe` reduce tamano y
+  borde para renders 9:16 centrados.
 
 ## Checklist para actualizar desde upstream
 

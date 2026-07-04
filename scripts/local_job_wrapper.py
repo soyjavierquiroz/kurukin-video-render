@@ -22,9 +22,14 @@ except ImportError:  # pragma: no cover - used when executed as scripts/local_jo
 
 DEFAULT_QUEUE_DIR = "/opt/moneyprinterturbo/storage/nightly_jobs"
 DEFAULT_LOCAL_VIDEOS_DIR = "/opt/moneyprinterturbo/storage/local_videos"
+DEFAULT_LOCAL_AUDIOS_DIR = "/opt/moneyprinterturbo/storage/local_audios"
+DEFAULT_LOCAL_SUBTITLES_DIR = "/opt/moneyprinterturbo/storage/local_subtitles"
 DEFAULT_FONTS_DIR = "/opt/moneyprinterturbo/resource/fonts"
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png"}
+ALLOWED_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "flac", "ogg"}
+ALLOWED_SUBTITLE_EXTENSIONS = {"srt"}
 ALLOWED_VIDEO_ASPECTS = {"9:16", "16:9"}
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class LocalJobWrapperError(Exception):
@@ -67,6 +72,32 @@ def validate_asset_filename(filename: Any) -> str:
     return value
 
 
+def validate_local_filename(
+    filename: Any,
+    *,
+    allowed_extensions: set[str],
+    label: str,
+) -> str:
+    if not isinstance(filename, str) or not filename.strip():
+        raise LocalJobWrapperError(f"{label} file is required and must be non-empty")
+
+    value = filename.strip()
+    if Path(value).is_absolute() or "/" in value or "\\" in value:
+        raise LocalJobWrapperError(f"{label} file must be a filename only: {filename!r}")
+    if value in {".", ".."} or ".." in Path(value).parts:
+        raise LocalJobWrapperError(f"{label} file cannot use parent paths: {filename!r}")
+    if Path(value).name != value:
+        raise LocalJobWrapperError(f"{label} file must be a filename only: {filename!r}")
+
+    extension = Path(value).suffix.lower().lstrip(".")
+    if extension not in allowed_extensions:
+        allowed = ", ".join(f".{item}" for item in sorted(allowed_extensions))
+        raise LocalJobWrapperError(
+            f"{label} file has unsupported extension {extension!r}; allowed: {allowed}"
+        )
+    return value
+
+
 def resolve_local_asset(filename: str, local_videos_dir: str | Path) -> Path:
     safe_filename = validate_asset_filename(filename)
     base_dir = Path(local_videos_dir).resolve()
@@ -85,6 +116,188 @@ def resolve_local_asset(filename: str, local_videos_dir: str | Path) -> Path:
     if not resolved.is_file():
         raise LocalJobWrapperError(f"local asset is not a file: {candidate}")
     return resolved
+
+
+def resolve_local_file(
+    filename: Any,
+    local_dir: str | Path,
+    *,
+    allowed_extensions: set[str],
+    label: str,
+) -> Path:
+    safe_filename = validate_local_filename(
+        filename,
+        allowed_extensions=allowed_extensions,
+        label=label,
+    )
+    base_dir = Path(local_dir).resolve()
+    candidate = base_dir / safe_filename
+    if not candidate.exists():
+        raise LocalJobWrapperError(f"{label} file does not exist: {candidate}")
+
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(base_dir)
+    except ValueError as exc:
+        raise LocalJobWrapperError(
+            f"{label} file resolves outside local directory: {safe_filename}"
+        ) from exc
+
+    if not resolved.is_file():
+        raise LocalJobWrapperError(f"{label} file is not a file: {candidate}")
+    return resolved
+
+
+def _payload_path_for_resolved_file(resolved_file: Path) -> str:
+    try:
+        return resolved_file.resolve().relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(resolved_file.resolve())
+
+
+def _server_side_path(payload_path: str) -> Path:
+    candidate = Path(payload_path)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (PROJECT_ROOT / candidate).resolve()
+
+
+def _ensure_legacy_field_matches(
+    *,
+    field_name: str,
+    generated_value: str,
+    legacy_value: Any,
+) -> None:
+    if legacy_value in (None, ""):
+        return
+    if not isinstance(legacy_value, str):
+        raise LocalJobWrapperError(f"video.{field_name} must be a string when provided")
+
+    generated_path = _server_side_path(generated_value)
+    legacy_path = _server_side_path(legacy_value.strip())
+    if generated_path != legacy_path:
+        raise LocalJobWrapperError(
+            f"top-level file conflicts with video.{field_name}: "
+            f"{generated_value!r} != {legacy_value!r}"
+        )
+
+
+def _optional_bool(value: Any, *, default: bool, label: str) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise LocalJobWrapperError(f"{label} must be a boolean")
+
+
+def apply_audio_contract(
+    pending_job: dict[str, Any],
+    spec: dict[str, Any],
+    *,
+    local_audios_dir: str | Path,
+) -> None:
+    audio = spec.get("audio")
+    if audio is None:
+        return
+    if not isinstance(audio, dict):
+        raise LocalJobWrapperError("audio must be a JSON object when provided")
+
+    if "file" not in audio:
+        raise LocalJobWrapperError("audio.file is required when audio is provided")
+
+    resolved_audio = resolve_local_file(
+        audio.get("file"),
+        local_audios_dir,
+        allowed_extensions=ALLOWED_AUDIO_EXTENSIONS,
+        label="audio",
+    )
+    payload_path = _payload_path_for_resolved_file(resolved_audio)
+    _ensure_legacy_field_matches(
+        field_name="custom_audio_file",
+        generated_value=payload_path,
+        legacy_value=pending_job.get("custom_audio_file"),
+    )
+    pending_job["custom_audio_file"] = payload_path
+    pending_job["runner"]["audio"] = {
+        "file": resolved_audio.name,
+        "custom_audio_file": payload_path,
+    }
+
+
+def apply_subtitle_contract(
+    pending_job: dict[str, Any],
+    spec: dict[str, Any],
+    *,
+    local_subtitles_dir: str | Path,
+) -> None:
+    subtitles = spec.get("subtitles")
+    if subtitles is None:
+        return
+    if not isinstance(subtitles, dict):
+        raise LocalJobWrapperError("subtitles must be a JSON object when provided")
+
+    mode = subtitles.get("mode")
+    if not isinstance(mode, str) or not mode.strip():
+        raise LocalJobWrapperError("subtitles.mode is required when subtitles is provided")
+    mode = mode.strip().lower()
+
+    runner_metadata = {"mode": mode}
+    if mode == "none":
+        pending_job["subtitle_enabled"] = False
+        pending_job["runner"]["subtitles"] = runner_metadata
+        return
+
+    if mode == "whisper":
+        pending_job["subtitle_enabled"] = True
+        pending_job["subtitle_correction_enabled"] = _optional_bool(
+            subtitles.get("correction_enabled"),
+            default=False,
+            label="subtitles.correction_enabled",
+        )
+        pending_job["subtitle_optimization_enabled"] = _optional_bool(
+            subtitles.get("optimize"),
+            default=True,
+            label="subtitles.optimize",
+        )
+        runner_metadata["correction_enabled"] = pending_job[
+            "subtitle_correction_enabled"
+        ]
+        runner_metadata["optimize"] = pending_job["subtitle_optimization_enabled"]
+        pending_job["runner"]["subtitles"] = runner_metadata
+        return
+
+    if mode == "custom_srt":
+        resolved_subtitle = resolve_local_file(
+            subtitles.get("file"),
+            local_subtitles_dir,
+            allowed_extensions=ALLOWED_SUBTITLE_EXTENSIONS,
+            label="subtitle",
+        )
+        payload_path = _payload_path_for_resolved_file(resolved_subtitle)
+        _ensure_legacy_field_matches(
+            field_name="custom_subtitle_file",
+            generated_value=payload_path,
+            legacy_value=pending_job.get("custom_subtitle_file"),
+        )
+
+        pending_job["subtitle_enabled"] = True
+        pending_job["custom_subtitle_file"] = payload_path
+        pending_job["subtitle_correction_enabled"] = False
+        pending_job["subtitle_optimization_enabled"] = _optional_bool(
+            subtitles.get("optimize"),
+            default=True,
+            label="subtitles.optimize",
+        )
+        runner_metadata["file"] = resolved_subtitle.name
+        runner_metadata["custom_subtitle_file"] = payload_path
+        runner_metadata["correction_enabled"] = False
+        runner_metadata["optimize"] = pending_job["subtitle_optimization_enabled"]
+        pending_job["runner"]["subtitles"] = runner_metadata
+        return
+
+    raise LocalJobWrapperError(
+        "subtitles.mode must be one of: whisper, custom_srt, none"
+    )
 
 
 def probe_media_dimensions(path: str | Path) -> tuple[int, int]:
@@ -217,6 +430,8 @@ def build_pending_job(
     spec: dict[str, Any],
     ordered_assets: list[dict[str, Any]],
     fonts_dir: str | Path = DEFAULT_FONTS_DIR,
+    local_audios_dir: str | Path = DEFAULT_LOCAL_AUDIOS_DIR,
+    local_subtitles_dir: str | Path = DEFAULT_LOCAL_SUBTITLES_DIR,
 ) -> dict[str, Any]:
     video = spec.get("video")
     if not isinstance(video, dict):
@@ -269,6 +484,16 @@ def build_pending_job(
     pending_job.pop("selectedAssets", None)
     pending_job.pop("subtitle_style_preset", None)
     pending_job.pop("subtitle_style_overrides", None)
+    apply_audio_contract(
+        pending_job,
+        spec,
+        local_audios_dir=local_audios_dir,
+    )
+    apply_subtitle_contract(
+        pending_job,
+        spec,
+        local_subtitles_dir=local_subtitles_dir,
+    )
     return pending_job
 
 
@@ -336,6 +561,8 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--print-payload", action="store_true")
     parser.add_argument("--queue-dir", default=DEFAULT_QUEUE_DIR)
     parser.add_argument("--local-videos-dir", default=DEFAULT_LOCAL_VIDEOS_DIR)
+    parser.add_argument("--local-audios-dir", default=DEFAULT_LOCAL_AUDIOS_DIR)
+    parser.add_argument("--local-subtitles-dir", default=DEFAULT_LOCAL_SUBTITLES_DIR)
     parser.add_argument("--fonts-dir", default=DEFAULT_FONTS_DIR)
     parser.add_argument("--min-width", default=480, type=positive_int)
     parser.add_argument("--min-height", default=480, type=positive_int)
@@ -354,7 +581,13 @@ def main(argv: list[str] | None = None) -> int:
             min_height=args.min_height,
             skip_media_probe=args.skip_media_probe,
         )
-        pending_job = build_pending_job(spec, ordered_assets, fonts_dir=args.fonts_dir)
+        pending_job = build_pending_job(
+            spec,
+            ordered_assets,
+            fonts_dir=args.fonts_dir,
+            local_audios_dir=args.local_audios_dir,
+            local_subtitles_dir=args.local_subtitles_dir,
+        )
 
         if args.print_payload:
             json.dump(pending_job, sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)

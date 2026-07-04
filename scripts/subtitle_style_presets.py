@@ -28,6 +28,7 @@ ALLOWED_OVERRIDES = {
 
 PRESET_ALIASES = {
     "center_white_black_outline": "clean_center_bold",
+    "safe_center_white_black_outline": "clean_center_bold_safe",
     "bottom_white_black_outline": "clean_bottom_bold",
 }
 
@@ -40,6 +41,15 @@ PRESETS = {
         "font_size": 72,
         "stroke_color": "#000000",
         "stroke_width": 3,
+    },
+    "clean_center_bold_safe": {
+        "subtitle_position": "center",
+        "text_fore_color": "#FFFFFF",
+        "text_background_color": False,
+        "rounded_subtitle_background": False,
+        "font_size": 54,
+        "stroke_color": "#000000",
+        "stroke_width": 2,
     },
     "clean_bottom_bold": {
         "subtitle_position": "bottom",
