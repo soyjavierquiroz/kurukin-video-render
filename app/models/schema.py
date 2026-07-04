@@ -87,6 +87,7 @@ class VideoParams(BaseModel):
     
     custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
     custom_subtitle_file: str = ""  # Custom SRT file path, will skip subtitle generation/correction
+    subtitle_provider: str = ""  # Empty uses config.toml; per-job values: edge, whisper
     subtitle_correction_enabled: bool = True
     subtitle_optimization_enabled: bool = True
     video_language: Optional[str] = ""  # auto detect

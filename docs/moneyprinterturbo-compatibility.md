@@ -34,6 +34,7 @@ Campos criticos:
 - `video_materials`
 - `custom_audio_file`
 - `custom_subtitle_file`
+- `subtitle_provider`
 - `subtitle_correction_enabled`
 - `subtitle_optimization_enabled`
 - `video_language`
@@ -127,10 +128,11 @@ mantenerlos visibles al comparar contra upstream.
 ## Patches actuales
 
 - `custom audio/subtitle contract`: `app/models/schema.py` expone
-  `custom_subtitle_file`, `subtitle_correction_enabled` y
-  `subtitle_optimization_enabled`; `app/services/task.py` usa SRT propio antes
-  de Edge/Whisper, permite saltar `subtitle.correct()` y permite omitir el
-  optimizer por request.
+  `custom_subtitle_file`, `subtitle_provider`,
+  `subtitle_correction_enabled` y `subtitle_optimization_enabled`;
+  `app/services/task.py` usa SRT propio antes de Edge/Whisper, resuelve
+  `subtitle_provider` por job con fallback a `config.toml`, permite saltar
+  `subtitle.correct()` y permite omitir el optimizer por request.
 - `subtitle_optimizer hook`: `task.generate_subtitle()` intenta importar `app.custom.subtitle_optimizer.optimize_srt_file()` y optimiza `subtitle.srt` despues de SRT propio, Edge o Whisper cuando `subtitle_optimization_enabled` esta activo.
 - `runtime local app mount`: compose local monta codigo local para iterar sin rebuild pesado.
 - `local_job_wrapper`: `scripts/local_job_wrapper.py` valida specs Kurukin, assets locales, orden, preset de subtitulos y genera payload MoneyPrinterTurbo local.

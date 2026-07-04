@@ -7,6 +7,7 @@
   },
   "subtitles": {
     "mode": "whisper",
+    "correction_enabled": false,
     "optimize": true
   },
   "selectedAssets": [
