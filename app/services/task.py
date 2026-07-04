@@ -1,6 +1,7 @@
 import math
 import os.path
 import re
+import shutil
 from os import path
 
 from loguru import logger
@@ -125,6 +126,65 @@ def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> st
     return server_audio_file
 
 
+def resolve_custom_subtitle_file(custom_subtitle_file: str, task_dir: str) -> str:
+    requested_file = (custom_subtitle_file or "").strip()
+    if not requested_file:
+        return ""
+
+    if path.splitext(requested_file)[1].lower() != ".srt":
+        raise ValueError("custom subtitle file must use .srt extension")
+
+    try:
+        return file_security.resolve_path_within_directory(
+            task_dir,
+            requested_file,
+        )
+    except ValueError as exc:
+        task_dir_error = exc
+
+    server_subtitle_file = path.realpath(
+        requested_file
+        if path.isabs(requested_file)
+        else path.join(utils.root_dir(), requested_file)
+    )
+    project_root = path.realpath(utils.root_dir())
+    try:
+        if path.commonpath([project_root, server_subtitle_file]) != project_root:
+            raise ValueError(
+                "custom subtitle paths must stay within the project directory"
+            )
+    except ValueError as exc:
+        raise ValueError(
+            "custom subtitle file must be task-local or an existing project file"
+        ) from exc
+
+    if not path.isfile(server_subtitle_file):
+        raise ValueError(
+            "custom subtitle file does not exist or is not a file"
+        ) from task_dir_error
+
+    return server_subtitle_file
+
+
+def optimize_subtitle_if_enabled(subtitle_path: str, params) -> dict | None:
+    if not getattr(params, "subtitle_optimization_enabled", True):
+        logger.info("subtitle optimizer skipped by request")
+        return None
+
+    try:
+        from app.custom.subtitle_optimizer import optimize_srt_file
+
+        optimize_result = optimize_srt_file(
+            subtitle_path=subtitle_path,
+            aspect=getattr(params, "video_aspect", "9:16"),
+        )
+        logger.info(f"subtitle optimizer result: {optimize_result}")
+        return optimize_result
+    except Exception as exc:
+        logger.warning(f"subtitle optimizer skipped: {str(exc)}")
+        return None
+
+
 def generate_audio(task_id, params, video_script):
     '''
     Generate audio for the video script.
@@ -197,7 +257,35 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     if not params.subtitle_enabled:
         return ""
 
-    subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
+    task_dir = utils.task_dir(task_id)
+    subtitle_path = path.join(task_dir, "subtitle.srt")
+
+    requested_custom_subtitle_file = getattr(params, "custom_subtitle_file", "")
+    if requested_custom_subtitle_file:
+        try:
+            custom_subtitle_file = resolve_custom_subtitle_file(
+                requested_custom_subtitle_file,
+                task_dir,
+            )
+        except ValueError as exc:
+            logger.error(
+                "custom subtitle file is invalid, "
+                f"task_id: {task_id}, path: {requested_custom_subtitle_file}, error: {str(exc)}"
+            )
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            return ""
+
+        logger.info(f"using custom subtitle file: {custom_subtitle_file}")
+        shutil.copyfile(custom_subtitle_file, subtitle_path)
+        optimize_subtitle_if_enabled(subtitle_path, params)
+
+        subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
+        if not subtitle_lines:
+            logger.warning(f"subtitle file is invalid: {subtitle_path}")
+            return ""
+
+        return subtitle_path
+
     subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
 
@@ -222,19 +310,13 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     if subtitle_provider == "whisper" or subtitle_fallback:
         subtitle.create(audio_file=audio_file, subtitle_file=subtitle_path)
-        logger.info("\n\n## correcting subtitle")
-        subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+        if getattr(params, "subtitle_correction_enabled", True):
+            logger.info("\n\n## correcting subtitle")
+            subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+        else:
+            logger.info("subtitle correction skipped by request")
 
-    try:
-        from app.custom.subtitle_optimizer import optimize_srt_file
-
-        optimize_result = optimize_srt_file(
-            subtitle_path=subtitle_path,
-            aspect=getattr(params, "video_aspect", "9:16"),
-        )
-        logger.info(f"subtitle optimizer result: {optimize_result}")
-    except Exception as exc:
-        logger.warning(f"subtitle optimizer skipped: {str(exc)}")
+    optimize_subtitle_if_enabled(subtitle_path, params)
 
     subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
     if not subtitle_lines:

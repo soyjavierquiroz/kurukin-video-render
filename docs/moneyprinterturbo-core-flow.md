@@ -14,7 +14,8 @@ El pipeline en `app/services/task.py` es lineal:
 2. `generate_terms()`: solo para fuentes no locales; usa `params.video_terms` si viene informado; si no, llama a `llm.generate_terms()`.
 3. `save_script_data()`: escribe `storage/tasks/<task_id>/script.json`.
 4. `generate_audio()`: usa TTS o `custom_audio_file`.
-5. `generate_subtitle()`: usa Edge/TTS `sub_maker` o Whisper segun `config.toml`.
+5. `generate_subtitle()`: usa SRT propio, Edge/TTS `sub_maker` o Whisper segun
+   el payload y `config.toml`.
 6. `get_video_materials()`: usa materiales locales o descarga proveedor externo.
 7. `generate_final_videos()`: concatena clips, monta audio, quema subtitulos y actualiza estado final.
 8. Opcional: cross-posting si `upload_post` esta configurado.
@@ -78,6 +79,31 @@ Cuando `custom_audio_file` es valido, `generate_audio()`:
 
 El `None` es clave: no hay `sub_maker`. Por eso Edge no puede generar subtitulos para audio propio; Whisper si puede.
 
+## custom_subtitle_file y control de correccion
+
+Feature `custom-audio-subtitle-contract` agrega tres campos core a
+`VideoParams`:
+
+- `custom_subtitle_file`: SRT propio. Puede ser task-local o relativo seguro
+  dentro del repo, por ejemplo `storage/local_subtitles/audio-prueba.srt`.
+- `subtitle_correction_enabled`: default `true` para preservar el
+  comportamiento original. En Whisper, `false` evita que `subtitle.correct()`
+  reemplace la transcripcion real con `video_script`.
+- `subtitle_optimization_enabled`: default `true` para preservar el hook
+  `app.custom.subtitle_optimizer`. En `false`, el SRT queda literal.
+
+Cuando `custom_subtitle_file` viene informado, `generate_subtitle()` lo resuelve,
+lo copia al task como `subtitle.srt`, no llama a `subtitle.correct()` y solo
+ejecuta el optimizer si `subtitle_optimization_enabled` esta activo.
+
+Cuando se usa Whisper, el core sigue llamando a `subtitle.create()` sobre el
+audio real. Luego solo corrige contra `video_script` si
+`subtitle_correction_enabled` es `true`. Esto evita el bug diagnosticado donde
+un `video_script` placeholder reemplazaba el texto Whisper correcto.
+
+Con Edge/TTS normal, el comportamiento se mantiene: se genera SRT desde
+`sub_maker` y despues se aplica el optimizer si esta activo.
+
 ## Subtitles con Edge
 
 `subtitle_provider` se lee desde `config.app["subtitle_provider"]`. El default en `config.example.toml` es `"edge"`.
@@ -90,7 +116,7 @@ Si hay `sub_maker`, llama a `voice.create_subtitle(text=video_script, sub_maker=
 
 Con `subtitle_provider = "whisper"`, `generate_subtitle()` llama a `subtitle.create(audio_file=audio_file, subtitle_file=subtitle_path)`. `app/services/subtitle.py` carga `faster_whisper`, transcribe con `word_timestamps=True` y `vad_filter=True`, detecta idioma y escribe un SRT inicial.
 
-Inmediatamente despues, el core llama a:
+Si `subtitle_correction_enabled` queda en su default `true`, inmediatamente despues el core llama a:
 
 ```python
 subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
@@ -98,7 +124,11 @@ subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
 
 Esta correccion no es una validacion pasiva. Si una linea del SRT no coincide con la linea esperada de `video_script`, escribe `script_line` en el SRT nuevo, conservando timestamps del subtitulo o grupo de subtitulos. Incluso en mismatch fuerte, el branch `else` agrega `script_line`. Por eso Whisper puede transcribir correctamente y aun asi el archivo final mostrar texto del guion/placeholder.
 
-Despues corre nuestro hook `app.custom.subtitle_optimizer.optimize_srt_file()`, que puede partir lineas largas y crear `subtitle.original.srt`. Ese hook optimiza el texto ya corregido; no recupera la transcripcion Whisper anterior si `subtitle.correct()` ya la reemplazo.
+Si `subtitle_correction_enabled` es `false`, se conserva el texto Whisper literal.
+Despues corre nuestro hook `app.custom.subtitle_optimizer.optimize_srt_file()`,
+salvo que `subtitle_optimization_enabled` sea `false`. El optimizer puede partir
+lineas largas y crear `subtitle.original.srt`; no recupera la transcripcion
+Whisper anterior si `subtitle.correct()` ya la reemplazo.
 
 ## Relacion entre video_script y subtitulos
 
@@ -116,9 +146,12 @@ Para audio propio confiable en el core actual:
 
 - `custom_audio_file` debe apuntar a un archivo existente dentro del repo o dentro del task.
 - `subtitle_provider` debe ser `"whisper"` si se quieren subtitulos automaticos.
-- `video_script` debe ser el transcript real o debe aceptarse que `subtitle.correct()` puede sobrescribir Whisper.
-- Si `video_script` no es transcript real, conviene desactivar subtitulos o implementar una feature posterior que permita saltar `subtitle.correct()` para audio propio.
-- Para soporte formal, conviene agregar `custom_srt_file` o equivalente y hacer que SRT propio tenga prioridad sobre Whisper y Edge.
+- `subtitle_correction_enabled = false` debe usarse cuando `video_script` es
+  placeholder y se quiere conservar Whisper real.
+- `custom_subtitle_file` debe usarse cuando ya existe un SRT propio. Ese camino
+  tiene prioridad sobre Whisper y Edge, y nunca pasa por `subtitle.correct()`.
+- `subtitle_optimization_enabled = false` debe usarse cuando el SRT propio ya
+  esta final y debe respetarse literal.
 
 ## Puntos donde MoneyPrinterTurbo usa IA
 
@@ -136,6 +169,20 @@ Para audio propio confiable en el core actual:
 - `scripts/subtitle_style_presets.py`: presets de estilo para subtitulos.
 - `app.custom.subtitle_optimizer`: hook cargado desde `task.generate_subtitle()` para dividir/optimizar SRT.
 - Runtime local app mount: compose local monta codigo app para desarrollo sin rebuild completo.
+
+## Subtitulos: contenido vs look visual
+
+El contrato `custom_audio_file`, `custom_subtitle_file`,
+`subtitle_correction_enabled` y `subtitle_optimization_enabled` controla que
+texto llega al SRT final. El look visual se aplica despues, en
+`app/services/video.py`, cuando MoviePy convierte cada item SRT en `TextClip`.
+Son capas separadas: una prueba puede tener contenido correcto y aun asi fallar
+visualmente por fuente, tamano, stroke o padding del renderer.
+
+Para 9:16, `clean_center_bold_safe` usa una combinacion mas conservadora
+(`font_size` 54, `stroke_width` 2) y el renderer agrega margen transparente al
+texto sin fondo para que trazos, acentos y descenders no queden cortados por el
+canvas interno de `TextClip`.
 
 ## Riesgos detectados
 

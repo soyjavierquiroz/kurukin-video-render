@@ -893,6 +893,12 @@ def _get_visible_center_position(
     return x, y
 
 
+def _subtitle_text_margin(font_size: int, stroke_width: int) -> tuple[int, int]:
+    horizontal = max(8, int(stroke_width) * 4)
+    vertical = max(12, int(stroke_width) * 6)
+    return horizontal, vertical
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -942,11 +948,14 @@ def generate_video(
             getattr(params, "rounded_subtitle_background", False) and bg_color
         )
         has_subtitle_background = bool(bg_color)
-        pad_x = int(params.font_size * 0.6) if has_subtitle_background else 0
+        text_margin_x, text_margin_y = _subtitle_text_margin(
+            params.font_size, params.stroke_width
+        )
+        pad_x = int(params.font_size * 0.6) if has_subtitle_background else text_margin_x
         # 字幕背景需要给文字左右留出明确内边距。先从可用宽度中扣除
         # padding 再换行，避免长英文或大字号刚好撑满 90% 视频宽度后，
         # 文字贴到背景框边缘，看起来像被裁切。普通矩形背景和圆角背景
-        # 都走这条逻辑；无背景字幕则保持原有最大宽度。
+        # 都走这条逻辑；无背景字幕也扣除透明 margin，避免描边贴边被裁切。
         text_max_width = max(1, int(max_width) - 2 * pad_x)
         wrapped_txt, txt_height = wrap_text(
             phrase,
@@ -957,8 +966,10 @@ def generate_video(
         interline = int(params.font_size * 0.25)
         line_count = wrapped_txt.count("\n") + 1
         vertical_padding = int(params.font_size * 0.35)
-        text_clip_margin_y = max(
-            int(params.font_size * 0.3), int(params.stroke_width * 2)
+        text_clip_margin_y = (
+            max(int(params.font_size * 0.3), int(params.stroke_width * 2))
+            if has_subtitle_background
+            else text_margin_y
         )
         # MoviePy 在 `method=label` 下会自动收缩文本框高度，遇到多行字幕、
         # 描边或背景色时，容易把最后一行的下半部分裁掉。这里显式传入
@@ -1041,10 +1052,6 @@ def generate_video(
                 size=size,
             )
         else:
-            size = (
-                int(max_width),
-                clip_h,
-            )
             _clip = TextClip(
                 text=wrapped_txt,
                 font=font_path,
@@ -1054,7 +1061,8 @@ def generate_video(
                 stroke_color=params.stroke_color,
                 stroke_width=params.stroke_width,
                 interline=interline,
-                size=size,
+                size=(text_max_width, None),
+                margin=(text_margin_x, text_margin_y),
                 text_align="center",
             )
         duration = subtitle_item[0][1] - subtitle_item[0][0]

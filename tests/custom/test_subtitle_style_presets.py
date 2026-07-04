@@ -42,6 +42,54 @@ class TestSubtitleStylePresets(unittest.TestCase):
 
         self.assertEqual(style["font_name"], "Montserrat-Bold.ttf")
 
+    def test_clean_center_bold_safe_exists_and_uses_safe_values(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write_font(tmp_dir, "BeVietnamPro-Bold.ttf")
+
+            resolved_preset, overrides, style = (
+                subtitle_style_presets.resolve_subtitle_style(
+                    "clean_center_bold_safe",
+                    None,
+                    fonts_dir=tmp_dir,
+                )
+            )
+
+        self.assertEqual(resolved_preset, "clean_center_bold_safe")
+        self.assertEqual(overrides, {})
+        self.assertEqual(style["font_name"], "BeVietnamPro-Bold.ttf")
+        self.assertEqual(style["subtitle_position"], "center")
+        self.assertFalse(style["text_background_color"])
+        self.assertFalse(style["rounded_subtitle_background"])
+        self.assertEqual(style["font_size"], 54)
+        self.assertEqual(style["stroke_width"], 2)
+
+    def test_safe_center_alias_resolves_to_clean_center_bold_safe(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write_font(tmp_dir, "BeVietnamPro-Bold.ttf")
+
+            resolved_preset, _, style = subtitle_style_presets.resolve_subtitle_style(
+                "safe_center_white_black_outline",
+                None,
+                fonts_dir=tmp_dir,
+            )
+
+        self.assertEqual(resolved_preset, "clean_center_bold_safe")
+        self.assertEqual(style["font_size"], 54)
+        self.assertEqual(style["stroke_width"], 2)
+
+    def test_clean_center_bold_safe_prefers_montserrat_bold_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write_font(tmp_dir, "BeVietnamPro-Bold.ttf")
+            self.write_font(tmp_dir, "Montserrat-Bold.ttf")
+
+            _, _, style = subtitle_style_presets.resolve_subtitle_style(
+                "clean_center_bold_safe",
+                None,
+                fonts_dir=tmp_dir,
+            )
+
+        self.assertEqual(style["font_name"], "Montserrat-Bold.ttf")
+
     def test_unknown_preset_fails(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             self.write_font(tmp_dir, "BeVietnamPro-Bold.ttf")
