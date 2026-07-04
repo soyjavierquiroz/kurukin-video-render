@@ -51,8 +51,9 @@ El JSON debe ser un objeto con:
   metadatos opcionales.
 - `audio`: objeto opcional. `audio.file` apunta a un archivo dentro de
   `storage/local_audios` o de `--local-audios-dir`.
-- `subtitles`: objeto opcional. `subtitles.mode` acepta `whisper`,
-  `custom_srt` o `none`.
+- `subtitles`: objeto opcional. `subtitles.mode` acepta `whisper`, `edge`,
+  `custom_srt` o `none`. `subtitles.provider` acepta `whisper` o `edge`
+  como forma avanzada cuando no se quiere expresar el provider como modo.
 - `video`: objeto con la configuracion MoneyPrinterTurbo. `video_subject`,
   `video_script` y `video_aspect` son requeridos.
 - `subtitle_style_preset`: string opcional para aplicar un look de subtitulos.
@@ -78,6 +79,36 @@ Ejemplo con audio propio y Whisper real sin correccion contra `video_script`:
   "audio": { "file": "audio-prueba.mp3" },
   "subtitles": {
     "mode": "whisper",
+    "correction_enabled": false,
+    "optimize": true
+  },
+  "video": {}
+}
+```
+
+Este modo ya no requiere cambiar `config.toml`: el wrapper envia
+`subtitle_provider: "whisper"` en el payload del job.
+
+Ejemplo con TTS normal y subtitulos Edge por job:
+
+```json
+{
+  "subtitles": {
+    "mode": "edge",
+    "optimize": true
+  },
+  "video": {
+    "video_script": "Este texto se sintetiza con TTS y Edge produce el SRT."
+  }
+}
+```
+
+Tambien se puede usar la forma avanzada:
+
+```json
+{
+  "subtitles": {
+    "provider": "whisper",
     "correction_enabled": false,
     "optimize": true
   },
@@ -132,23 +163,38 @@ Reglas:
 - Si `audio.file` existe, el payload MoneyPrinterTurbo recibe
   `custom_audio_file: "storage/local_audios/<file>"`.
 - `subtitles.mode = "whisper"` activa subtitulos, desactiva correccion por
-  defecto y respeta `subtitles.correction_enabled` si se envia explicitamente.
+  defecto, envia `subtitle_provider: "whisper"` y respeta
+  `subtitles.correction_enabled` si se envia explicitamente.
+- `subtitles.mode = "edge"` activa subtitulos y envia
+  `subtitle_provider: "edge"`. Este modo requiere audio generado por TTS,
+  porque Edge depende del `sub_maker` devuelto por TTS.
+- `subtitles.provider = "whisper"` o `"edge"` permite definir el provider sin
+  usar `mode`. Si `mode` y `provider` apuntan a providers distintos, el wrapper
+  falla antes de encolar.
 - `subtitles.mode = "custom_srt"` activa subtitulos, envia
   `custom_subtitle_file: "storage/local_subtitles/<file>"` y nunca corrige
-  contra `video_script`.
+  contra `video_script`. El provider es irrelevante en este modo.
 - `subtitles.mode = "none"` envia `subtitle_enabled: false`.
+- `audio.file` o `video.custom_audio_file` con `subtitles.mode = "edge"` se
+  rechaza: Edge necesita audio TTS generado para producir el timeline de
+  subtitulos. Use `subtitles.mode = "whisper"`, `custom_srt` o `none` con audio
+  propio.
 - `subtitles.optimize` controla `subtitle_optimization_enabled`; el default es
   `true`. Con `true`, el SRT puede adaptarse a formato vertical. Con `false`,
   el SRT se respeta literal.
-- Los campos legacy `video.custom_audio_file` y `video.custom_subtitle_file`
+- Los campos legacy `video.custom_audio_file`, `video.custom_subtitle_file` y
+  `video.subtitle_provider`
   siguen soportados. Si chocan con `audio.file` o `subtitles.file`, el wrapper
-  falla salvo que resuelvan al mismo archivo.
+  falla salvo que resuelvan al mismo archivo o provider.
+- Si `subtitles` no define provider por job, el core mantiene su default
+  original y lee `subtitle_provider` desde `config.toml`.
 
 Prioridad efectiva de subtitulos:
 
 1. `custom_srt`, si existe.
-2. `whisper`, si se pide y hay audio propio o audio generado.
-3. Edge/TTS normal del core.
+2. `whisper`, si se pide por `mode` o `provider`.
+3. `edge`, si se pide por `mode` o `provider` y hay audio TTS.
+4. Default del core desde `config.toml`.
 
 Importante: si `subtitles.mode = "whisper"` y
 `subtitles.correction_enabled = true`, `video_script` debe ser el transcript

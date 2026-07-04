@@ -166,6 +166,20 @@ def resolve_custom_subtitle_file(custom_subtitle_file: str, task_dir: str) -> st
     return server_subtitle_file
 
 
+def resolve_subtitle_provider(params) -> str:
+    requested_provider = (getattr(params, "subtitle_provider", "") or "").strip()
+    if requested_provider:
+        provider = requested_provider.lower()
+    else:
+        provider = config.app.get("subtitle_provider", "edge").strip().lower()
+
+    if provider not in {"edge", "whisper"}:
+        raise ValueError(
+            f"Unsupported subtitle_provider '{provider}'. Expected 'edge' or 'whisper'."
+        )
+    return provider
+
+
 def optimize_subtitle_if_enabled(subtitle_path: str, params) -> dict | None:
     if not getattr(params, "subtitle_optimization_enabled", True):
         logger.info("subtitle optimizer skipped by request")
@@ -286,7 +300,14 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
         return subtitle_path
 
-    subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
+    requested_subtitle_provider = (
+        getattr(params, "subtitle_provider", "") or ""
+    ).strip()
+    subtitle_provider = resolve_subtitle_provider(params)
+    provider_source = "request" if requested_subtitle_provider else "config"
+    logger.info(
+        f"subtitle provider resolved from {provider_source}: {subtitle_provider}"
+    )
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
 
     if sub_maker is None and subtitle_provider != "whisper":

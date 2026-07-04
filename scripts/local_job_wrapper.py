@@ -29,6 +29,8 @@ ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png"}
 ALLOWED_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "flac", "ogg"}
 ALLOWED_SUBTITLE_EXTENSIONS = {"srt"}
 ALLOWED_VIDEO_ASPECTS = {"9:16", "16:9"}
+ALLOWED_SUBTITLE_MODES = {"whisper", "edge", "custom_srt", "none"}
+ALLOWED_SUBTITLE_PROVIDERS = {"whisper", "edge"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -190,6 +192,67 @@ def _optional_bool(value: Any, *, default: bool, label: str) -> bool:
     raise LocalJobWrapperError(f"{label} must be a boolean")
 
 
+def _normalize_optional_subtitle_provider(value: Any, *, label: str) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise LocalJobWrapperError(f"{label} must be a string when provided")
+
+    provider = value.strip().lower()
+    if not provider:
+        return ""
+    if provider not in ALLOWED_SUBTITLE_PROVIDERS:
+        raise LocalJobWrapperError(
+            f"{label} must be one of: edge, whisper"
+        )
+    return provider
+
+
+def _normalize_optional_subtitle_mode(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise LocalJobWrapperError("subtitles.mode must be a string when provided")
+
+    mode = value.strip().lower()
+    if not mode:
+        return ""
+    if mode not in ALLOWED_SUBTITLE_MODES:
+        raise LocalJobWrapperError(
+            "subtitles.mode must be one of: whisper, edge, custom_srt, none"
+        )
+    return mode
+
+
+def _subtitle_provider_from_mode(mode: str) -> str:
+    if mode in {"edge", "whisper"}:
+        return mode
+    return ""
+
+
+def _ensure_subtitle_provider_compatible(
+    *,
+    mode: str,
+    provider: str,
+    legacy_provider: str,
+) -> str:
+    mode_provider = _subtitle_provider_from_mode(mode)
+    effective_provider = provider or mode_provider
+
+    if mode_provider and provider and mode_provider != provider:
+        raise LocalJobWrapperError(
+            f"subtitles.mode={mode!r} conflicts with subtitles.provider={provider!r}"
+        )
+
+    if effective_provider and legacy_provider and effective_provider != legacy_provider:
+        raise LocalJobWrapperError(
+            "top-level subtitles provider conflicts with video.subtitle_provider: "
+            f"{effective_provider!r} != {legacy_provider!r}"
+        )
+
+    return effective_provider or legacy_provider
+
+
 def apply_audio_contract(
     pending_job: dict[str, Any],
     spec: dict[str, Any],
@@ -236,33 +299,33 @@ def apply_subtitle_contract(
     if not isinstance(subtitles, dict):
         raise LocalJobWrapperError("subtitles must be a JSON object when provided")
 
-    mode = subtitles.get("mode")
-    if not isinstance(mode, str) or not mode.strip():
-        raise LocalJobWrapperError("subtitles.mode is required when subtitles is provided")
-    mode = mode.strip().lower()
+    mode = _normalize_optional_subtitle_mode(subtitles.get("mode"))
+    provider = _normalize_optional_subtitle_provider(
+        subtitles.get("provider"),
+        label="subtitles.provider",
+    )
+    legacy_provider = _normalize_optional_subtitle_provider(
+        pending_job.get("subtitle_provider"),
+        label="video.subtitle_provider",
+    )
+    if not mode and not provider:
+        raise LocalJobWrapperError(
+            "subtitles.mode or subtitles.provider is required when subtitles is provided"
+        )
 
-    runner_metadata = {"mode": mode}
+    effective_provider = _ensure_subtitle_provider_compatible(
+        mode=mode,
+        provider=provider,
+        legacy_provider=legacy_provider,
+    )
+
+    runner_metadata = {}
+    if mode:
+        runner_metadata["mode"] = mode
+    if provider:
+        runner_metadata["provider"] = provider
     if mode == "none":
         pending_job["subtitle_enabled"] = False
-        pending_job["runner"]["subtitles"] = runner_metadata
-        return
-
-    if mode == "whisper":
-        pending_job["subtitle_enabled"] = True
-        pending_job["subtitle_correction_enabled"] = _optional_bool(
-            subtitles.get("correction_enabled"),
-            default=False,
-            label="subtitles.correction_enabled",
-        )
-        pending_job["subtitle_optimization_enabled"] = _optional_bool(
-            subtitles.get("optimize"),
-            default=True,
-            label="subtitles.optimize",
-        )
-        runner_metadata["correction_enabled"] = pending_job[
-            "subtitle_correction_enabled"
-        ]
-        runner_metadata["optimize"] = pending_job["subtitle_optimization_enabled"]
         pending_job["runner"]["subtitles"] = runner_metadata
         return
 
@@ -295,8 +358,47 @@ def apply_subtitle_contract(
         pending_job["runner"]["subtitles"] = runner_metadata
         return
 
+    if effective_provider == "edge" and pending_job.get("custom_audio_file"):
+        raise LocalJobWrapperError(
+            "Edge subtitles require generated TTS audio. Use "
+            "subtitles.mode='whisper', subtitles.mode='custom_srt', or "
+            "subtitles.mode='none' with custom audio."
+        )
+
+    if effective_provider == "whisper":
+        pending_job["subtitle_enabled"] = True
+        pending_job["subtitle_provider"] = "whisper"
+        pending_job["subtitle_correction_enabled"] = _optional_bool(
+            subtitles.get("correction_enabled"),
+            default=False,
+            label="subtitles.correction_enabled",
+        )
+        pending_job["subtitle_optimization_enabled"] = _optional_bool(
+            subtitles.get("optimize"),
+            default=True,
+            label="subtitles.optimize",
+        )
+        runner_metadata["correction_enabled"] = pending_job[
+            "subtitle_correction_enabled"
+        ]
+        runner_metadata["optimize"] = pending_job["subtitle_optimization_enabled"]
+        pending_job["runner"]["subtitles"] = runner_metadata
+        return
+
+    if effective_provider == "edge":
+        pending_job["subtitle_enabled"] = True
+        pending_job["subtitle_provider"] = "edge"
+        pending_job["subtitle_optimization_enabled"] = _optional_bool(
+            subtitles.get("optimize"),
+            default=True,
+            label="subtitles.optimize",
+        )
+        runner_metadata["optimize"] = pending_job["subtitle_optimization_enabled"]
+        pending_job["runner"]["subtitles"] = runner_metadata
+        return
+
     raise LocalJobWrapperError(
-        "subtitles.mode must be one of: whisper, custom_srt, none"
+        "subtitles.mode must be one of: whisper, edge, custom_srt, none"
     )
 
 

@@ -15,7 +15,7 @@ El pipeline en `app/services/task.py` es lineal:
 3. `save_script_data()`: escribe `storage/tasks/<task_id>/script.json`.
 4. `generate_audio()`: usa TTS o `custom_audio_file`.
 5. `generate_subtitle()`: usa SRT propio, Edge/TTS `sub_maker` o Whisper segun
-   el payload y `config.toml`.
+   el payload; si el payload no define provider, usa `config.toml`.
 6. `get_video_materials()`: usa materiales locales o descarga proveedor externo.
 7. `generate_final_videos()`: concatena clips, monta audio, quema subtitulos y actualiza estado final.
 8. Opcional: cross-posting si `upload_post` esta configurado.
@@ -96,6 +96,12 @@ Cuando `custom_subtitle_file` viene informado, `generate_subtitle()` lo resuelve
 lo copia al task como `subtitle.srt`, no llama a `subtitle.correct()` y solo
 ejecuta el optimizer si `subtitle_optimization_enabled` esta activo.
 
+`subtitle_provider` tambien puede venir por job. Si el payload envia
+`subtitle_provider = "whisper"` o `"edge"`, `task.resolve_subtitle_provider()`
+usa ese valor para el job actual. Si falta o viene vacio, el core conserva el
+comportamiento historico y lee `subtitle_provider` desde `config.toml`.
+`custom_subtitle_file` tiene prioridad absoluta sobre ese provider.
+
 Cuando se usa Whisper, el core sigue llamando a `subtitle.create()` sobre el
 audio real. Luego solo corrige contra `video_script` si
 `subtitle_correction_enabled` es `true`. Esto evita el bug diagnosticado donde
@@ -106,7 +112,9 @@ Con Edge/TTS normal, el comportamiento se mantiene: se genera SRT desde
 
 ## Subtitles con Edge
 
-`subtitle_provider` se lee desde `config.app["subtitle_provider"]`. El default en `config.example.toml` es `"edge"`.
+`subtitle_provider` puede venir en el payload del job. Si falta, se lee desde
+`config.app["subtitle_provider"]`. El default en `config.example.toml` es
+`"edge"`.
 
 Con `subtitle_provider = "edge"`, `generate_subtitle()` requiere `sub_maker`. Si `sub_maker is None` y el provider no es Whisper, retorna `""` y salta subtitulos. Ese fue el caso del primer intento de audio propio que quedo sin subtitulos: audio propio implica no TTS, no `sub_maker`, y Edge se salta.
 
@@ -146,10 +154,13 @@ Para audio propio confiable en el core actual:
 
 - `custom_audio_file` debe apuntar a un archivo existente dentro del repo o dentro del task.
 - `subtitle_provider` debe ser `"whisper"` si se quieren subtitulos automaticos.
+  Ahora puede enviarse por job, sin tocar `config.toml`.
 - `subtitle_correction_enabled = false` debe usarse cuando `video_script` es
   placeholder y se quiere conservar Whisper real.
 - `custom_subtitle_file` debe usarse cuando ya existe un SRT propio. Ese camino
   tiene prioridad sobre Whisper y Edge, y nunca pasa por `subtitle.correct()`.
+- `subtitle_provider = "edge"` por job funciona para el flujo normal con TTS y
+  `sub_maker`.
 - `subtitle_optimization_enabled = false` debe usarse cuando el SRT propio ya
   esta final y debe respetarse literal.
 
@@ -189,7 +200,8 @@ canvas interno de `TextClip`.
 - Riesgo alto: `subtitle.correct()` sobreescribe texto Whisper con `video_script` incluso cuando el mismatch confirma que no coinciden.
 - Riesgo alto: `custom_audio_file` salta TTS, por lo que Edge no puede producir subtitulos.
 - Riesgo medio: `video_script` sigue siendo requerido por nuestra capa local wrapper, aunque para audio propio podria ser solo metadata o placeholder.
-- Riesgo medio: `subtitle_provider` es global en `config.toml`, no por request.
+- Riesgo medio mitigado: `subtitle_provider` ahora puede venir por request; si
+  falta, sigue siendo global via `config.toml`.
 - Riesgo medio: los jobs Kurukin deben filtrar metadata propia; campos como `runner`, `selectedAssets` y presets no pertenecen al API original.
 - Riesgo operativo: Pexels/Pixabay/Coverr dependen de keys locales y red; fallos pueden dejar tareas en `state=4` si una excepcion ocurre en background.
 
