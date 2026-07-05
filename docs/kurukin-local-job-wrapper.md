@@ -50,8 +50,11 @@ El JSON debe ser un objeto con:
 - `render_quality`: string opcional. Acepta `draft_720p`, `standard_1080p`,
   `premium_2k` y aliases como `720p`, `1080p`, `2k`, `draft`, `standard` y
   `premium`.
+- `image_motion`: objeto opcional para animar imagenes locales JPG/JPEG/PNG con
+  movimiento simple. No genera video con IA.
 - `selectedAssets`: lista no vacia de objetos con `file`; `label` y `order` son
-  metadatos opcionales.
+  metadatos opcionales. En imagenes, `motion` y `motion_intensity` permiten
+  sobreescribir el movimiento global por asset.
 - `audio`: objeto opcional. `audio.file` apunta a un archivo dentro de
   `storage/local_audios` o de `--local-audios-dir`.
 - `subtitles`: objeto opcional. `subtitles.mode` acepta `whisper`, `edge`,
@@ -88,6 +91,76 @@ detalle real.
 Tambien se puede usar el campo legacy `video.video_resolution`. Si
 `render_quality` y `video.video_resolution` existen, deben ser equivalentes
 despues de normalizar aliases; si no, el wrapper falla antes de encolar.
+
+## Imagenes locales con movimiento
+
+`selectedAssets` puede mezclar videos locales e imagenes locales. Los videos
+mantienen el comportamiento normal del core. Las imagenes `.jpg`, `.jpeg` y
+`.png` pueden convertirse en clips de duracion `video.video_clip_duration` con
+movimiento visual suave tipo Ken Burns.
+
+Ejemplo global:
+
+```json
+{
+  "image_motion": {
+    "enabled": true,
+    "preset": "slow_zoom_in",
+    "intensity": 0.06
+  }
+}
+```
+
+Ejemplo por asset:
+
+```json
+{
+  "selectedAssets": [
+    {
+      "file": "foto-ritual.png",
+      "label": "intro",
+      "order": 1,
+      "motion": "pan_up",
+      "motion_intensity": 0.05
+    }
+  ]
+}
+```
+
+Perfiles disponibles:
+
+```text
+none
+slow_zoom_in
+slow_zoom_out
+pan_left
+pan_right
+pan_up
+pan_down
+subtle_pulse
+handheld_soft
+```
+
+Aliases aceptados: `zoom_in`, `zoom_out`, `ken_burns`, `pulse` y `handheld`.
+`intensity` y `motion_intensity` aceptan valores de `0.0` a `0.20`; `0.06` es
+el default recomendado y `0.0` deja el movimiento imperceptible.
+
+Reglas:
+
+- Si `image_motion` falta o `enabled` es `false`, el payload core no recibe los
+  campos globales y se conserva el comportamiento actual.
+- Si una imagen define `motion`, ese preset gana sobre el global.
+- Si una imagen no define `motion` y `image_motion.enabled` es `true`, el core
+  usa `image_motion.preset`.
+- Si un video trae `motion`, el wrapper lo conserva bajo `runner.selectedAssets`
+  como metadata, pero no lo envia en `video_materials`.
+- El wrapper no deja `image_motion` ni `selectedAssets` como keys root del job;
+  solo envia los campos core `image_motion_enabled`, `image_motion_preset` e
+  `image_motion_intensity` cuando corresponde.
+
+Para vertical, los presets mas seguros son `slow_zoom_in`, `pan_up` y
+`subtle_pulse`. Use movimientos suaves para evitar mareo; esto solo anima una
+imagen existente con zoom, pan o pulso, no crea contenido nuevo con IA.
 
 ## Audio y subtitulos propios
 

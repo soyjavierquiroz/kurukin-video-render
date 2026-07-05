@@ -71,6 +71,35 @@ Si `video_source == "local"`, `task.get_video_materials()` llama a `video.prepro
 
 La WebUI puede subir archivos locales y guardarlos en `storage/local_videos`. Nuestro `scripts/local_job_wrapper.py` tambien genera payloads locales: valida `selectedAssets`, ordena por `order`, aplica presets de subtitulos, fija `video_source = "local"` y produce `video_materials = [{"provider": "local", "url": <filename>, "duration": 0}]`.
 
+## Imagenes locales con image_motion
+
+Las imagenes locales pueden convertirse a clips MP4 temporales antes del render
+final. `app/services/task.py` pasa a `video.preprocess_video()` el
+`video_aspect`, `video_resolution`, `video_clip_duration` y los campos
+`image_motion_*` del request. `app/services/video.py` resuelve `target_size`
+con `resolve_video_size(video_aspect, video_resolution)` y aplica movimiento
+solo cuando el material local es imagen.
+
+Campos globales:
+
+- `image_motion_enabled`
+- `image_motion_preset`
+- `image_motion_intensity`
+
+Campos por material:
+
+- `MaterialInfo.motion`
+- `MaterialInfo.motion_intensity`
+
+La prioridad es: `MaterialInfo.motion` por asset, luego preset global si
+`image_motion_enabled` es `true`, y finalmente `none`. Los videos locales
+ignoran estos campos y no se alteran. El movimiento no usa IA: es un motion
+still con zoom, pan, pulso suave o vibracion sutil, implementado en
+`create_image_motion_clip()` dentro de `app/services/video.py`.
+
+Cuando no hay movimiento habilitado, el preprocesado de imagenes conserva el
+comportamiento historico del core.
+
 ## TTS/voice
 
 Si no hay `custom_audio_file`, `generate_audio()` llama a `voice.tts()` con:

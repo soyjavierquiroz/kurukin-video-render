@@ -53,6 +53,8 @@ class MaterialInfo:
     provider: str = "pexels"
     url: str = ""
     duration: int = 0
+    motion: str = ""
+    motion_intensity: float = 0.0
 
 
 class VideoParams(BaseModel):
@@ -87,6 +89,9 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
+    image_motion_enabled: bool = False
+    image_motion_preset: str = ""
+    image_motion_intensity: float = 0.06
     
     custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
     custom_subtitle_file: str = ""  # Custom SRT file path, will skip subtitle generation/correction

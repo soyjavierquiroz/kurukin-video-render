@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -44,6 +45,27 @@ RENDER_QUALITY_ALIASES = {
     "2k": "premium_2k",
     "1440p": "premium_2k",
 }
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
+IMAGE_MOTION_PRESETS = {
+    "none",
+    "slow_zoom_in",
+    "slow_zoom_out",
+    "pan_left",
+    "pan_right",
+    "pan_up",
+    "pan_down",
+    "subtle_pulse",
+    "handheld_soft",
+}
+IMAGE_MOTION_ALIASES = {
+    "zoom_in": "slow_zoom_in",
+    "zoom_out": "slow_zoom_out",
+    "ken_burns": "slow_zoom_in",
+    "pulse": "subtle_pulse",
+    "handheld": "handheld_soft",
+}
+DEFAULT_IMAGE_MOTION_INTENSITY = 0.06
+MAX_IMAGE_MOTION_INTENSITY = 0.20
 
 
 class LocalJobWrapperError(Exception):
@@ -282,6 +304,85 @@ def normalize_render_quality(value: Any, *, label: str) -> str:
         ) from exc
 
 
+def normalize_image_motion_preset(value: Any, *, label: str) -> str:
+    if value in (None, ""):
+        return "none"
+    if not isinstance(value, str):
+        raise LocalJobWrapperError(f"{label} must be a string when provided")
+
+    normalized = value.strip().lower()
+    if not normalized:
+        return "none"
+    normalized = IMAGE_MOTION_ALIASES.get(normalized, normalized)
+    if normalized not in IMAGE_MOTION_PRESETS:
+        raise LocalJobWrapperError(
+            f"Unsupported image motion preset {value!r}."
+        )
+    return normalized
+
+
+def normalize_image_motion_intensity(value: Any, *, label: str) -> float:
+    if value in (None, ""):
+        return DEFAULT_IMAGE_MOTION_INTENSITY
+    if isinstance(value, bool):
+        raise LocalJobWrapperError(f"{label} must be a number between 0.0 and 0.20")
+    try:
+        intensity = float(value)
+    except (TypeError, ValueError) as exc:
+        raise LocalJobWrapperError(
+            f"{label} must be a number between 0.0 and 0.20"
+        ) from exc
+    if not math.isfinite(intensity):
+        raise LocalJobWrapperError(f"{label} must be a finite number")
+    if intensity < 0.0 or intensity > MAX_IMAGE_MOTION_INTENSITY:
+        raise LocalJobWrapperError(f"{label} must be between 0.0 and 0.20")
+    return intensity
+
+
+def is_image_asset(filename: str) -> bool:
+    return Path(filename).suffix.lower().lstrip(".") in IMAGE_EXTENSIONS
+
+
+def normalize_image_motion_config(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise LocalJobWrapperError("image_motion must be a JSON object when provided")
+
+    enabled = _optional_bool(
+        value.get("enabled"),
+        default=False,
+        label="image_motion.enabled",
+    )
+    normalized = {"enabled": enabled}
+    if "preset" in value or enabled:
+        normalized["preset"] = normalize_image_motion_preset(
+            value.get("preset"),
+            label="image_motion.preset",
+        )
+    if "intensity" in value or enabled:
+        normalized["intensity"] = normalize_image_motion_intensity(
+            value.get("intensity"),
+            label="image_motion.intensity",
+        )
+    return normalized
+
+
+def normalize_asset_motion(asset: dict[str, Any], index: int) -> dict[str, Any]:
+    normalized = dict(asset)
+    if "motion" in normalized:
+        normalized["motion"] = normalize_image_motion_preset(
+            normalized.get("motion"),
+            label=f"selectedAssets[{index}].motion",
+        )
+    if "motion_intensity" in normalized:
+        normalized["motion_intensity"] = normalize_image_motion_intensity(
+            normalized.get("motion_intensity"),
+            label=f"selectedAssets[{index}].motion_intensity",
+        )
+    return normalized
+
+
 def apply_render_quality_contract(
     pending_job: dict[str, Any],
     spec: dict[str, Any],
@@ -310,6 +411,26 @@ def apply_render_quality_contract(
     pending_job.pop("render_quality", None)
     if top_level_quality:
         pending_job["runner"]["render_quality"] = effective_quality
+
+
+def apply_image_motion_contract(
+    pending_job: dict[str, Any],
+    spec: dict[str, Any],
+) -> None:
+    image_motion = normalize_image_motion_config(spec.get("image_motion"))
+    if image_motion is None:
+        return
+
+    pending_job["runner"]["image_motion"] = image_motion
+    if not image_motion.get("enabled", False):
+        return
+
+    pending_job["image_motion_enabled"] = True
+    pending_job["image_motion_preset"] = image_motion.get("preset", "none")
+    pending_job["image_motion_intensity"] = image_motion.get(
+        "intensity",
+        DEFAULT_IMAGE_MOTION_INTENSITY,
+    )
 
 
 def apply_audio_contract(
@@ -580,7 +701,7 @@ def validate_job_spec(
                     f"({width}x{height}, minimum {min_width}x{min_height})"
                 )
 
-        normalized = dict(asset)
+        normalized = normalize_asset_motion(asset, index)
         normalized["file"] = filename
         normalized_assets.append(normalized)
 
@@ -634,18 +755,25 @@ def build_pending_job(
 
     pending_job.update(styled_video)
     pending_job["video_source"] = "local"
-    pending_job["video_materials"] = [
-        {
+    video_materials = []
+    for asset in ordered_assets:
+        material = {
             "provider": "local",
             "url": asset["file"],
             "duration": 0,
         }
-        for asset in ordered_assets
-    ]
+        if is_image_asset(asset["file"]):
+            if asset.get("motion"):
+                material["motion"] = asset["motion"]
+            if "motion_intensity" in asset:
+                material["motion_intensity"] = asset["motion_intensity"]
+        video_materials.append(material)
+    pending_job["video_materials"] = video_materials
     pending_job.pop("selectedAssets", None)
     pending_job.pop("subtitle_style_preset", None)
     pending_job.pop("subtitle_style_overrides", None)
     apply_render_quality_contract(pending_job, spec)
+    apply_image_motion_contract(pending_job, spec)
     apply_audio_contract(
         pending_job,
         spec,

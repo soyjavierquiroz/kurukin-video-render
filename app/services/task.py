@@ -351,7 +351,13 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+            materials=params.video_materials,
+            clip_duration=params.video_clip_duration,
+            video_aspect=params.video_aspect,
+            video_resolution=getattr(params, "video_resolution", ""),
+            image_motion_enabled=getattr(params, "image_motion_enabled", False),
+            image_motion_preset=getattr(params, "image_motion_preset", ""),
+            image_motion_intensity=getattr(params, "image_motion_intensity", 0.06),
         )
         if not materials:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
