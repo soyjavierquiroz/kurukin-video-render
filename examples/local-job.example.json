@@ -1,6 +1,7 @@
 {
   "job_id": "relaciones-local-demo-001",
   "description": "Demo usando assets locales seleccionados",
+  "render_quality": "standard_1080p",
   "subtitle_style_preset": "clean_center_bold",
   "audio": {
     "file": "audio-prueba.mp3"

@@ -32,6 +32,18 @@ ALLOWED_VIDEO_ASPECTS = {"9:16", "16:9"}
 ALLOWED_SUBTITLE_MODES = {"whisper", "edge", "custom_srt", "none"}
 ALLOWED_SUBTITLE_PROVIDERS = {"whisper", "edge"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RENDER_QUALITY_ALIASES = {
+    "draft": "draft_720p",
+    "draft_720p": "draft_720p",
+    "720p": "draft_720p",
+    "standard": "standard_1080p",
+    "standard_1080p": "standard_1080p",
+    "1080p": "standard_1080p",
+    "premium": "premium_2k",
+    "premium_2k": "premium_2k",
+    "2k": "premium_2k",
+    "1440p": "premium_2k",
+}
 
 
 class LocalJobWrapperError(Exception):
@@ -251,6 +263,53 @@ def _ensure_subtitle_provider_compatible(
         )
 
     return effective_provider or legacy_provider
+
+
+def normalize_render_quality(value: Any, *, label: str) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise LocalJobWrapperError(f"{label} must be a string when provided")
+
+    normalized = value.strip().lower()
+    if not normalized:
+        return ""
+    try:
+        return RENDER_QUALITY_ALIASES[normalized]
+    except KeyError as exc:
+        raise LocalJobWrapperError(
+            f"{label} must be one of: 720p, 1080p, 2k"
+        ) from exc
+
+
+def apply_render_quality_contract(
+    pending_job: dict[str, Any],
+    spec: dict[str, Any],
+) -> None:
+    top_level_quality = normalize_render_quality(
+        spec.get("render_quality"),
+        label="render_quality",
+    )
+    video_resolution = normalize_render_quality(
+        pending_job.get("video_resolution"),
+        label="video.video_resolution",
+    )
+
+    if top_level_quality and video_resolution and top_level_quality != video_resolution:
+        raise LocalJobWrapperError(
+            "render_quality conflicts with video.video_resolution: "
+            f"{top_level_quality!r} != {video_resolution!r}"
+        )
+
+    effective_quality = top_level_quality or video_resolution
+    if not effective_quality:
+        pending_job.pop("render_quality", None)
+        return
+
+    pending_job["video_resolution"] = effective_quality
+    pending_job.pop("render_quality", None)
+    if top_level_quality:
+        pending_job["runner"]["render_quality"] = effective_quality
 
 
 def apply_audio_contract(
@@ -586,6 +645,7 @@ def build_pending_job(
     pending_job.pop("selectedAssets", None)
     pending_job.pop("subtitle_style_preset", None)
     pending_job.pop("subtitle_style_overrides", None)
+    apply_render_quality_contract(pending_job, spec)
     apply_audio_contract(
         pending_job,
         spec,

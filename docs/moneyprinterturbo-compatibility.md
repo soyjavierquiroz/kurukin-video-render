@@ -25,6 +25,7 @@ Campos criticos:
 - `video_script`
 - `video_terms`
 - `video_aspect`
+- `video_resolution`
 - `video_concat_mode`
 - `video_transition_mode`
 - `video_clip_duration`
@@ -142,6 +143,10 @@ mantenerlos visibles al comparar contra upstream.
   margen transparente a subtitulos sin fondo para evitar cortes de stroke,
   acentos y descenders en `TextClip`; `clean_center_bold_safe` reduce tamano y
   borde para renders 9:16 centrados.
+- `render quality profiles`: `app/models/schema.py` expone
+  `video_resolution` y `app/services/video.py` usa `resolve_video_size()` para
+  resolver el tamano final por `video_aspect` + perfil. El default vacio
+  preserva 1080p; `premium_2k` es opt-in.
 
 ## Checklist para actualizar desde upstream
 
@@ -177,7 +182,10 @@ El script marca como `HIGH RISK`:
 - `docker-compose.yml`
 - `config.example.toml`
 
-Razon: ahi vive el contrato de payload, pipeline de render, subtitulos/audio/materiales, API, UI original, dependencias y runtime.
+Razon: ahi vive el contrato de payload, pipeline de render, resolucion final,
+padding visual de subtitulos, subtitulos/audio/materiales, API, UI original,
+dependencias y runtime. `app/services/video.py` es especialmente sensible
+porque concentra resolucion final y padding de subtitulos.
 
 ## Tests minimos despues de upstream sync
 

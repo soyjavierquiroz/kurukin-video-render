@@ -47,6 +47,9 @@ El JSON debe ser un objeto con:
 
 - `job_id`: string requerido.
 - `description`: string opcional.
+- `render_quality`: string opcional. Acepta `draft_720p`, `standard_1080p`,
+  `premium_2k` y aliases como `720p`, `1080p`, `2k`, `draft`, `standard` y
+  `premium`.
 - `selectedAssets`: lista no vacia de objetos con `file`; `label` y `order` son
   metadatos opcionales.
 - `audio`: objeto opcional. `audio.file` apunta a un archivo dentro de
@@ -62,6 +65,29 @@ El JSON debe ser un objeto con:
 
 `selectedAssets` se ordena por `order` cuando existe. Si ningun asset tiene
 `order`, se mantiene el orden original.
+
+## Calidad de render
+
+`render_quality` es metadata de entrada del wrapper. No se envia al API de
+MoneyPrinterTurbo como key propia: el wrapper lo convierte al campo core
+`video_resolution`.
+
+Perfiles soportados:
+
+```text
+draft_720p     = 720x1280 vertical / 1280x720 horizontal
+standard_1080p = 1080x1920 vertical / 1920x1080 horizontal
+premium_2k     = 1440x2560 vertical / 2560x1440 horizontal
+```
+
+`standard_1080p` preserva el default recomendado para el Droplet de 8GB. `2K`
+es opt-in y debe reservarse para pruebas o jobs premium controlados. Si los
+assets fuente son 1080p, `premium_2k` escala el video final pero no agrega
+detalle real.
+
+Tambien se puede usar el campo legacy `video.video_resolution`. Si
+`render_quality` y `video.video_resolution` existen, deben ser equivalentes
+despues de normalizar aliases; si no, el wrapper falla antes de encolar.
 
 ## Audio y subtitulos propios
 
@@ -295,6 +321,7 @@ El job pendiente conserva metadatos para el runner:
   "description": "Demo usando assets locales seleccionados",
   "runner": {
     "source": "local_job_wrapper",
+    "render_quality": "standard_1080p",
     "selectedAssets": [
       { "file": "clip-01.mp4", "label": "intro", "order": 1 }
     ],
@@ -314,6 +341,7 @@ El job pendiente conserva metadatos para el runner:
   "video_subject": "La importancia de escoger bien a tu pareja",
   "video_script": "Escoger bien a tu pareja puede cambiar por completo el rumbo de tu vida.",
   "video_aspect": "9:16",
+  "video_resolution": "standard_1080p",
   "subtitle_position": "center",
   "font_name": "BeVietnamPro-Bold.ttf",
   "text_fore_color": "#FFFFFF",
@@ -335,6 +363,9 @@ enviar el payload final a MoneyPrinterTurbo.
 
 `audio` y `subtitles` tampoco quedan como keys raiz. Su metadata queda dentro de
 `runner.audio` y `runner.subtitles`.
+
+`render_quality` tampoco queda como key raiz. Si se informa, queda auditado en
+`runner.render_quality` y se convierte a `video_resolution` para el core.
 
 `subtitle_style_preset` y `subtitle_style_overrides` tampoco quedan como keys
 raiz del job pendiente. La metadata de estilo se conserva dentro de `runner`.
