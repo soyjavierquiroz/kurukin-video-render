@@ -1,9 +1,14 @@
 # Kurukin Local Job Wrapper
 
-`scripts/local_job_wrapper.py` convierte un JSON con `selectedAssets` locales y
-configuracion de video en un job compatible con `scripts/nightly_runner.py`.
-No renderiza video ni llama a la API de MoneyPrinterTurbo; solo valida assets y,
-cuando se solicita, escribe un JSON en `storage/nightly_jobs/pending/`.
+`scripts/local_job_wrapper.py` es el CLI fino para specs Kurukin locales. La
+conversion y validacion reusable vive en `app/custom/kurukin_job_adapter.py`;
+el wrapper solo carga el JSON, llama al adapter, imprime el payload, valida o
+encola en `storage/nightly_jobs/pending/`.
+
+No renderiza video ni llama a la API de MoneyPrinterTurbo. La futura Render
+Console debe usar `app/custom/kurukin_job_adapter.py` directamente en vez de
+reimplementar reglas de selectedAssets, audio, subtitulos, render quality,
+image motion o Asset Hub.
 
 ## Uso
 
@@ -43,7 +48,8 @@ python3 scripts/local_job_wrapper.py examples/local-job.example.json --validate-
 
 ## Entrada esperada
 
-El JSON debe ser un objeto con:
+El contrato reusable completo esta documentado en
+`docs/kurukin-job-spec.md`. El JSON debe ser un objeto con:
 
 - `job_id`: string requerido.
 - `description`: string opcional.

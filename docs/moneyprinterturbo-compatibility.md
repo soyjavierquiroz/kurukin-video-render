@@ -116,6 +116,12 @@ El wrapper tambien elimina del payload root:
 
 Estos campos pueden existir en specs Kurukin, en artifacts y en UI propia, pero MoneyPrinterTurbo Adapter debe convertirlos a campos originales antes de llamar `/api/v1/videos`.
 
+`app/custom/kurukin_job_adapter.py` es la frontera reusable para esa conversion.
+La Render Console, scripts locales y cualquier orquestador Kurukin deben usar
+ese modulo para producir el payload MoneyPrinterTurbo en vez de duplicar reglas.
+`scripts/local_job_wrapper.py` queda como CLI y escritor opcional de cola
+pending, no como fuente de contratos.
+
 ## Archivos core que tocamos o montamos
 
 El core a proteger en sync upstream incluye:
@@ -169,6 +175,12 @@ mantenerlos visibles al comparar contra upstream.
   `app/services/video.py` permite `provider = "asset_hub"` solo bajo
   `/data/job-assets`; `docker-compose.local.yml` monta
   `kurukin-asset-hub_job_assets:/data/job-assets:ro`.
+- `kurukin job adapter`: `app/custom/kurukin_job_adapter.py` convierte specs
+  Kurukin a payloads MoneyPrinterTurbo compatibles con `/api/v1/videos`.
+  Centraliza selectedAssets locales, audio propio, subtitulos por job,
+  render_quality, image_motion, Asset Hub renderer manifests y metadata
+  `runner`. `scripts/local_job_wrapper.py` delega en este modulo y conserva
+  solo CLI, print-payload, validate-only y enqueue.
 
 ## Checklist para actualizar desde upstream
 
