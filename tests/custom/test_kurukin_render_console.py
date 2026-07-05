@@ -7,11 +7,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from app.custom.kurukin_job_adapter import KurukinJobAdapterError
 from app.custom.kurukin_render_console import (
+    ASSET_SOURCE_LOCAL,
+    ASSET_SOURCE_ASSET_HUB,
+    ASSET_SOURCE_STOCK,
+    SOURCE_MODE_ASSET_HUB,
+    SOURCE_MODE_LOCAL,
+    SOURCE_MODE_STOCK,
     build_operator_summary,
     build_render_console_spec,
+    build_workflow_payload,
     default_asset_hub_manifest_path,
     get_manifest_summary_for_ui,
+    list_local_storage_files,
+    safe_relative_path,
     validate_and_build_payload_from_console_spec,
 )
 
@@ -34,6 +44,11 @@ def make_spec(**overrides):
 
 
 class TestKurukinRenderConsole(unittest.TestCase):
+    def test_asset_source_constants_are_importable_aliases(self):
+        self.assertEqual(ASSET_SOURCE_ASSET_HUB, SOURCE_MODE_ASSET_HUB)
+        self.assertEqual(ASSET_SOURCE_LOCAL, SOURCE_MODE_LOCAL)
+        self.assertEqual(ASSET_SOURCE_STOCK, SOURCE_MODE_STOCK)
+
     def test_get_manifest_summary_for_ui_with_empty_path(self):
         self.assertEqual(
             get_manifest_summary_for_ui(""),
@@ -161,6 +176,34 @@ class TestKurukinRenderConsole(unittest.TestCase):
             )
         )
 
+    def test_build_render_console_spec_with_local_assets_creates_selected_assets(self):
+        spec = make_spec(
+            asset_source_mode=ASSET_SOURCE_LOCAL,
+            selected_local_assets=["clip-01.mp4", "still-02.png"],
+        )
+
+        self.assertNotIn("asset_hub", spec)
+        self.assertEqual(
+            spec["selectedAssets"],
+            [
+                {"file": "clip-01.mp4", "order": 1},
+                {"file": "still-02.png", "order": 2},
+            ],
+        )
+
+    def test_build_render_console_spec_local_assets_rejects_parent_path(self):
+        with self.assertRaises(KurukinJobAdapterError):
+            make_spec(
+                asset_source_mode=ASSET_SOURCE_LOCAL,
+                selected_local_assets=["../clip-01.mp4"],
+            )
+
+    def test_build_render_console_spec_stock_mode_is_not_available_yet(self):
+        with self.assertRaises(ValueError) as raised:
+            make_spec(asset_source_mode=ASSET_SOURCE_STOCK, stock_source="pexels")
+
+        self.assertIn("Stock externo", str(raised.exception))
+
     def test_build_render_console_spec_with_audio_file_creates_audio(self):
         spec = make_spec(audio_file="audio-prueba.mp3")
 
@@ -250,6 +293,46 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
     def test_no_selected_assets_in_basic_form_spec(self):
         self.assertNotIn("selectedAssets", make_spec())
+
+    def test_safe_relative_path_rejects_absolute_path(self):
+        with self.assertRaises(KurukinJobAdapterError):
+            safe_relative_path(
+                "/tmp/clip.mp4",
+                allowed_extensions={"mp4"},
+                label="asset",
+            )
+
+    def test_list_local_storage_files_returns_allowed_safe_filenames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "clip-a.mp4").write_text("dummy", encoding="utf-8")
+            (base / "notes.txt").write_text("dummy", encoding="utf-8")
+            (base / "clip-b.png").write_text("dummy", encoding="utf-8")
+
+            self.assertEqual(
+                list_local_storage_files(base, allowed_extensions={"mp4", "png"}),
+                ["clip-a.mp4", "clip-b.png"],
+            )
+
+    def test_build_workflow_payload_keeps_asset_hub_material_count_zero(self):
+        payload = build_workflow_payload(
+            {
+                "job_id": "render-console-ui-smoke-001",
+                "video_subject": "Smoke",
+                "video_script": "Smoke script.",
+                "render_quality": "draft_720p",
+                "video_aspect": "9:16",
+                "asset_hub_bundle_uid": BUNDLE_UID,
+                "subtitles_mode": "none",
+                "image_motion_enabled": True,
+                "image_motion_preset": "slow_zoom_in",
+            }
+        )
+
+        self.assertEqual(payload["job_id"], "render-console-ui-smoke-001")
+        self.assertEqual(payload["asset_hub_bundle_uid"], BUNDLE_UID)
+        self.assertEqual(payload["video_resolution"], "draft_720p")
+        self.assertNotIn("video_materials", payload)
 
 
 if __name__ == "__main__":
