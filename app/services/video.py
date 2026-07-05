@@ -1,6 +1,7 @@
 import glob
 import itertools
 import io
+import math
 import os
 import random
 import gc
@@ -84,6 +85,26 @@ _SUPPORTED_VIDEO_CODECS = (
     "h264_videotoolbox",
 )
 _runtime_disabled_video_codecs = set()
+_IMAGE_MOTION_PRESETS = {
+    "none",
+    "slow_zoom_in",
+    "slow_zoom_out",
+    "pan_left",
+    "pan_right",
+    "pan_up",
+    "pan_down",
+    "subtle_pulse",
+    "handheld_soft",
+}
+_IMAGE_MOTION_ALIASES = {
+    "zoom_in": "slow_zoom_in",
+    "zoom_out": "slow_zoom_out",
+    "ken_burns": "slow_zoom_in",
+    "pulse": "subtle_pulse",
+    "handheld": "handheld_soft",
+}
+_IMAGE_MOTION_DEFAULT_INTENSITY = 0.06
+_IMAGE_MOTION_MAX_INTENSITY = 0.20
 
 
 def _normalize_video_resolution(video_resolution: str = "") -> str:
@@ -133,6 +154,130 @@ def resolve_video_size(video_aspect: str, video_resolution: str = "") -> tuple[i
         f"Unsupported video_aspect {str(video_aspect)!r} for video_resolution "
         f"{str(video_resolution)!r}. Expected 9:16 or 16:9."
     )
+
+
+def normalize_image_motion_preset(value: str) -> str:
+    raw_value = "" if value is None else str(value)
+    normalized = raw_value.strip().lower()
+    if not normalized:
+        return "none"
+    normalized = _IMAGE_MOTION_ALIASES.get(normalized, normalized)
+    if normalized not in _IMAGE_MOTION_PRESETS:
+        raise ValueError(f"Unsupported image motion preset {raw_value!r}.")
+    return normalized
+
+
+def clamp_image_motion_intensity(value: float | int | None) -> float:
+    if value in (None, ""):
+        return _IMAGE_MOTION_DEFAULT_INTENSITY
+    if isinstance(value, bool):
+        raise ValueError("image motion intensity must be a number between 0.0 and 0.20")
+    try:
+        intensity = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "image motion intensity must be a number between 0.0 and 0.20"
+        ) from exc
+    if not math.isfinite(intensity):
+        raise ValueError("image motion intensity must be a finite number")
+    if intensity < 0.0 or intensity > _IMAGE_MOTION_MAX_INTENSITY:
+        raise ValueError("image motion intensity must be between 0.0 and 0.20")
+    return intensity
+
+
+def is_image_file(path_or_name: str) -> bool:
+    extension = os.path.splitext(str(path_or_name or ""))[1].lower().lstrip(".")
+    return extension in {"jpg", "jpeg", "png"}
+
+
+def _progress(current_time: float, duration: float) -> float:
+    return min(max(current_time / max(duration, 0.001), 0.0), 1.0)
+
+
+def _cover_image_size(image_path: str, target_size: tuple[int, int]) -> tuple[int, int]:
+    target_width, target_height = target_size
+    with Image.open(image_path) as image:
+        image_width, image_height = image.size
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError(f"invalid image size for {image_path}")
+    cover_scale = max(target_width / image_width, target_height / image_height)
+    return (
+        max(target_width, int(math.ceil(image_width * cover_scale))),
+        max(target_height, int(math.ceil(image_height * cover_scale))),
+    )
+
+
+def create_image_motion_clip(
+    image_path: str,
+    duration: float,
+    target_size: tuple[int, int],
+    motion_preset: str = "none",
+    intensity: float = _IMAGE_MOTION_DEFAULT_INTENSITY,
+):
+    preset = normalize_image_motion_preset(motion_preset)
+    motion_intensity = clamp_image_motion_intensity(intensity)
+    target_width, target_height = target_size
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("target_size must contain positive width and height")
+    clip_duration = float(duration)
+    if clip_duration <= 0:
+        raise ValueError("image motion duration must be greater than 0")
+
+    base_width, base_height = _cover_image_size(image_path, target_size)
+    motion_pad = 1.0 + max(motion_intensity, 0.01)
+
+    if preset in {"pan_left", "pan_right", "pan_up", "pan_down", "handheld_soft"}:
+        base_width = int(math.ceil(base_width * motion_pad))
+        base_height = int(math.ceil(base_height * motion_pad))
+
+    def scale_at(current_time: float) -> float:
+        progress = _progress(current_time, clip_duration)
+        if preset == "slow_zoom_in":
+            return 1.0 + (motion_intensity * progress)
+        if preset == "slow_zoom_out":
+            return 1.0 + (motion_intensity * (1.0 - progress))
+        if preset == "subtle_pulse":
+            return 1.0 + (motion_intensity * 0.5 * math.sin(math.pi * progress) ** 2)
+        if preset == "handheld_soft":
+            return 1.0 + min(motion_intensity * 0.25, 0.02)
+        return 1.0
+
+    def position_at(current_time: float):
+        progress = _progress(current_time, clip_duration)
+        scale = scale_at(current_time)
+        width = base_width * scale
+        height = base_height * scale
+        overflow_x = max(width - target_width, 0.0)
+        overflow_y = max(height - target_height, 0.0)
+        center_x = -overflow_x / 2.0
+        center_y = -overflow_y / 2.0
+
+        if preset == "pan_left":
+            return (-overflow_x * progress, center_y)
+        if preset == "pan_right":
+            return (-overflow_x * (1.0 - progress), center_y)
+        if preset == "pan_up":
+            return (center_x, -overflow_y * progress)
+        if preset == "pan_down":
+            return (center_x, -overflow_y * (1.0 - progress))
+        if preset == "handheld_soft":
+            amplitude_x = min(target_width * motion_intensity * 0.10, 12.0)
+            amplitude_y = min(target_height * motion_intensity * 0.08, 12.0)
+            return (
+                center_x + math.sin(current_time * 2.1) * amplitude_x,
+                center_y + math.cos(current_time * 1.7) * amplitude_y,
+            )
+        return (center_x, center_y)
+
+    image_clip = (
+        ImageClip(image_path)
+        .with_duration(clip_duration)
+        .resized(new_size=(base_width, base_height))
+    )
+    if preset in {"slow_zoom_in", "slow_zoom_out", "subtle_pulse", "handheld_soft"}:
+        image_clip = image_clip.resized(scale_at)
+    image_clip = image_clip.with_position(position_at)
+    return CompositeVideoClip([image_clip], size=target_size).with_duration(clip_duration)
 
 
 def _get_required_video_duration(audio_duration: float) -> float:
@@ -1204,7 +1349,15 @@ def generate_video(
     del video_clip
 
 
-def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
+def preprocess_video(
+    materials: List[MaterialInfo],
+    clip_duration=4,
+    video_aspect: str = VideoAspect.portrait.value,
+    video_resolution: str = "",
+    image_motion_enabled: bool = False,
+    image_motion_preset: str = "",
+    image_motion_intensity: float = _IMAGE_MOTION_DEFAULT_INTENSITY,
+):
     # WebUI 在某些二次生成场景下可能传入空素材列表，这里直接返回空结果，避免抛出 NoneType 异常。
     if not materials:
         return []
@@ -1212,6 +1365,9 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
     # 仅返回通过预处理校验的素材，避免低分辨率图片继续进入后续的视频合成流程。
     valid_materials = []
     local_videos_dir = utils.storage_dir("local_videos", create=True)
+    target_size = resolve_video_size(video_aspect, video_resolution)
+    global_motion_preset = normalize_image_motion_preset(image_motion_preset)
+    global_motion_intensity = clamp_image_motion_intensity(image_motion_intensity)
 
     for material in materials:
         if not material.url:
@@ -1264,24 +1420,51 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 logger.info(f"processing image: {material_source_path}")
                 # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再重新创建用于导出的图片 clip。
                 close_clip(clip)
-                # Create an image clip and set its duration to 3 seconds
-                clip = (
-                    ImageClip(material_source_path)
-                    .with_duration(clip_duration)
-                    .with_position("center")
-                )
-                # Apply a zoom effect using the resize method.
-                # A lambda function is used to make the zoom effect dynamic over time.
-                # The zoom effect starts from the original size and gradually scales up to 120%.
-                # t represents the current time, and clip.duration is the total duration of the clip (3 seconds).
-                # Note: 1 represents 100% size, so 1.2 represents 120% size.
-                zoom_clip = clip.resized(
-                    lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
-                )
+                duration = float(material.duration or clip_duration)
+                asset_motion = getattr(material, "motion", "") or ""
+                if asset_motion:
+                    motion_preset = normalize_image_motion_preset(asset_motion)
+                    motion_intensity = clamp_image_motion_intensity(
+                        getattr(material, "motion_intensity", None)
+                    )
+                elif image_motion_enabled:
+                    motion_preset = global_motion_preset
+                    motion_intensity = global_motion_intensity
+                else:
+                    motion_preset = "none"
+                    motion_intensity = global_motion_intensity
 
-                # Optionally, create a composite video clip containing the zoomed clip.
-                # This is useful when you want to add other elements to the video.
-                final_clip = CompositeVideoClip([zoom_clip])
+                if motion_preset == "none":
+                    logger.info(
+                        "image motion skipped: "
+                        f"file={os.path.basename(material_source_path)}, preset=none"
+                    )
+                    # Preserve the historical local image behavior when motion is disabled.
+                    clip = (
+                        ImageClip(material_source_path)
+                        .with_duration(duration)
+                        .with_position("center")
+                    )
+                    zoom_clip = clip.resized(
+                        lambda t: 1 + (duration * 0.03) * (t / clip.duration)
+                    )
+                    final_clip = CompositeVideoClip([zoom_clip])
+                else:
+                    logger.info(
+                        "image motion applied: "
+                        f"file={os.path.basename(material_source_path)}, "
+                        f"preset={motion_preset}, "
+                        f"intensity={motion_intensity:.2f}, "
+                        f"duration={duration:g}"
+                    )
+                    clip = None
+                    final_clip = create_image_motion_clip(
+                        image_path=material_source_path,
+                        duration=duration,
+                        target_size=target_size,
+                        motion_preset=motion_preset,
+                        intensity=motion_intensity,
+                    )
 
                 # Output the video to a file.
                 video_file = f"{material_source_path}.mp4"

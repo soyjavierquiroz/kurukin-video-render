@@ -33,6 +33,11 @@ Campos criticos:
 - `video_count`
 - `video_source`
 - `video_materials`
+- `image_motion_enabled`
+- `image_motion_preset`
+- `image_motion_intensity`
+- `MaterialInfo.motion`
+- `MaterialInfo.motion_intensity`
 - `custom_audio_file`
 - `custom_subtitle_file`
 - `subtitle_provider`
@@ -147,6 +152,12 @@ mantenerlos visibles al comparar contra upstream.
   `video_resolution` y `app/services/video.py` usa `resolve_video_size()` para
   resolver el tamano final por `video_aspect` + perfil. El default vacio
   preserva 1080p; `premium_2k` es opt-in.
+- `image motion profiles`: `app/models/schema.py` expone
+  `image_motion_enabled`, `image_motion_preset`, `image_motion_intensity`,
+  `MaterialInfo.motion` y `MaterialInfo.motion_intensity`; `app/services/video.py`
+  normaliza presets, valida intensidad y aplica motion still solo a imagenes
+  locales durante `preprocess_video()`. Videos locales mantienen el flujo
+  previo.
 
 ## Checklist para actualizar desde upstream
 

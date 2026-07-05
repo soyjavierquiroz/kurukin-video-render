@@ -2,6 +2,11 @@
   "job_id": "relaciones-local-demo-001",
   "description": "Demo usando assets locales seleccionados",
   "render_quality": "standard_1080p",
+  "image_motion": {
+    "enabled": true,
+    "preset": "slow_zoom_in",
+    "intensity": 0.06
+  },
   "subtitle_style_preset": "clean_center_bold",
   "audio": {
     "file": "audio-prueba.mp3"
@@ -13,9 +18,11 @@
   },
   "selectedAssets": [
     {
-      "file": "clip-01.mp4",
+      "file": "foto-ritual.png",
       "label": "intro",
-      "order": 1
+      "order": 1,
+      "motion": "pan_up",
+      "motion_intensity": 0.05
     },
     {
       "file": "clip-02.mp4",
