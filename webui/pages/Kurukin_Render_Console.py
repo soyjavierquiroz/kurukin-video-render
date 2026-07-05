@@ -101,7 +101,7 @@ def _show_error(exc):
 
 def _state_label(status):
     return {
-        "ready": "Listo",
+        "ready": "Bundle listo",
         "invalid": "Requiere atención",
         "not_found": "No encontrado",
         "missing_path": "Pendiente",
@@ -112,35 +112,215 @@ def _apply_page_style():
     st.markdown(
         """
         <style>
+        .stApp {
+            background: #f6f8fb;
+            color: #111827;
+        }
+        [data-testid="stHeader"] {
+            background: rgba(246, 248, 251, 0.86);
+            backdrop-filter: blur(10px);
+        }
+        [data-testid="stToolbar"] {
+            right: 1.25rem;
+        }
+        .block-container {
+            max-width: 1180px;
+            padding-top: 1.6rem;
+            padding-bottom: 3rem;
+        }
+        h1, h2, h3 {
+            color: #111827;
+            letter-spacing: 0;
+        }
+        .kurukin-hero {
+            border: 1px solid #dbe5f1;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #ffffff 0%, #eef6ff 62%, #f8fafc 100%);
+            padding: 1.65rem 1.75rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 18px 38px rgba(30, 41, 59, 0.08);
+        }
+        .kurukin-hero h1 {
+            font-size: clamp(2rem, 5vw, 3rem);
+            line-height: 1.04;
+            margin: 0 0 0.55rem;
+            font-weight: 780;
+        }
         .kurukin-lede {
             color: #4b5563;
-            font-size: 1.02rem;
-            margin: -0.35rem 0 1.25rem 0;
+            font-size: 1.04rem;
+            line-height: 1.55;
+            max-width: 760px;
+            margin: 0 0 1rem;
+        }
+        .kurukin-safety-note {
+            display: inline-flex;
+            align-items: center;
+            border: 1px solid #bfdbfe;
+            border-radius: 8px;
+            background: #eff6ff;
+            color: #1e3a8a;
+            font-size: 0.94rem;
+            font-weight: 650;
+            padding: 0.65rem 0.8rem;
+        }
+        .progress-row {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 0.65rem;
+            margin: 0.35rem 0 1rem;
+        }
+        .progress-step {
+            border: 1px solid #dbe5f1;
+            border-radius: 8px;
+            background: #ffffff;
+            padding: 0.78rem 0.85rem;
+            min-height: 76px;
+            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.05);
+        }
+        .progress-step strong {
+            display: block;
+            color: #0f172a;
+            font-size: 0.94rem;
+            margin-bottom: 0.2rem;
+        }
+        .progress-step span {
+            color: #64748b;
+            font-size: 0.8rem;
+            line-height: 1.25;
         }
         .workflow-card {
-            border: 1px solid #e5e7eb;
+            border: 1px solid #dbe5f1;
             border-radius: 8px;
-            padding: 1rem 1.1rem;
+            padding: 1.15rem 1.2rem;
             background: #ffffff;
-            margin-bottom: 0.85rem;
+            margin-bottom: 0.9rem;
+            box-shadow: 0 12px 26px rgba(15, 23, 42, 0.055);
         }
         .workflow-card h3 {
             margin-top: 0;
-            margin-bottom: 0.35rem;
-            font-size: 1.05rem;
+            margin-bottom: 0.45rem;
+            font-size: 1.12rem;
+            font-weight: 760;
         }
         .soft-note {
-            border-left: 4px solid #2563eb;
+            border: 1px solid #bfdbfe;
             background: #eff6ff;
             padding: 0.75rem 0.9rem;
-            border-radius: 6px;
+            border-radius: 8px;
             color: #1f2937;
             margin: 0.5rem 0 0.75rem;
+        }
+        .mode-card-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.75rem;
+            margin: 0.45rem 0 0.95rem;
+        }
+        .mode-card {
+            border: 1px solid #dbe5f1;
+            border-radius: 8px;
+            background: #f8fafc;
+            padding: 0.95rem 1rem;
+            min-height: 118px;
+        }
+        .mode-card.is-selected {
+            border-color: #2563eb;
+            background: #eff6ff;
+            box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.16);
+        }
+        .mode-card strong {
+            display: block;
+            color: #0f172a;
+            font-size: 0.98rem;
+            margin-bottom: 0.28rem;
+        }
+        .mode-card span {
+            display: block;
+            color: #64748b;
+            font-size: 0.86rem;
+            line-height: 1.35;
+        }
+        .mode-card small {
+            display: inline-block;
+            margin-top: 0.65rem;
+            color: #2563eb;
+            font-weight: 700;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+        }
+        .bundle-summary {
+            border: 1px solid #bbf7d0;
+            border-radius: 8px;
+            background: #f0fdf4;
+            padding: 1rem;
+            margin: 0.7rem 0 0.8rem;
+        }
+        .bundle-summary h4 {
+            margin: 0 0 0.35rem;
+            color: #14532d;
+            font-size: 1rem;
+        }
+        .bundle-summary p {
+            margin: 0;
+            color: #166534;
+            font-size: 0.9rem;
+        }
+        .secondary-caption {
+            color: #64748b;
+            font-size: 0.9rem;
+            margin: 0.35rem 0 0.7rem;
+        }
+        .stAlert {
+            border-radius: 8px;
+        }
+        [data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 0.85rem 0.9rem;
+        }
+        [data-testid="stMetricLabel"] {
+            color: #64748b;
+        }
+        div.stButton > button {
+            border-radius: 8px;
+            border: 1px solid #2563eb;
+            background: #2563eb;
+            color: #ffffff;
+            font-weight: 720;
+            min-height: 2.8rem;
+            box-shadow: 0 10px 18px rgba(37, 99, 235, 0.18);
+        }
+        div.stButton > button:hover {
+            border-color: #1d4ed8;
+            background: #1d4ed8;
+            color: #ffffff;
+        }
+        [data-testid="stExpander"] {
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            background: #ffffff;
+            box-shadow: none;
+        }
+        [data-testid="stMarkdownContainer"] hr {
+            border-color: #e2e8f0;
+            margin: 0.65rem 0;
         }
         .status-ready { color: #047857; font-weight: 700; }
         .status-attention { color: #b45309; font-weight: 700; }
         .status-missing { color: #b91c1c; font-weight: 700; }
         .status-pending { color: #4b5563; font-weight: 700; }
+        @media (max-width: 760px) {
+            .progress-row,
+            .mode-card-grid {
+                grid-template-columns: 1fr;
+            }
+            .kurukin-hero {
+                padding: 1.25rem;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -159,9 +339,90 @@ def _select_label_for_value(mapping, value, default_value):
     return mapping.get(value, mapping[default_value])
 
 
+def _format_duration(seconds):
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        value = 0.0
+    return f"{value:.2f} s aprox."
+
+
+def _hero_block():
+    st.markdown(
+        """
+        <section class="kurukin-hero">
+            <h1>Crear video Kurukin</h1>
+            <p class="kurukin-lede">
+                Prepara un video usando assets aprobados, audio propio y subtítulos,
+                y envíalo a la cola de render cuando esté listo.
+            </p>
+            <div class="kurukin-safety-note">
+                Esta pantalla no renderiza inmediatamente. Solo prepara y envía
+                trabajos a la cola.
+            </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _progress_steps():
+    steps = (
+        ("1", "Assets", "Elige visuales aprobados"),
+        ("2", "Contenido", "Define título y guion"),
+        ("3", "Audio", "Suma audio o subtítulos"),
+        ("4", "Estilo", "Ajusta formato y movimiento"),
+        ("5", "Revisión", "Valida antes de encolar"),
+    )
+    step_html = "".join(
+        f"""
+        <div class="progress-step">
+            <strong>{number}. {title}</strong>
+            <span>{caption}</span>
+        </div>
+        """
+        for number, title, caption in steps
+    )
+    st.markdown(f'<div class="progress-row">{step_html}</div>', unsafe_allow_html=True)
+
+
+def _asset_mode_cards(selected_mode):
+    cards = (
+        (
+            ASSET_SOURCE_ASSET_HUB,
+            "Asset Hub Bundle",
+            "Usa el paquete aprobado y su manifest derivado automáticamente.",
+            "Recomendado",
+        ),
+        (
+            ASSET_SOURCE_LOCAL,
+            "Assets locales",
+            "Selecciona archivos ya disponibles en el worker.",
+            "Manual",
+        ),
+        (
+            ASSET_SOURCE_STOCK,
+            "Stock externo",
+            "Próximamente/configurable desde la experiencia legacy.",
+            "Configurable",
+        ),
+    )
+    card_html = "".join(
+        f"""
+        <div class="mode-card {'is-selected' if selected_mode == mode else ''}">
+            <strong>{title}</strong>
+            <span>{description}</span>
+            <small>{tag}</small>
+        </div>
+        """
+        for mode, title, description, tag in cards
+    )
+    st.markdown(f'<div class="mode-card-grid">{card_html}</div>', unsafe_allow_html=True)
+
+
 def _initialize_form_state():
     st.session_state.setdefault("job_id", _default_job_id())
-    st.session_state.setdefault("video_subject", "Render Console Example")
+    st.session_state.setdefault("video_subject", "Video Kurukin de prueba")
     st.session_state.setdefault("video_script", "Example script.")
     st.session_state.setdefault("video_aspect", "9:16")
     st.session_state.setdefault("render_quality", "draft_720p")
@@ -211,7 +472,12 @@ def _manifest_summary_block(summary):
     status = summary.get("status")
     label = _state_label(status)
     st.markdown(
-        f"Estado del bundle: <span class=\"{_status_class(summary)}\">{label}</span>",
+        f"""
+        <div class="bundle-summary">
+            <h4><span class="{_status_class(summary)}">{label}</span></h4>
+            <p>Resumen del paquete de assets seleccionado.</p>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -219,10 +485,10 @@ def _manifest_summary_block(summary):
         cols = st.columns(5)
         cols[0].metric("Escenas", summary.get("total_scenes", 0))
         cols[1].metric("Assets", summary.get("total_assets", 0))
-        cols[2].metric("Duración aprox.", f"{summary.get('duration_total_seconds', 0)} s")
-        cols[3].metric("Warnings", summary.get("warnings_count", 0))
-        cols[4].metric("Revisión humana", summary.get("needs_human_review_count", 0))
-        st.caption(f"Bundle UID: {summary.get('bundle_uid') or '-'}")
+        cols[2].metric("Duración", _format_duration(summary.get("duration_total_seconds")))
+        cols[3].metric("Avisos", summary.get("warnings_count", 0))
+        cols[4].metric("Para revisar", summary.get("needs_human_review_count", 0))
+        st.caption(f"Código del paquete de assets: {summary.get('bundle_uid') or '-'}")
         asset_types = summary.get("asset_types") or {}
         if asset_types:
             st.caption(
@@ -233,41 +499,51 @@ def _manifest_summary_block(summary):
         if filenames:
             st.caption("Vista rápida: " + ", ".join(filenames))
         if summary.get("warnings_count"):
-            st.warning("El manifest incluye warnings. Revísalos antes de enviar a cola.")
+            st.warning(
+                "Encontramos avisos en el paquete. Puedes continuar, pero conviene "
+                "revisarlos."
+            )
         if summary.get("needs_human_review_count"):
-            st.warning("Hay items marcados para revisión humana.")
+            st.warning("Hay elementos que requieren revisión antes de publicar.")
     elif status == "not_found":
-        st.warning("No encontrado. Verifica que el bundle esté montado dentro del contenedor WebUI.")
+        st.warning(
+            "No encontramos el paquete. Verifica que esté disponible dentro del "
+            "contenedor WebUI."
+        )
     elif status == "missing_path":
-        st.info("Pendiente. Ingresa un bundle_uid para derivar el manifest.")
+        st.info("Ingresa un código de paquete para derivar el manifest.")
     else:
         st.error(f"Requiere atención: {summary.get('message')}")
 
     st.info(
-        "En modo Asset Hub, algunos materiales se resuelven al iniciar el render. "
-        "material_count=0 puede ser correcto si el manifest está listo."
+        "Nota técnica: en Asset Hub algunos materiales se resuelven al iniciar el "
+        "render. Esto puede ser normal si el bundle está listo."
     )
 
 
 def _operator_summary_block(operator):
     cols = st.columns(5)
-    cols[0].metric("Job", operator.get("job_id") or "-")
+    cols[0].metric("Video", operator.get("job_id") or "-")
     cols[1].metric("Calidad", operator.get("render_quality") or "-")
     cols[2].metric("Fuente", operator.get("mode") or "-")
     cols[3].metric("Subtítulos", operator.get("subtitles") or "none")
     cols[4].metric("Audio", operator.get("audio") or "-")
-    st.caption(f"Título/tema: {operator.get('subject') or '-'}")
+    st.caption(f"Título del video: {operator.get('subject') or '-'}")
     if operator.get("bundle_uid"):
-        st.caption(f"Bundle UID: {operator.get('bundle_uid')}")
+        st.caption(f"Código del paquete de assets: {operator.get('bundle_uid')}")
     if operator.get("payload_material_count") == 0 and operator.get("mode") == "Asset Hub manifest":
-        st.success("material_count=0 no es error fatal en Asset Hub: el worker leerá el manifest.")
-    if operator.get("note"):
+        st.info(
+            "Nota técnica: en Asset Hub algunos materiales se resuelven al iniciar "
+            "el render. Esto puede ser normal si el bundle está listo."
+        )
+    elif operator.get("note"):
         st.info(operator["note"])
 
 
 def render_asset_source_step():
     st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
-    st.markdown("### 1. Fuente de assets")
+    st.markdown("### 1. Assets")
+    _asset_mode_cards(st.session_state["asset_source_mode"])
     source_label = st.radio(
         "Elige de dónde saldrán los materiales visuales",
         list(ASSET_SOURCE_LABELS),
@@ -284,7 +560,7 @@ def render_asset_source_step():
     manifest_summary = {"status": "missing_path", "exists": False}
     if st.session_state["asset_source_mode"] == ASSET_SOURCE_ASSET_HUB:
         st.text_input(
-            "Bundle UID",
+            "Código del paquete de assets",
             key="asset_hub_bundle_uid",
             help="Identificador del bundle preparado por Asset Hub.",
         )
@@ -310,7 +586,8 @@ def render_asset_source_step():
 
     elif st.session_state["asset_source_mode"] == ASSET_SOURCE_LOCAL:
         st.caption(
-            "Usa archivos ya presentes en el worker. No hay upload en esta fase."
+            "Usa archivos ya presentes en el worker. No hay carga de archivos en "
+            "esta fase."
         )
         local_assets = list_local_storage_files(
             DEFAULT_LOCAL_VIDEOS_DIR,
@@ -341,9 +618,9 @@ def render_asset_source_step():
             key="stock_source",
         )
         st.warning(
-            "Modo de producto visible, pero no disponible todavía desde esta consola. "
-            "Usa la UI legacy de MoneyPrinterTurbo para configurar credenciales. "
-            "Esta pantalla no modifica config.toml ni llama Asset Hub API."
+            "Stock externo aparece como opción de producto, pero todavía se configura "
+            "fuera de esta pantalla. Esta consola no modifica config.toml ni "
+            "credenciales."
         )
     st.markdown("</div>", unsafe_allow_html=True)
     return manifest_summary
@@ -351,16 +628,16 @@ def render_asset_source_step():
 
 def render_content_step():
     st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
-    st.markdown("### 2. Contenido / guion")
+    st.markdown("### 2. Contenido")
     left, right = st.columns([1, 1])
     with left:
         st.text_input(
-            "Job ID",
+            "Identificador del video",
             key="job_id",
             help="Identificador humano para encontrar el trabajo en la cola.",
         )
     with right:
-        st.text_input("Título o tema", key="video_subject")
+        st.text_input("Título del video", key="video_subject")
     st.text_area(
         "Guion o descripción",
         key="video_script",
@@ -422,7 +699,7 @@ def render_audio_subtitles_step():
 
     with right:
         subtitle_label = st.selectbox(
-            "Modo de subtítulos",
+            "Subtítulos",
             list(SUBTITLE_MODE_LABELS),
             index=_index_for_value(
                 SUBTITLE_MODE_LABELS,
@@ -453,7 +730,7 @@ def render_audio_subtitles_step():
             st.session_state["manual_custom_subtitle_file"] = ""
 
     st.selectbox(
-        "Preset de estilo de subtítulo",
+        "Estilo de subtítulos",
         SUBTITLE_STYLE_PRESETS,
         key="subtitle_style_preset",
     )
@@ -466,7 +743,7 @@ def render_quality_style_step():
     left, right = st.columns([1, 1])
     with left:
         quality_label = st.selectbox(
-            "Calidad de render",
+            "Calidad del video",
             list(QUALITY_LABELS),
             index=_index_for_value(
                 QUALITY_LABELS,
@@ -476,9 +753,9 @@ def render_quality_style_step():
             key="render_quality_label",
         )
         st.session_state["render_quality"] = QUALITY_LABELS[quality_label]
-        st.selectbox("Formato", ["9:16", "16:9"], key="video_aspect")
+        st.selectbox("Formato del video", ["9:16", "16:9"], key="video_aspect")
         st.number_input(
-            "Duración por asset",
+            "Duración por visual",
             min_value=1,
             max_value=20,
             step=1,
@@ -487,7 +764,7 @@ def render_quality_style_step():
     with right:
         st.checkbox("Activar movimiento de imágenes", key="image_motion_enabled")
         st.selectbox(
-            "Perfil de image motion",
+            "Movimiento de imágenes",
             MOTION_PROFILES,
             key="image_motion_preset",
         )
@@ -571,13 +848,13 @@ def render_human_summary(payload, manifest_summary):
     st.markdown("**Resumen antes de encolar**")
     _operator_summary_block(operator)
     if manifest_summary.get("status") == "ready":
-        st.caption("Manifest Asset Hub detectado y legible.")
+        st.caption("Paquete Asset Hub detectado y legible.")
     elif payload.get("asset_hub_renderer_manifest_path"):
-        st.warning("El manifest no está listo o no se pudo leer desde esta UI.")
+        st.warning("El paquete no está listo o no se pudo leer desde esta pantalla.")
 
 
 def _show_validation_result(spec, payload, manifest_summary, operator):
-    st.success("Trabajo validado. Estado: Listo para enviar a cola.")
+    st.success("Video validado. Está listo para enviarse a cola.")
     render_human_summary(payload, manifest_summary)
     with st.expander("Modo avanzado: ver payload JSON", expanded=False):
         st.json(payload)
@@ -587,15 +864,15 @@ def _show_validation_result(spec, payload, manifest_summary, operator):
 
 def render_validate_enqueue_step(manifest_summary):
     st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
-    st.markdown("### 5. Validar y encolar")
+    st.markdown("### 5. Revisión")
     st.info(
-        "Enviar a cola nocturna no renderiza inmediatamente. Solo crea un trabajo "
-        "pendiente para que el runner lo procese cuando se ejecute."
+        "Enviar a cola no renderiza inmediatamente. El video queda pendiente para "
+        "que el runner lo procese cuando se ejecute."
     )
 
     actions = st.columns([1, 1, 3])
-    validate_clicked = actions[0].button("Validar trabajo", key="form_validate")
-    enqueue_clicked = actions[1].button("Enviar a cola nocturna", key="form_enqueue")
+    validate_clicked = actions[0].button("Validar video", key="form_validate")
+    enqueue_clicked = actions[1].button("Enviar a cola", key="form_enqueue")
 
     if validate_clicked or enqueue_clicked:
         try:
@@ -603,7 +880,7 @@ def render_validate_enqueue_step(manifest_summary):
             _show_validation_result(spec, payload, manifest_summary, operator)
             if enqueue_clicked:
                 path = enqueue_moneyprinter_payload(payload)
-                st.success("En cola. No se ejecutó render.")
+                st.success("Video enviado a cola. No se ejecutó render.")
                 st.caption(f"Pendiente creado: {path}")
         except Exception as exc:
             _show_error(exc)
@@ -615,21 +892,17 @@ def render_validate_enqueue_step(manifest_summary):
             st.session_state["form_operator_summary"],
         )
     else:
-        st.caption("Valida el trabajo para ver el resumen humano y el JSON avanzado.")
+        st.caption("Valida el video para ver el resumen y el JSON avanzado.")
         with st.expander("Modo avanzado: ver payload JSON", expanded=False):
-            st.caption("El payload aparecerá aquí después de validar el trabajo.")
+            st.caption("El payload aparecerá aquí después de validar el video.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _new_render_view():
     _initialize_form_state()
-    st.subheader("Crear trabajo Kurukin")
-    st.markdown(
-        '<p class="kurukin-lede">Flujo guiado para preparar un pending job del '
-        "renderer. Esta pantalla no ejecuta renders.</p>",
-        unsafe_allow_html=True,
-    )
+    _hero_block()
+    _progress_steps()
 
     manifest_summary = render_asset_source_step()
     render_content_step()
@@ -647,7 +920,7 @@ def _queue_table(title, rows):
 
 
 def _queue_storage_view():
-    st.subheader("Cola nocturna")
+    st.subheader("Cola de render")
     st.button("Actualizar", key="refresh_queue")
 
     queue = list_nightly_queue()
@@ -693,15 +966,10 @@ def _diagnostics_expander():
         )
 
 
-st.set_page_config(page_title="Kurukin Render Console", layout="wide")
+st.set_page_config(page_title="Crear video Kurukin", layout="wide")
 _apply_page_style()
-st.title("Kurukin Render Console")
-st.write(
-    "Crea trabajos guiados para Kurukin usando Asset Hub Bundle, assets locales o "
-    "modos de stock disponibles en el backend legacy."
-)
 
-tab_new, tab_queue = st.tabs(["Crear trabajo", "Cola"])
+tab_new, tab_queue = st.tabs(["Crear video", "Cola"])
 with tab_new:
     _new_render_view()
 with tab_queue:
