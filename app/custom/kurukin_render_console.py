@@ -11,12 +11,24 @@ from app.custom.asset_hub_manifest import (
     validate_asset_hub_renderer_manifest,
 )
 from app.custom.kurukin_job_adapter import (
+    ALLOWED_AUDIO_EXTENSIONS,
+    ALLOWED_SUBTITLE_EXTENSIONS,
+    ALLOWED_EXTENSIONS,
+    DEFAULT_LOCAL_AUDIOS_DIR,
+    DEFAULT_LOCAL_SUBTITLES_DIR,
+    DEFAULT_LOCAL_VIDEOS_DIR,
     build_moneyprinter_payload,
     summarize_payload,
+    validate_asset_filename,
+    validate_local_filename,
 )
 
 
 DEFAULT_VOICE_NAME = "es-MX-DaliaNeural-Female"
+ASSET_SOURCE_ASSET_HUB = "asset_hub_bundle"
+ASSET_SOURCE_LOCAL = "local_assets"
+ASSET_SOURCE_STOCK = "stock_external"
+STOCK_SOURCES = {"pexels", "pixabay", "coverr"}
 
 
 def _clean_text(value: str) -> str:
@@ -42,6 +54,60 @@ def default_asset_hub_manifest_path(bundle_uid: str) -> str:
     return f"/data/job-assets/{safe_bundle_uid}/manifests/renderer-manifest.json"
 
 
+derive_manifest_path = default_asset_hub_manifest_path
+
+
+def safe_relative_path(
+    value: str,
+    *,
+    allowed_extensions: set[str],
+    label: str,
+) -> str:
+    """Validate a UI-supplied storage filename without resolving filesystem state."""
+
+    if allowed_extensions == ALLOWED_EXTENSIONS:
+        return validate_asset_filename(value)
+    return validate_local_filename(
+        value,
+        allowed_extensions=allowed_extensions,
+        label=label,
+    )
+
+
+def list_local_storage_files(
+    directory: str | Path,
+    *,
+    allowed_extensions: set[str],
+) -> list[str]:
+    """List safe filenames already present in a local storage directory."""
+
+    base_dir = Path(directory)
+    if not base_dir.exists() or not base_dir.is_dir():
+        return []
+
+    filenames = []
+    for path in sorted(base_dir.iterdir(), key=lambda item: item.name.lower()):
+        if not path.is_file():
+            continue
+        extension = path.suffix.lower().lstrip(".")
+        if extension not in allowed_extensions:
+            continue
+        try:
+            if allowed_extensions == ALLOWED_EXTENSIONS:
+                filenames.append(validate_asset_filename(path.name))
+            else:
+                filenames.append(
+                    validate_local_filename(
+                        path.name,
+                        allowed_extensions=allowed_extensions,
+                        label="local",
+                    )
+                )
+        except Exception:
+            continue
+    return filenames
+
+
 def build_render_console_spec(
     *,
     job_id: str,
@@ -51,6 +117,9 @@ def build_render_console_spec(
     video_aspect: str,
     asset_hub_bundle_uid: str = "",
     asset_hub_renderer_manifest_path: str = "",
+    asset_source_mode: str = ASSET_SOURCE_ASSET_HUB,
+    selected_local_assets: list[str] | None = None,
+    stock_source: str = "pexels",
     audio_file: str = "",
     subtitles_mode: str = "none",
     custom_subtitle_file: str = "",
@@ -63,9 +132,25 @@ def build_render_console_spec(
 ) -> dict[str, Any]:
     """Build a Kurukin Job Spec from Render Console form fields."""
 
+    source_mode = _clean_text(asset_source_mode) or ASSET_SOURCE_ASSET_HUB
+    if source_mode not in {
+        ASSET_SOURCE_ASSET_HUB,
+        ASSET_SOURCE_LOCAL,
+        ASSET_SOURCE_STOCK,
+    }:
+        raise ValueError("asset_source_mode is not supported")
+    if source_mode == ASSET_SOURCE_STOCK:
+        normalized_stock_source = _clean_text(stock_source).lower()
+        if normalized_stock_source not in STOCK_SOURCES:
+            raise ValueError("stock_source must be pexels, pixabay, or coverr")
+        raise ValueError(
+            "El modo Stock externo todavía requiere configuración desde la UI legacy "
+            "de MoneyPrinterTurbo. Esta consola no modifica config.toml ni credenciales."
+        )
+
     safe_bundle_uid = _validate_safe_bundle_uid(asset_hub_bundle_uid)
     manifest_path = _clean_text(asset_hub_renderer_manifest_path)
-    if safe_bundle_uid and not manifest_path:
+    if source_mode == ASSET_SOURCE_ASSET_HUB and safe_bundle_uid and not manifest_path:
         manifest_path = default_asset_hub_manifest_path(safe_bundle_uid)
 
     subtitles_mode = _clean_text(subtitles_mode).lower() or "none"
@@ -105,6 +190,23 @@ def build_render_console_spec(
             "strict": True,
         }
 
+    if source_mode == ASSET_SOURCE_LOCAL:
+        assets = selected_local_assets or []
+        if not assets:
+            raise ValueError("Selecciona al menos un asset local para crear el trabajo.")
+        spec["selectedAssets"] = [
+            {
+                "file": safe_relative_path(
+                    item,
+                    allowed_extensions=ALLOWED_EXTENSIONS,
+                    label="asset",
+                ),
+                "order": index + 1,
+            }
+            for index, item in enumerate(assets)
+        ]
+        spec.pop("asset_hub", None)
+
     clean_audio_file = _clean_text(audio_file)
     if clean_audio_file:
         spec["audio"] = {"file": clean_audio_file}
@@ -117,6 +219,40 @@ def build_render_console_spec(
         }
 
     return spec
+
+
+def build_workflow_payload(state: dict[str, Any]) -> dict[str, Any]:
+    """Build a MoneyPrinterTurbo payload from the guided workflow state."""
+
+    spec = build_render_console_spec(
+        job_id=state.get("job_id", ""),
+        video_subject=state.get("video_subject", ""),
+        video_script=state.get("video_script", ""),
+        render_quality=state.get("render_quality", "draft_720p"),
+        video_aspect=state.get("video_aspect", "9:16"),
+        asset_source_mode=state.get("asset_source_mode", ASSET_SOURCE_ASSET_HUB),
+        asset_hub_bundle_uid=state.get("asset_hub_bundle_uid", ""),
+        asset_hub_renderer_manifest_path=state.get(
+            "asset_hub_renderer_manifest_path",
+            "",
+        ),
+        selected_local_assets=state.get("selected_local_assets") or [],
+        stock_source=state.get("stock_source", "pexels"),
+        audio_file=state.get("audio_file", ""),
+        subtitles_mode=state.get("subtitles_mode", "none"),
+        custom_subtitle_file=state.get("custom_subtitle_file", ""),
+        subtitle_style_preset=state.get(
+            "subtitle_style_preset",
+            "clean_center_bold_safe",
+        ),
+        image_motion_enabled=bool(state.get("image_motion_enabled")),
+        image_motion_preset=state.get("image_motion_preset", "slow_zoom_in"),
+        image_motion_intensity=float(state.get("image_motion_intensity", 0.06)),
+        video_clip_duration=int(state.get("video_clip_duration", 4)),
+        n_threads=int(state.get("n_threads", 2)),
+    )
+    payload, _ = validate_and_build_payload_from_console_spec(spec)
+    return payload
 
 
 def validate_and_build_payload_from_console_spec(
@@ -214,6 +350,9 @@ def get_manifest_summary_for_ui(manifest_path: str) -> dict[str, Any]:
         "duration_total_seconds": round(duration_total_seconds, 2),
         "preview_filenames": preview_filenames,
     }
+
+
+load_manifest_summary = get_manifest_summary_for_ui
 
 
 def build_operator_summary(

@@ -10,6 +10,14 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__fi
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
+from app.custom.kurukin_job_adapter import (  # noqa: E402
+    ALLOWED_AUDIO_EXTENSIONS,
+    ALLOWED_EXTENSIONS,
+    ALLOWED_SUBTITLE_EXTENSIONS,
+    DEFAULT_LOCAL_AUDIOS_DIR,
+    DEFAULT_LOCAL_SUBTITLES_DIR,
+    DEFAULT_LOCAL_VIDEOS_DIR,
+)
 from app.custom.kurukin_job_queue import (  # noqa: E402
     enqueue_moneyprinter_payload,
     get_storage_summary,
@@ -17,51 +25,61 @@ from app.custom.kurukin_job_queue import (  # noqa: E402
     list_render_tasks,
 )
 from app.custom.kurukin_render_console import (  # noqa: E402
+    ASSET_SOURCE_ASSET_HUB,
+    ASSET_SOURCE_LOCAL,
+    ASSET_SOURCE_STOCK,
     build_operator_summary,
     build_render_console_spec,
     default_asset_hub_manifest_path,
     get_manifest_summary_for_ui,
+    list_local_storage_files,
+    safe_relative_path,
     validate_and_build_payload_from_console_spec,
 )
 
 
 DEFAULT_BUNDLE_UID = "jab_b28367fb22d44a40bae507c175f464c4"
-
-EXAMPLE_SPEC = {
-    "job_id": "render-console-example-001",
-    "description": "Render Console example",
-    "asset_hub": {
-        "renderer_manifest_path": (
-            "/data/job-assets/jab_b28367fb22d44a40bae507c175f464c4/"
-            "manifests/renderer-manifest.json"
-        ),
-        "bundle_uid": DEFAULT_BUNDLE_UID,
-        "scene_mode": "ordered",
-        "strict": True,
-    },
-    "render_quality": "draft_720p",
-    "subtitles": {"mode": "none"},
-    "video": {
-        "video_subject": "Render Console Example",
-        "video_script": "Example script.",
-        "video_aspect": "9:16",
-        "video_concat_mode": "sequential",
-        "video_transition_mode": "None",
-        "video_clip_duration": 4,
-        "video_count": 1,
-        "voice_name": "es-MX-DaliaNeural-Female",
-        "voice_volume": 1.0,
-        "voice_rate": 1.0,
-        "bgm_type": "none",
-        "subtitle_enabled": False,
-        "n_threads": 2,
-        "paragraph_number": 1,
-    },
+ASSET_SOURCE_LABELS = {
+    "Asset Hub Bundle": ASSET_SOURCE_ASSET_HUB,
+    "Assets locales": ASSET_SOURCE_LOCAL,
+    "Stock externo": ASSET_SOURCE_STOCK,
 }
+ASSET_SOURCE_LABEL_BY_VALUE = {value: key for key, value in ASSET_SOURCE_LABELS.items()}
+SUBTITLE_MODE_LABELS = {
+    "Sin subtítulos": "none",
+    "SRT propio": "custom_srt",
+    "Whisper": "whisper",
+    "Edge": "edge",
+}
+SUBTITLE_MODE_LABEL_BY_VALUE = {value: key for key, value in SUBTITLE_MODE_LABELS.items()}
+QUALITY_LABELS = {
+    "Borrador 720p": "draft_720p",
+    "Estándar 1080p": "standard_1080p",
+    "Premium 2K": "premium_2k",
+}
+QUALITY_LABEL_BY_VALUE = {value: key for key, value in QUALITY_LABELS.items()}
+MOTION_PROFILES = [
+    "none",
+    "slow_zoom_in",
+    "slow_zoom_out",
+    "pan_left",
+    "pan_right",
+    "pan_up",
+    "pan_down",
+    "subtle_pulse",
+    "handheld_soft",
+]
+SUBTITLE_STYLE_PRESETS = [
+    "clean_center_bold_safe",
+    "clean_center_bold",
+    "clean_bottom_bold",
+    "boxed_bottom",
+    "large_hook_center",
+]
 
 
 def _default_job_id() -> str:
-    return f"render-console-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    return f"kurukin-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
 
 
 def _human_bytes(size_bytes):
@@ -81,65 +99,434 @@ def _show_error(exc):
     st.error(str(exc))
 
 
-def _manifest_summary_block(summary):
+def _state_label(status):
+    return {
+        "ready": "Listo",
+        "invalid": "Requiere atención",
+        "not_found": "No encontrado",
+        "missing_path": "Pendiente",
+    }.get(status, "Pendiente")
+
+
+def _apply_page_style():
+    st.markdown(
+        """
+        <style>
+        .kurukin-lede {
+            color: #4b5563;
+            font-size: 1.02rem;
+            margin: -0.35rem 0 1.25rem 0;
+        }
+        .workflow-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 1rem 1.1rem;
+            background: #ffffff;
+            margin-bottom: 0.85rem;
+        }
+        .workflow-card h3 {
+            margin-top: 0;
+            margin-bottom: 0.35rem;
+            font-size: 1.05rem;
+        }
+        .soft-note {
+            border-left: 4px solid #2563eb;
+            background: #eff6ff;
+            padding: 0.75rem 0.9rem;
+            border-radius: 6px;
+            color: #1f2937;
+            margin: 0.5rem 0 0.75rem;
+        }
+        .status-ready { color: #047857; font-weight: 700; }
+        .status-attention { color: #b45309; font-weight: 700; }
+        .status-missing { color: #b91c1c; font-weight: 700; }
+        .status-pending { color: #4b5563; font-weight: 700; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _index_for_value(labels, value, default_value):
+    values = list(labels.values())
+    try:
+        return values.index(value)
+    except ValueError:
+        return values.index(default_value)
+
+
+def _select_label_for_value(mapping, value, default_value):
+    return mapping.get(value, mapping[default_value])
+
+
+def _initialize_form_state():
+    st.session_state.setdefault("job_id", _default_job_id())
+    st.session_state.setdefault("video_subject", "Render Console Example")
+    st.session_state.setdefault("video_script", "Example script.")
+    st.session_state.setdefault("video_aspect", "9:16")
+    st.session_state.setdefault("render_quality", "draft_720p")
+    st.session_state.setdefault("asset_source_mode", ASSET_SOURCE_ASSET_HUB)
+    st.session_state.setdefault("asset_hub_bundle_uid", DEFAULT_BUNDLE_UID)
+    st.session_state.setdefault("asset_hub_manifest_advanced", False)
+    st.session_state.setdefault("asset_hub_renderer_manifest_path", "")
+    st.session_state.setdefault("selected_local_assets", [])
+    st.session_state.setdefault("manual_local_assets", "")
+    st.session_state.setdefault("stock_source", "pexels")
+    st.session_state.setdefault("audio_enabled", False)
+    st.session_state.setdefault("audio_file", "")
+    st.session_state.setdefault("manual_audio_file", "")
+    st.session_state.setdefault("subtitles_mode", "none")
+    st.session_state.setdefault("custom_subtitle_file", "")
+    st.session_state.setdefault("manual_custom_subtitle_file", "")
+    st.session_state.setdefault("subtitle_style_preset", "clean_center_bold_safe")
+    st.session_state.setdefault("image_motion_enabled", True)
+    st.session_state.setdefault("image_motion_preset", "slow_zoom_in")
+    st.session_state.setdefault("image_motion_intensity", 0.06)
+    st.session_state.setdefault("video_clip_duration", 4)
+    st.session_state.setdefault("n_threads", 2)
+
+
+def _current_manifest_path():
+    bundle_uid = st.session_state.get("asset_hub_bundle_uid", "")
+    if st.session_state.get("asset_hub_manifest_advanced"):
+        return st.session_state.get("asset_hub_renderer_manifest_path", "")
+    try:
+        return default_asset_hub_manifest_path(bundle_uid)
+    except ValueError:
+        return ""
+
+
+def _status_class(summary):
     status = summary.get("status")
     if status == "ready":
-        st.success("Manifest encontrado y válido. El worker resolverá estos assets al iniciar el render.")
+        return "status-ready"
+    if status == "invalid":
+        return "status-attention"
+    if status == "not_found":
+        return "status-missing"
+    return "status-pending"
+
+
+def _manifest_summary_block(summary):
+    status = summary.get("status")
+    label = _state_label(status)
+    st.markdown(
+        f"Estado del bundle: <span class=\"{_status_class(summary)}\">{label}</span>",
+        unsafe_allow_html=True,
+    )
+
+    if status == "ready":
         cols = st.columns(5)
         cols[0].metric("Escenas", summary.get("total_scenes", 0))
         cols[1].metric("Assets", summary.get("total_assets", 0))
-        cols[2].metric(
-            "Duración aprox.",
-            f"{summary.get('duration_total_seconds', 0)} s",
-        )
+        cols[2].metric("Duración aprox.", f"{summary.get('duration_total_seconds', 0)} s")
         cols[3].metric("Warnings", summary.get("warnings_count", 0))
         cols[4].metric("Revisión humana", summary.get("needs_human_review_count", 0))
         st.caption(f"Bundle UID: {summary.get('bundle_uid') or '-'}")
         asset_types = summary.get("asset_types") or {}
         if asset_types:
             st.caption(
-                "Tipos: "
+                "Tipos detectados: "
                 + ", ".join(f"{key}: {value}" for key, value in sorted(asset_types.items()))
             )
         filenames = summary.get("preview_filenames") or []
         if filenames:
-            st.caption("Primeros assets: " + ", ".join(filenames))
+            st.caption("Vista rápida: " + ", ".join(filenames))
+        if summary.get("warnings_count"):
+            st.warning("El manifest incluye warnings. Revísalos antes de enviar a cola.")
+        if summary.get("needs_human_review_count"):
+            st.warning("Hay items marcados para revisión humana.")
     elif status == "not_found":
-        st.warning("Manifest no encontrado. Revisa que el bundle esté materializado en /data/job-assets.")
+        st.warning("No encontrado. Verifica que el bundle esté montado dentro del contenedor WebUI.")
     elif status == "missing_path":
-        st.info("Ingresa un renderer manifest para ver el resumen.")
+        st.info("Pendiente. Ingresa un bundle_uid para derivar el manifest.")
     else:
-        st.error(f"Manifest inválido: {summary.get('message')}")
+        st.error(f"Requiere atención: {summary.get('message')}")
+
+    st.info(
+        "En modo Asset Hub, algunos materiales se resuelven al iniciar el render. "
+        "material_count=0 puede ser correcto si el manifest está listo."
+    )
 
 
 def _operator_summary_block(operator):
-    cols = st.columns(6)
-    cols[0].metric("Job ID", operator.get("job_id") or "-")
+    cols = st.columns(5)
+    cols[0].metric("Job", operator.get("job_id") or "-")
     cols[1].metric("Calidad", operator.get("render_quality") or "-")
-    cols[2].metric("Modo", operator.get("mode") or "-")
-    cols[3].metric("Assets manifest", operator.get("manifest_asset_count", 0))
-    cols[4].metric("Subtítulos", operator.get("subtitles") or "none")
-    cols[5].metric("Audio", operator.get("audio") or "-")
-    st.caption(f"Asunto: {operator.get('subject') or '-'}")
+    cols[2].metric("Fuente", operator.get("mode") or "-")
+    cols[3].metric("Subtítulos", operator.get("subtitles") or "none")
+    cols[4].metric("Audio", operator.get("audio") or "-")
+    st.caption(f"Título/tema: {operator.get('subject') or '-'}")
     if operator.get("bundle_uid"):
         st.caption(f"Bundle UID: {operator.get('bundle_uid')}")
+    if operator.get("payload_material_count") == 0 and operator.get("mode") == "Asset Hub manifest":
+        st.success("material_count=0 no es error fatal en Asset Hub: el worker leerá el manifest.")
     if operator.get("note"):
         st.info(operator["note"])
-    if (
-        operator.get("mode") == "Asset Hub manifest"
-        and operator.get("payload_material_count") == 0
-        and operator.get("manifest_asset_count", 0) > 0
-    ):
-        st.success("Correcto: el payload no expande assets. El worker los leerá del manifest.")
 
 
-def _show_validation_result(spec, payload, manifest_summary, operator):
-    st.success("Payload válido para encolar.")
-    _operator_summary_block(operator)
-    with st.expander("Ver Kurukin Job Spec", expanded=False):
-        st.json(spec)
-    with st.expander("Ver MoneyPrinterTurbo Payload", expanded=False):
-        st.json(payload)
+def render_asset_source_step():
+    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
+    st.markdown("### 1. Fuente de assets")
+    source_label = st.radio(
+        "Elige de dónde saldrán los materiales visuales",
+        list(ASSET_SOURCE_LABELS),
+        index=_index_for_value(
+            ASSET_SOURCE_LABELS,
+            st.session_state["asset_source_mode"],
+            ASSET_SOURCE_ASSET_HUB,
+        ),
+        horizontal=True,
+        key="asset_source_label",
+    )
+    st.session_state["asset_source_mode"] = ASSET_SOURCE_LABELS[source_label]
+
+    manifest_summary = {"status": "missing_path", "exists": False}
+    if st.session_state["asset_source_mode"] == ASSET_SOURCE_ASSET_HUB:
+        st.text_input(
+            "Bundle UID",
+            key="asset_hub_bundle_uid",
+            help="Identificador del bundle preparado por Asset Hub.",
+        )
+        derived_path = _current_manifest_path()
+        if not st.session_state.get("asset_hub_manifest_advanced"):
+            st.session_state["asset_hub_renderer_manifest_path"] = derived_path
+        st.caption(f"Manifest derivado automáticamente: {derived_path or '-'}")
+
+        with st.expander("Modo avanzado: editar ruta de manifest", expanded=False):
+            st.checkbox(
+                "Usar ruta manual de manifest",
+                key="asset_hub_manifest_advanced",
+            )
+            if st.session_state.get("asset_hub_manifest_advanced"):
+                st.text_input(
+                    "renderer_manifest_path",
+                    key="asset_hub_renderer_manifest_path",
+                    help="Solo para diagnóstico. Debe mantenerse bajo /data/job-assets.",
+                )
+
+        manifest_summary = get_manifest_summary_for_ui(_current_manifest_path())
+        _manifest_summary_block(manifest_summary)
+
+    elif st.session_state["asset_source_mode"] == ASSET_SOURCE_LOCAL:
+        st.caption(
+            "Usa archivos ya presentes en el worker. No hay upload en esta fase."
+        )
+        local_assets = list_local_storage_files(
+            DEFAULT_LOCAL_VIDEOS_DIR,
+            allowed_extensions=ALLOWED_EXTENSIONS,
+        )
+        st.multiselect(
+            "Assets disponibles en storage/local_videos",
+            local_assets,
+            key="selected_local_assets",
+            help="El orden seleccionado se respeta al crear el trabajo.",
+        )
+        st.text_area(
+            "Rutas relativas seguras adicionales",
+            key="manual_local_assets",
+            placeholder="clip-01.mp4\nstill-02.png",
+            help="Solo filenames dentro de storage/local_videos. No se aceptan / ni ..",
+            height=88,
+        )
+        st.info(
+            "Estado: Listo si los archivos existen en storage/local_videos y pasan "
+            "la validación de rutas seguras."
+        )
+
+    else:
+        st.selectbox(
+            "Proveedor de stock",
+            ["pexels", "pixabay", "coverr"],
+            key="stock_source",
+        )
+        st.warning(
+            "Modo de producto visible, pero no disponible todavía desde esta consola. "
+            "Usa la UI legacy de MoneyPrinterTurbo para configurar credenciales. "
+            "Esta pantalla no modifica config.toml ni llama Asset Hub API."
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+    return manifest_summary
+
+
+def render_content_step():
+    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
+    st.markdown("### 2. Contenido / guion")
+    left, right = st.columns([1, 1])
+    with left:
+        st.text_input(
+            "Job ID",
+            key="job_id",
+            help="Identificador humano para encontrar el trabajo en la cola.",
+        )
+    with right:
+        st.text_input("Título o tema", key="video_subject")
+    st.text_area(
+        "Guion o descripción",
+        key="video_script",
+        height=160,
+        help="Texto base para voz, subtítulos o contexto del render.",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _manual_lines(value):
+    return [line.strip() for line in str(value or "").splitlines() if line.strip()]
+
+
+def _selected_local_assets():
+    selected = list(st.session_state.get("selected_local_assets") or [])
+    for item in _manual_lines(st.session_state.get("manual_local_assets")):
+        safe = safe_relative_path(
+            item,
+            allowed_extensions=ALLOWED_EXTENSIONS,
+            label="asset",
+        )
+        if safe not in selected:
+            selected.append(safe)
+    return selected
+
+
+def render_audio_subtitles_step():
+    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
+    st.markdown("### 3. Audio y subtítulos")
+    st.markdown(
+        '<div class="soft-note">Puedes usar audio propio y subtítulos mejorados '
+        "en todos los modos compatibles.</div>",
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.checkbox("Usar audio propio", key="audio_enabled")
+        audio_files = list_local_storage_files(
+            DEFAULT_LOCAL_AUDIOS_DIR,
+            allowed_extensions=ALLOWED_AUDIO_EXTENSIONS,
+        )
+        if st.session_state.get("audio_enabled"):
+            st.selectbox(
+                "Audio en storage/local_audios",
+                [""] + audio_files,
+                key="audio_file",
+                format_func=lambda value: value or "Elegir audio",
+            )
+            st.text_input(
+                "Audio relativo seguro",
+                key="manual_audio_file",
+                placeholder="audio-prueba.mp3",
+                help="Solo filenames dentro de storage/local_audios.",
+            )
+        else:
+            st.session_state["audio_file"] = ""
+            st.session_state["manual_audio_file"] = ""
+
+    with right:
+        subtitle_label = st.selectbox(
+            "Modo de subtítulos",
+            list(SUBTITLE_MODE_LABELS),
+            index=_index_for_value(
+                SUBTITLE_MODE_LABELS,
+                st.session_state["subtitles_mode"],
+                "none",
+            ),
+            key="subtitles_mode_label",
+        )
+        st.session_state["subtitles_mode"] = SUBTITLE_MODE_LABELS[subtitle_label]
+        subtitle_files = list_local_storage_files(
+            DEFAULT_LOCAL_SUBTITLES_DIR,
+            allowed_extensions=ALLOWED_SUBTITLE_EXTENSIONS,
+        )
+        if st.session_state["subtitles_mode"] == "custom_srt":
+            st.selectbox(
+                "SRT en storage/local_subtitles",
+                [""] + subtitle_files,
+                key="custom_subtitle_file",
+                format_func=lambda value: value or "Elegir SRT",
+            )
+            st.text_input(
+                "SRT relativo seguro",
+                key="manual_custom_subtitle_file",
+                placeholder="subtitulos.srt",
+            )
+        else:
+            st.session_state["custom_subtitle_file"] = ""
+            st.session_state["manual_custom_subtitle_file"] = ""
+
+    st.selectbox(
+        "Preset de estilo de subtítulo",
+        SUBTITLE_STYLE_PRESETS,
+        key="subtitle_style_preset",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_quality_style_step():
+    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
+    st.markdown("### 4. Calidad y estilo")
+    left, right = st.columns([1, 1])
+    with left:
+        quality_label = st.selectbox(
+            "Calidad de render",
+            list(QUALITY_LABELS),
+            index=_index_for_value(
+                QUALITY_LABELS,
+                st.session_state["render_quality"],
+                "draft_720p",
+            ),
+            key="render_quality_label",
+        )
+        st.session_state["render_quality"] = QUALITY_LABELS[quality_label]
+        st.selectbox("Formato", ["9:16", "16:9"], key="video_aspect")
+        st.number_input(
+            "Duración por asset",
+            min_value=1,
+            max_value=20,
+            step=1,
+            key="video_clip_duration",
+        )
+    with right:
+        st.checkbox("Activar movimiento de imágenes", key="image_motion_enabled")
+        st.selectbox(
+            "Perfil de image motion",
+            MOTION_PROFILES,
+            key="image_motion_preset",
+        )
+        st.slider(
+            "Intensidad de movimiento",
+            min_value=0.0,
+            max_value=0.20,
+            step=0.01,
+            key="image_motion_intensity",
+        )
+        with st.expander("Modo avanzado: rendimiento", expanded=False):
+            st.number_input("Threads", min_value=1, max_value=4, step=1, key="n_threads")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _effective_audio_file():
+    if not st.session_state.get("audio_enabled"):
+        return ""
+    manual = st.session_state.get("manual_audio_file", "").strip()
+    if manual:
+        return safe_relative_path(
+            manual,
+            allowed_extensions=ALLOWED_AUDIO_EXTENSIONS,
+            label="audio",
+        )
+    return st.session_state.get("audio_file", "")
+
+
+def _effective_subtitle_file():
+    if st.session_state.get("subtitles_mode") != "custom_srt":
+        return ""
+    manual = st.session_state.get("manual_custom_subtitle_file", "").strip()
+    if manual:
+        return safe_relative_path(
+            manual,
+            allowed_extensions=ALLOWED_SUBTITLE_EXTENSIONS,
+            label="subtitle",
+        )
+    return st.session_state.get("custom_subtitle_file", "")
 
 
 def _build_form_spec():
@@ -149,13 +536,14 @@ def _build_form_spec():
         video_script=st.session_state["video_script"],
         render_quality=st.session_state["render_quality"],
         video_aspect=st.session_state["video_aspect"],
+        asset_source_mode=st.session_state["asset_source_mode"],
         asset_hub_bundle_uid=st.session_state["asset_hub_bundle_uid"],
-        asset_hub_renderer_manifest_path=st.session_state[
-            "asset_hub_renderer_manifest_path"
-        ],
-        audio_file=st.session_state["audio_file"],
+        asset_hub_renderer_manifest_path=_current_manifest_path(),
+        selected_local_assets=_selected_local_assets(),
+        stock_source=st.session_state["stock_source"],
+        audio_file=_effective_audio_file(),
         subtitles_mode=st.session_state["subtitles_mode"],
-        custom_subtitle_file=st.session_state.get("custom_subtitle_file", ""),
+        custom_subtitle_file=_effective_subtitle_file(),
         subtitle_style_preset=st.session_state["subtitle_style_preset"],
         image_motion_enabled=st.session_state["image_motion_enabled"],
         image_motion_preset=st.session_state["image_motion_preset"],
@@ -178,130 +566,36 @@ def _validate_form_payload():
     return spec, payload, manifest_summary, operator
 
 
-def _initialize_form_state():
-    st.session_state.setdefault("job_id", _default_job_id())
-    st.session_state.setdefault("video_subject", "Render Console Example")
-    st.session_state.setdefault("render_quality", "draft_720p")
-    st.session_state.setdefault("video_aspect", "9:16")
-    st.session_state.setdefault("audio_file", "")
-    st.session_state.setdefault("subtitles_mode", "none")
-    st.session_state.setdefault("custom_subtitle_file", "")
-    st.session_state.setdefault("asset_hub_bundle_uid", DEFAULT_BUNDLE_UID)
-    st.session_state.setdefault("subtitle_style_preset", "clean_center_bold_safe")
-    st.session_state.setdefault("image_motion_enabled", True)
-    st.session_state.setdefault("image_motion_preset", "slow_zoom_in")
-    st.session_state.setdefault("image_motion_intensity", 0.06)
-    st.session_state.setdefault("video_clip_duration", 4)
-    st.session_state.setdefault("n_threads", 2)
-    st.session_state.setdefault("video_script", "Example script.")
+def render_human_summary(payload, manifest_summary):
+    operator = build_operator_summary(payload, manifest_summary)
+    st.markdown("**Resumen antes de encolar**")
+    _operator_summary_block(operator)
+    if manifest_summary.get("status") == "ready":
+        st.caption("Manifest Asset Hub detectado y legible.")
+    elif payload.get("asset_hub_renderer_manifest_path"):
+        st.warning("El manifest no está listo o no se pudo leer desde esta UI.")
 
-    bundle_uid = st.session_state.get("asset_hub_bundle_uid", "")
-    previous_bundle_uid = st.session_state.get("_manifest_bundle_uid")
-    if bundle_uid and bundle_uid != previous_bundle_uid:
-        try:
-            st.session_state["asset_hub_renderer_manifest_path"] = (
-                default_asset_hub_manifest_path(bundle_uid)
-            )
-            st.session_state["_manifest_bundle_uid"] = bundle_uid
-        except ValueError as exc:
-            st.warning(str(exc))
-    st.session_state.setdefault(
-        "asset_hub_renderer_manifest_path",
-        default_asset_hub_manifest_path(DEFAULT_BUNDLE_UID),
+
+def _show_validation_result(spec, payload, manifest_summary, operator):
+    st.success("Trabajo validado. Estado: Listo para enviar a cola.")
+    render_human_summary(payload, manifest_summary)
+    with st.expander("Modo avanzado: ver payload JSON", expanded=False):
+        st.json(payload)
+    with st.expander("Diagnóstico: ver Kurukin Job Spec", expanded=False):
+        st.json(spec)
+
+
+def render_validate_enqueue_step(manifest_summary):
+    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
+    st.markdown("### 5. Validar y encolar")
+    st.info(
+        "Enviar a cola nocturna no renderiza inmediatamente. Solo crea un trabajo "
+        "pendiente para que el runner lo procese cuando se ejecute."
     )
 
-
-def _new_render_tab():
-    st.subheader("Nuevo render")
-
-    status_cols = st.columns(3)
-    status_cols[0].metric("Modo actual", "Asset Hub manifest-first")
-    status_cols[1].metric("Queue target", "storage/nightly_jobs/pending")
-    status_cols[2].metric("Ejecución", "Solo encola")
-    st.warning("Encolar no ejecuta render. El nightly runner procesa después.")
-
-    _initialize_form_state()
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.text_input("ID del job", key="job_id")
-        st.text_input("Título / asunto del video", key="video_subject")
-        st.selectbox(
-            "Calidad",
-            ["draft_720p", "standard_1080p", "premium_2k"],
-            key="render_quality",
-        )
-        st.selectbox("Formato", ["9:16", "16:9"], key="video_aspect")
-        st.text_input("Audio propio opcional", key="audio_file", placeholder="audio-prueba.mp3")
-        st.selectbox(
-            "Subtítulos",
-            ["none", "whisper", "edge", "custom_srt"],
-            key="subtitles_mode",
-        )
-        if st.session_state["subtitles_mode"] == "custom_srt":
-            st.text_input("Archivo .srt propio", key="custom_subtitle_file")
-
-    with col_b:
-        st.text_input("Bundle UID de Asset Hub", key="asset_hub_bundle_uid")
-        st.caption("Bundle de prueba para entorno dev/local.")
-        st.text_input(
-            "Ruta del renderer manifest",
-            key="asset_hub_renderer_manifest_path",
-        )
-        st.selectbox(
-            "Estilo de subtítulos",
-            [
-                "clean_center_bold_safe",
-                "clean_center_bold",
-                "clean_bottom_bold",
-                "boxed_bottom",
-                "large_hook_center",
-            ],
-            key="subtitle_style_preset",
-        )
-        st.checkbox("Animar imágenes", key="image_motion_enabled")
-        st.selectbox(
-            "Preset de animación",
-            [
-                "none",
-                "slow_zoom_in",
-                "slow_zoom_out",
-                "pan_left",
-                "pan_right",
-                "pan_up",
-                "pan_down",
-                "subtle_pulse",
-                "handheld_soft",
-            ],
-            key="image_motion_preset",
-        )
-        st.slider(
-            "Intensidad de animación",
-            min_value=0.0,
-            max_value=0.20,
-            step=0.01,
-            key="image_motion_intensity",
-        )
-        st.number_input(
-            "Duración por asset",
-            min_value=1,
-            max_value=20,
-            step=1,
-            key="video_clip_duration",
-        )
-        st.number_input("Threads", min_value=1, max_value=4, step=1, key="n_threads")
-
-    st.text_area("Guion o descripción del render", height=180, key="video_script")
-
-    st.markdown("**Resumen del manifest**")
-    manifest_summary = get_manifest_summary_for_ui(
-        st.session_state.get("asset_hub_renderer_manifest_path", "")
-    )
-    _manifest_summary_block(manifest_summary)
-
-    actions = st.columns([1, 1, 4])
-    validate_clicked = actions[0].button("Validar payload", key="form_validate")
-    enqueue_clicked = actions[1].button("Encolar job", key="form_enqueue")
+    actions = st.columns([1, 1, 3])
+    validate_clicked = actions[0].button("Validar trabajo", key="form_validate")
+    enqueue_clicked = actions[1].button("Enviar a cola nocturna", key="form_enqueue")
 
     if validate_clicked or enqueue_clicked:
         try:
@@ -309,12 +603,8 @@ def _new_render_tab():
             _show_validation_result(spec, payload, manifest_summary, operator)
             if enqueue_clicked:
                 path = enqueue_moneyprinter_payload(payload)
-                st.success("Job encolado. No se ejecutó render.")
-                st.code(str(path))
-                st.info(
-                    "Para procesar, ejecutar nightly_runner manualmente o esperar "
-                    "ventana nocturna."
-                )
+                st.success("En cola. No se ejecutó render.")
+                st.caption(f"Pendiente creado: {path}")
         except Exception as exc:
             _show_error(exc)
     elif st.session_state.get("form_validated_payload"):
@@ -324,54 +614,28 @@ def _new_render_tab():
             st.session_state["form_manifest_summary"],
             st.session_state["form_operator_summary"],
         )
+    else:
+        st.caption("Valida el trabajo para ver el resumen humano y el JSON avanzado.")
+        with st.expander("Modo avanzado: ver payload JSON", expanded=False):
+            st.caption("El payload aparecerá aquí después de validar el trabajo.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def _advanced_json_tab():
-    st.subheader("JSON avanzado")
-    st.write("Pega un Kurukin Job Spec completo. Úsalo para casos avanzados o pruebas.")
-    raw_spec = st.text_area(
-        "Kurukin Job Spec JSON",
-        value=json.dumps(EXAMPLE_SPEC, indent=2, ensure_ascii=False),
-        height=420,
+def _new_render_view():
+    _initialize_form_state()
+    st.subheader("Crear trabajo Kurukin")
+    st.markdown(
+        '<p class="kurukin-lede">Flujo guiado para preparar un pending job del '
+        "renderer. Esta pantalla no ejecuta renders.</p>",
+        unsafe_allow_html=True,
     )
 
-    actions = st.columns([1, 1, 4])
-    validate_clicked = actions[0].button("Validar JSON", key="json_validate")
-    enqueue_clicked = actions[1].button("Encolar JSON validado", key="json_enqueue")
-
-    if validate_clicked or enqueue_clicked:
-        try:
-            spec = json.loads(raw_spec)
-            if not isinstance(spec, dict):
-                raise ValueError("JSON must be an object")
-            payload, _ = validate_and_build_payload_from_console_spec(spec)
-            manifest_summary = get_manifest_summary_for_ui(
-                payload.get("asset_hub_renderer_manifest_path") or ""
-            )
-            operator = build_operator_summary(payload, manifest_summary)
-            st.session_state["json_validated_payload"] = payload
-            st.session_state["json_validated_spec"] = spec
-            st.session_state["json_manifest_summary"] = manifest_summary
-            st.session_state["json_operator_summary"] = operator
-
-            st.success("JSON válido para encolar.")
-            if manifest_summary.get("status") != "missing_path":
-                _manifest_summary_block(manifest_summary)
-            _operator_summary_block(operator)
-            with st.expander("Ver MoneyPrinterTurbo Payload", expanded=False):
-                st.json(payload)
-            if enqueue_clicked:
-                path = enqueue_moneyprinter_payload(payload)
-                st.success("Job encolado. No se ejecutó render.")
-                st.code(str(path))
-        except Exception as exc:
-            _show_error(exc)
-    elif st.session_state.get("json_validated_payload"):
-        if st.session_state["json_manifest_summary"].get("status") != "missing_path":
-            _manifest_summary_block(st.session_state["json_manifest_summary"])
-        _operator_summary_block(st.session_state["json_operator_summary"])
-        with st.expander("Ver MoneyPrinterTurbo Payload", expanded=False):
-            st.json(st.session_state["json_validated_payload"])
+    manifest_summary = render_asset_source_step()
+    render_content_step()
+    render_audio_subtitles_step()
+    render_quality_style_step()
+    render_validate_enqueue_step(manifest_summary)
 
 
 def _queue_table(title, rows):
@@ -379,11 +643,11 @@ def _queue_table(title, rows):
     if rows:
         st.dataframe(rows, use_container_width=True)
     else:
-        st.info("Sin jobs")
+        st.info("Sin trabajos")
 
 
-def _queue_storage_tab():
-    st.subheader("Cola y storage")
+def _queue_storage_view():
+    st.subheader("Cola nocturna")
     st.button("Actualizar", key="refresh_queue")
 
     queue = list_nightly_queue()
@@ -392,47 +656,55 @@ def _queue_storage_tab():
 
     final_tasks = [item for item in tasks if item.get("has_final_video")]
     metric_cols = st.columns(6)
-    metric_cols[0].metric("Pending", len(queue.get("pending", [])))
-    metric_cols[1].metric("Processing", len(queue.get("processing", [])))
-    metric_cols[2].metric("Completed", len(queue.get("completed", [])))
-    metric_cols[3].metric("Failed", len(queue.get("failed", [])))
-    metric_cols[4].metric("Tasks con video final", len(final_tasks))
-    metric_cols[5].metric("Storage total", _human_bytes(storage_summary.get("size_bytes")))
+    metric_cols[0].metric("Pendiente", len(queue.get("pending", [])))
+    metric_cols[1].metric("Procesando", len(queue.get("processing", [])))
+    metric_cols[2].metric("Completado", len(queue.get("completed", [])))
+    metric_cols[3].metric("Fallido", len(queue.get("failed", [])))
+    metric_cols[4].metric("Videos finales", len(final_tasks))
+    metric_cols[5].metric("Storage", _human_bytes(storage_summary.get("size_bytes")))
 
-    for group in ("pending", "processing", "completed", "failed"):
-        _queue_table(group.capitalize(), queue.get(group, []))
+    for group, label in (
+        ("pending", "Pendiente"),
+        ("processing", "Procesando"),
+        ("completed", "Completado"),
+        ("failed", "Fallido"),
+    ):
+        _queue_table(label, queue.get(group, []))
 
-    _queue_table("Tasks", tasks)
-    st.markdown("**Storage**")
-    subdirs = storage_summary.get("subdirs") or []
-    if subdirs:
-        rows = [
+
+def _diagnostics_expander():
+    with st.expander("Diagnóstico", expanded=False):
+        queue = list_nightly_queue()
+        tasks = list_render_tasks()
+        storage_summary = get_storage_summary()
+        st.caption("Lectura local de cola y storage. No modifica archivos.")
+        st.json(
             {
-                "name": item.get("name"),
-                "path": item.get("path"),
-                "size": _human_bytes(item.get("size_bytes")),
-                "size_bytes": item.get("size_bytes"),
-                "modified_at_iso": item.get("modified_at_iso"),
+                "queue_counts": {group: len(items) for group, items in queue.items()},
+                "task_count": len(tasks),
+                "storage_size": _human_bytes(storage_summary.get("size_bytes")),
+                "local_dirs": {
+                    "videos": DEFAULT_LOCAL_VIDEOS_DIR,
+                    "audios": DEFAULT_LOCAL_AUDIOS_DIR,
+                    "subtitles": DEFAULT_LOCAL_SUBTITLES_DIR,
+                },
+                "asset_source_mode": st.session_state.get("asset_source_mode"),
             }
-            for item in subdirs
-        ]
-        st.dataframe(rows, use_container_width=True)
-    else:
-        st.info("Sin jobs")
-    st.info("Limpieza destructiva se implementará en una fase posterior.")
+        )
 
 
 st.set_page_config(page_title="Kurukin Render Console", layout="wide")
+_apply_page_style()
 st.title("Kurukin Render Console")
 st.write(
-    "Crea, valida y encola jobs para el worker nocturno. "
-    "Esta pantalla no renderiza directamente."
+    "Crea trabajos guiados para Kurukin usando Asset Hub Bundle, assets locales o "
+    "modos de stock disponibles en el backend legacy."
 )
 
-tab_new, tab_json, tab_queue = st.tabs(["Nuevo render", "JSON avanzado", "Cola y storage"])
+tab_new, tab_queue = st.tabs(["Crear trabajo", "Cola"])
 with tab_new:
-    _new_render_tab()
-with tab_json:
-    _advanced_json_tab()
+    _new_render_view()
 with tab_queue:
-    _queue_storage_tab()
+    _queue_storage_view()
+
+_diagnostics_expander()
