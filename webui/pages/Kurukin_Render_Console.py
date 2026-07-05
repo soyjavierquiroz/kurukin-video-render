@@ -132,145 +132,12 @@ def _apply_page_style():
             color: #111827;
             letter-spacing: 0;
         }
-        .kurukin-hero {
-            border: 1px solid #dbe5f1;
-            border-radius: 8px;
-            background: linear-gradient(135deg, #ffffff 0%, #eef6ff 62%, #f8fafc 100%);
-            padding: 1.65rem 1.75rem;
-            margin-bottom: 1rem;
-            box-shadow: 0 18px 38px rgba(30, 41, 59, 0.08);
+        label, p, li, span, [data-testid="stMarkdownContainer"] {
+            color: #111827;
         }
-        .kurukin-hero h1 {
-            font-size: clamp(2rem, 5vw, 3rem);
-            line-height: 1.04;
-            margin: 0 0 0.55rem;
-            font-weight: 780;
-        }
-        .kurukin-lede {
-            color: #4b5563;
-            font-size: 1.04rem;
-            line-height: 1.55;
-            max-width: 760px;
-            margin: 0 0 1rem;
-        }
-        .kurukin-safety-note {
-            display: inline-flex;
-            align-items: center;
-            border: 1px solid #bfdbfe;
-            border-radius: 8px;
-            background: #eff6ff;
-            color: #1e3a8a;
-            font-size: 0.94rem;
+        [data-testid="stWidgetLabel"] p {
+            color: #111827;
             font-weight: 650;
-            padding: 0.65rem 0.8rem;
-        }
-        .progress-row {
-            display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
-            gap: 0.65rem;
-            margin: 0.35rem 0 1rem;
-        }
-        .progress-step {
-            border: 1px solid #dbe5f1;
-            border-radius: 8px;
-            background: #ffffff;
-            padding: 0.78rem 0.85rem;
-            min-height: 76px;
-            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.05);
-        }
-        .progress-step strong {
-            display: block;
-            color: #0f172a;
-            font-size: 0.94rem;
-            margin-bottom: 0.2rem;
-        }
-        .progress-step span {
-            color: #64748b;
-            font-size: 0.8rem;
-            line-height: 1.25;
-        }
-        .workflow-card {
-            border: 1px solid #dbe5f1;
-            border-radius: 8px;
-            padding: 1.15rem 1.2rem;
-            background: #ffffff;
-            margin-bottom: 0.9rem;
-            box-shadow: 0 12px 26px rgba(15, 23, 42, 0.055);
-        }
-        .workflow-card h3 {
-            margin-top: 0;
-            margin-bottom: 0.45rem;
-            font-size: 1.12rem;
-            font-weight: 760;
-        }
-        .soft-note {
-            border: 1px solid #bfdbfe;
-            background: #eff6ff;
-            padding: 0.75rem 0.9rem;
-            border-radius: 8px;
-            color: #1f2937;
-            margin: 0.5rem 0 0.75rem;
-        }
-        .mode-card-grid {
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 0.75rem;
-            margin: 0.45rem 0 0.95rem;
-        }
-        .mode-card {
-            border: 1px solid #dbe5f1;
-            border-radius: 8px;
-            background: #f8fafc;
-            padding: 0.95rem 1rem;
-            min-height: 118px;
-        }
-        .mode-card.is-selected {
-            border-color: #2563eb;
-            background: #eff6ff;
-            box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.16);
-        }
-        .mode-card strong {
-            display: block;
-            color: #0f172a;
-            font-size: 0.98rem;
-            margin-bottom: 0.28rem;
-        }
-        .mode-card span {
-            display: block;
-            color: #64748b;
-            font-size: 0.86rem;
-            line-height: 1.35;
-        }
-        .mode-card small {
-            display: inline-block;
-            margin-top: 0.65rem;
-            color: #2563eb;
-            font-weight: 700;
-            font-size: 0.78rem;
-            text-transform: uppercase;
-            letter-spacing: 0.02em;
-        }
-        .bundle-summary {
-            border: 1px solid #bbf7d0;
-            border-radius: 8px;
-            background: #f0fdf4;
-            padding: 1rem;
-            margin: 0.7rem 0 0.8rem;
-        }
-        .bundle-summary h4 {
-            margin: 0 0 0.35rem;
-            color: #14532d;
-            font-size: 1rem;
-        }
-        .bundle-summary p {
-            margin: 0;
-            color: #166534;
-            font-size: 0.9rem;
-        }
-        .secondary-caption {
-            color: #64748b;
-            font-size: 0.9rem;
-            margin: 0.35rem 0 0.7rem;
         }
         .stAlert {
             border-radius: 8px;
@@ -308,19 +175,6 @@ def _apply_page_style():
             border-color: #e2e8f0;
             margin: 0.65rem 0;
         }
-        .status-ready { color: #047857; font-weight: 700; }
-        .status-attention { color: #b45309; font-weight: 700; }
-        .status-missing { color: #b91c1c; font-weight: 700; }
-        .status-pending { color: #4b5563; font-weight: 700; }
-        @media (max-width: 760px) {
-            .progress-row,
-            .mode-card-grid {
-                grid-template-columns: 1fr;
-            }
-            .kurukin-hero {
-                padding: 1.25rem;
-            }
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -348,21 +202,14 @@ def _format_duration(seconds):
 
 
 def _hero_block():
-    st.markdown(
-        """
-        <section class="kurukin-hero">
-            <h1>Crear video Kurukin</h1>
-            <p class="kurukin-lede">
-                Prepara un video usando assets aprobados, audio propio y subtítulos,
-                y envíalo a la cola de render cuando esté listo.
-            </p>
-            <div class="kurukin-safety-note">
-                Esta pantalla no renderiza inmediatamente. Solo prepara y envía
-                trabajos a la cola.
-            </div>
-        </section>
-        """,
-        unsafe_allow_html=True,
+    st.title("Crear video Kurukin")
+    st.write(
+        "Prepara un video usando assets aprobados, audio propio y subtítulos, "
+        "y envíalo a la cola de render cuando esté listo."
+    )
+    st.info(
+        "Esta pantalla no renderiza inmediatamente. Solo prepara y envía trabajos "
+        "a la cola."
     )
 
 
@@ -374,50 +221,25 @@ def _progress_steps():
         ("4", "Estilo", "Ajusta formato y movimiento"),
         ("5", "Revisión", "Valida antes de encolar"),
     )
-    step_html = "".join(
-        f"""
-        <div class="progress-step">
-            <strong>{number}. {title}</strong>
-            <span>{caption}</span>
-        </div>
-        """
-        for number, title, caption in steps
-    )
-    st.markdown(f'<div class="progress-row">{step_html}</div>', unsafe_allow_html=True)
+    cols = st.columns(5)
+    for col, (number, title, caption) in zip(cols, steps):
+        with col:
+            st.markdown(f"**{number}. {title}**")
+            st.caption(caption)
 
 
-def _asset_mode_cards(selected_mode):
-    cards = (
-        (
-            ASSET_SOURCE_ASSET_HUB,
-            "Asset Hub Bundle",
-            "Usa el paquete aprobado y su manifest derivado automáticamente.",
-            "Recomendado",
-        ),
-        (
-            ASSET_SOURCE_LOCAL,
-            "Assets locales",
-            "Selecciona archivos ya disponibles en el worker.",
-            "Manual",
-        ),
-        (
-            ASSET_SOURCE_STOCK,
-            "Stock externo",
-            "Próximamente/configurable desde la experiencia legacy.",
-            "Configurable",
-        ),
-    )
-    card_html = "".join(
-        f"""
-        <div class="mode-card {'is-selected' if selected_mode == mode else ''}">
-            <strong>{title}</strong>
-            <span>{description}</span>
-            <small>{tag}</small>
-        </div>
-        """
-        for mode, title, description, tag in cards
-    )
-    st.markdown(f'<div class="mode-card-grid">{card_html}</div>', unsafe_allow_html=True)
+def _asset_mode_description(selected_mode):
+    if selected_mode == ASSET_SOURCE_ASSET_HUB:
+        st.success(
+            "Asset Hub Bundle recomendado: usa un paquete aprobado y su manifest "
+            "derivado automáticamente."
+        )
+    elif selected_mode == ASSET_SOURCE_LOCAL:
+        st.info("Assets locales: usa archivos ya disponibles en el worker.")
+    else:
+        st.warning(
+            "Stock externo: disponible cuando el backend legacy esté configurado."
+        )
 
 
 def _initialize_form_state():
@@ -457,35 +279,19 @@ def _current_manifest_path():
         return ""
 
 
-def _status_class(summary):
-    status = summary.get("status")
-    if status == "ready":
-        return "status-ready"
-    if status == "invalid":
-        return "status-attention"
-    if status == "not_found":
-        return "status-missing"
-    return "status-pending"
-
-
 def _manifest_summary_block(summary):
     status = summary.get("status")
     label = _state_label(status)
-    st.markdown(
-        f"""
-        <div class="bundle-summary">
-            <h4><span class="{_status_class(summary)}">{label}</span></h4>
-            <p>Resumen del paquete de assets seleccionado.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
     if status == "ready":
+        st.success(f"{label}. Resumen del paquete de assets seleccionado.")
         cols = st.columns(5)
         cols[0].metric("Escenas", summary.get("total_scenes", 0))
         cols[1].metric("Assets", summary.get("total_assets", 0))
-        cols[2].metric("Duración", _format_duration(summary.get("duration_total_seconds")))
+        cols[2].metric(
+            "Duración aprox.",
+            _format_duration(summary.get("duration_total_seconds")),
+        )
         cols[3].metric("Avisos", summary.get("warnings_count", 0))
         cols[4].metric("Para revisar", summary.get("needs_human_review_count", 0))
         st.caption(f"Código del paquete de assets: {summary.get('bundle_uid') or '-'}")
@@ -541,9 +347,7 @@ def _operator_summary_block(operator):
 
 
 def render_asset_source_step():
-    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
     st.markdown("### 1. Assets")
-    _asset_mode_cards(st.session_state["asset_source_mode"])
     source_label = st.radio(
         "Elige de dónde saldrán los materiales visuales",
         list(ASSET_SOURCE_LABELS),
@@ -556,6 +360,7 @@ def render_asset_source_step():
         key="asset_source_label",
     )
     st.session_state["asset_source_mode"] = ASSET_SOURCE_LABELS[source_label]
+    _asset_mode_description(st.session_state["asset_source_mode"])
 
     manifest_summary = {"status": "missing_path", "exists": False}
     if st.session_state["asset_source_mode"] == ASSET_SOURCE_ASSET_HUB:
@@ -622,12 +427,10 @@ def render_asset_source_step():
             "fuera de esta pantalla. Esta consola no modifica config.toml ni "
             "credenciales."
         )
-    st.markdown("</div>", unsafe_allow_html=True)
     return manifest_summary
 
 
 def render_content_step():
-    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
     st.markdown("### 2. Contenido")
     left, right = st.columns([1, 1])
     with left:
@@ -644,7 +447,6 @@ def render_content_step():
         height=160,
         help="Texto base para voz, subtítulos o contexto del render.",
     )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _manual_lines(value):
@@ -665,12 +467,10 @@ def _selected_local_assets():
 
 
 def render_audio_subtitles_step():
-    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
     st.markdown("### 3. Audio y subtítulos")
-    st.markdown(
-        '<div class="soft-note">Puedes usar audio propio y subtítulos mejorados '
-        "en todos los modos compatibles.</div>",
-        unsafe_allow_html=True,
+    st.info(
+        "Puedes usar audio propio y subtítulos mejorados en todos los modos "
+        "compatibles."
     )
 
     left, right = st.columns([1, 1])
@@ -734,11 +534,9 @@ def render_audio_subtitles_step():
         SUBTITLE_STYLE_PRESETS,
         key="subtitle_style_preset",
     )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_quality_style_step():
-    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
     st.markdown("### 4. Calidad y estilo")
     left, right = st.columns([1, 1])
     with left:
@@ -777,7 +575,6 @@ def render_quality_style_step():
         )
         with st.expander("Modo avanzado: rendimiento", expanded=False):
             st.number_input("Threads", min_value=1, max_value=4, step=1, key="n_threads")
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _effective_audio_file():
@@ -863,7 +660,6 @@ def _show_validation_result(spec, payload, manifest_summary, operator):
 
 
 def render_validate_enqueue_step(manifest_summary):
-    st.markdown('<div class="workflow-card">', unsafe_allow_html=True)
     st.markdown("### 5. Revisión")
     st.info(
         "Enviar a cola no renderiza inmediatamente. El video queda pendiente para "
@@ -895,8 +691,6 @@ def render_validate_enqueue_step(manifest_summary):
         st.caption("Valida el video para ver el resumen y el JSON avanzado.")
         with st.expander("Modo avanzado: ver payload JSON", expanded=False):
             st.caption("El payload aparecerá aquí después de validar el video.")
-
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _new_render_view():

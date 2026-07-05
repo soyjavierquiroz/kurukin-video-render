@@ -44,6 +44,14 @@ def make_spec(**overrides):
 
 
 class TestKurukinRenderConsole(unittest.TestCase):
+    def test_webui_page_does_not_use_raw_structural_html(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        for forbidden in ("<div", "</div>", "class=", "<span", "<strong>"):
+            self.assertNotIn(forbidden, page)
+
     def test_asset_source_constants_are_importable_aliases(self):
         self.assertEqual(ASSET_SOURCE_ASSET_HUB, SOURCE_MODE_ASSET_HUB)
         self.assertEqual(ASSET_SOURCE_LOCAL, SOURCE_MODE_LOCAL)
