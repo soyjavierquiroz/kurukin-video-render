@@ -8,10 +8,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-try:
-    from scripts import subtitle_style_presets
-except ImportError:  # pragma: no cover - used when executed as scripts/local_job_wrapper.py
-    import subtitle_style_presets  # type: ignore
+from app.custom import subtitle_style_presets
 
 
 DEFAULT_LOCAL_VIDEOS_DIR = "storage/local_videos"
