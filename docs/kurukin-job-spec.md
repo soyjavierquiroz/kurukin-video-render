@@ -106,6 +106,40 @@ Minimal Render Console-style example:
 }
 ```
 
+Render Console local dev example with the current test bundle:
+
+```json
+{
+  "job_id": "render-console-20260705-120000",
+  "asset_hub": {
+    "renderer_manifest_path": "/data/job-assets/jab_b28367fb22d44a40bae507c175f464c4/manifests/renderer-manifest.json",
+    "bundle_uid": "jab_b28367fb22d44a40bae507c175f464c4",
+    "scene_mode": "ordered",
+    "strict": true
+  },
+  "render_quality": "draft_720p",
+  "subtitles": {
+    "mode": "none"
+  },
+  "video": {
+    "video_subject": "Render Console Example",
+    "video_script": "Example script.",
+    "video_aspect": "9:16",
+    "video_concat_mode": "sequential",
+    "video_transition_mode": "None",
+    "video_clip_duration": 4,
+    "video_count": 1,
+    "voice_name": "es-MX-DaliaNeural-Female",
+    "voice_volume": 1.0,
+    "voice_rate": 1.0,
+    "bgm_type": "none",
+    "subtitle_enabled": false,
+    "n_threads": 2,
+    "paragraph_number": 1
+  }
+}
+```
+
 The manifest path must stay under `/data/job-assets` unless tests or callers
 override the adapter base. The MVP only supports `scene_mode: "ordered"`.
 
@@ -121,6 +155,11 @@ When `asset_hub.renderer_manifest_path` exists, the manifest wins over
 
 If `selectedAssets` also exists, it is validated and preserved only in
 `runner.selectedAssets` as operator metadata.
+
+The Render Console basic form intentionally does not emit `selectedAssets`.
+That form is manifest-first: the UI can summarize the local renderer manifest,
+but the worker expands it into runtime materials only when the render starts.
+Seeing `material_count: 0` in the safe payload summary is expected in this mode.
 
 Legacy fields under `video` remain supported:
 

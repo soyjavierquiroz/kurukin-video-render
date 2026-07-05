@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from app.custom.asset_hub_manifest import (
+    load_asset_hub_renderer_manifest,
+    summarize_asset_hub_manifest,
+    validate_asset_hub_renderer_manifest,
+)
 from app.custom.kurukin_job_adapter import (
     build_moneyprinter_payload,
     summarize_payload,
@@ -121,3 +126,140 @@ def validate_and_build_payload_from_console_spec(
 
     payload = build_moneyprinter_payload(spec, media_probe=False)
     return payload, summarize_payload(payload)
+
+
+def _safe_error_message(exc: Exception) -> str:
+    return str(exc) or exc.__class__.__name__
+
+
+def _iter_manifest_assets(manifest: dict[str, Any]):
+    scenes = manifest.get("scenes")
+    if not isinstance(scenes, list):
+        return
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        for asset in scene.get("assets") or []:
+            if isinstance(asset, dict):
+                yield asset
+
+
+def get_manifest_summary_for_ui(manifest_path: str) -> dict[str, Any]:
+    """Return a safe, compact renderer manifest summary for operator UI."""
+
+    clean_path = _clean_text(manifest_path)
+    if not clean_path:
+        return {
+            "exists": False,
+            "status": "missing_path",
+            "message": "No manifest path provided",
+        }
+
+    if not Path(clean_path).exists():
+        return {
+            "exists": False,
+            "status": "not_found",
+            "message": "Manifest file not found",
+        }
+
+    try:
+        manifest = load_asset_hub_renderer_manifest(clean_path)
+        validate_asset_hub_renderer_manifest(manifest)
+        base_summary = summarize_asset_hub_manifest(manifest)
+    except Exception as exc:
+        return {
+            "exists": True,
+            "status": "invalid",
+            "message": _safe_error_message(exc),
+        }
+
+    asset_types: dict[str, int] = {}
+    duration_total_seconds = 0.0
+    preview_filenames = []
+    for asset in _iter_manifest_assets(manifest):
+        asset_type = asset.get("type")
+        if isinstance(asset_type, str) and asset_type:
+            asset_types[asset_type] = asset_types.get(asset_type, 0) + 1
+
+        duration = asset.get("duration_seconds")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            duration_total_seconds += float(duration)
+
+        filename = asset.get("filename")
+        if isinstance(filename, str) and filename and len(preview_filenames) < 5:
+            preview_filenames.append(filename)
+
+    return {
+        "exists": True,
+        "status": "ready",
+        "message": "Manifest ready",
+        "bundle_uid": base_summary.get("bundle_uid"),
+        "job_id": base_summary.get("job_id"),
+        "total_scenes": base_summary.get("total_scenes", 0),
+        "total_assets": base_summary.get("total_assets", 0),
+        "warnings_count": base_summary.get("warnings_count", 0),
+        "needs_human_review_count": base_summary.get(
+            "needs_human_review_count",
+            0,
+        ),
+        "safe_for_subtitles_false_count": base_summary.get(
+            "safe_for_subtitles_false_count",
+            0,
+        ),
+        "safe_for_text_overlay_false_count": base_summary.get(
+            "safe_for_text_overlay_false_count",
+            0,
+        ),
+        "asset_types": asset_types,
+        "duration_total_seconds": round(duration_total_seconds, 2),
+        "preview_filenames": preview_filenames,
+    }
+
+
+def build_operator_summary(
+    payload: dict[str, Any],
+    manifest_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Adapt the safe payload summary into operator-friendly UI fields."""
+
+    payload_summary = summarize_payload(payload)
+    payload_material_count = int(payload_summary.get("material_count") or 0)
+    manifest_asset_count = 0
+    if isinstance(manifest_summary, dict):
+        manifest_asset_count = int(manifest_summary.get("total_assets") or 0)
+
+    has_asset_hub = bool(payload.get("asset_hub_renderer_manifest_path"))
+    has_local_materials = isinstance(payload.get("video_materials"), list)
+    if has_asset_hub:
+        mode = "Asset Hub manifest"
+    elif has_local_materials:
+        mode = "Local selected assets"
+    else:
+        mode = "Unknown"
+
+    summary = {
+        "job_id": payload_summary.get("job_id"),
+        "subject": payload_summary.get("video_subject"),
+        "mode": mode,
+        "render_quality": payload_summary.get("video_resolution"),
+        "aspect": payload.get("video_aspect"),
+        "subtitles": (
+            payload_summary.get("subtitle_provider")
+            or ("enabled" if payload_summary.get("subtitle_enabled") else "none")
+        ),
+        "audio": "custom" if payload_summary.get("has_custom_audio") else "generated",
+        "image_motion": (
+            "enabled" if payload_summary.get("image_motion_enabled") else "disabled"
+        ),
+        "bundle_uid": payload_summary.get("asset_hub_bundle_uid"),
+        "payload_material_count": payload_material_count,
+        "manifest_asset_count": manifest_asset_count,
+        "note": "",
+    }
+
+    if has_asset_hub and payload_material_count == 0:
+        summary["note"] = (
+            "Los assets se resolverán desde el manifest cuando el worker "
+            "inicie el render."
+        )
+    return summary
