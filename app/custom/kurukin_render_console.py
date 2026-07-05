@@ -25,9 +25,12 @@ from app.custom.kurukin_job_adapter import (
 
 
 DEFAULT_VOICE_NAME = "es-MX-DaliaNeural-Female"
-ASSET_SOURCE_ASSET_HUB = "asset_hub_bundle"
-ASSET_SOURCE_LOCAL = "local_assets"
-ASSET_SOURCE_STOCK = "stock_external"
+SOURCE_MODE_ASSET_HUB = "asset_hub_bundle"
+SOURCE_MODE_LOCAL = "local_assets"
+SOURCE_MODE_STOCK = "stock_external"
+ASSET_SOURCE_ASSET_HUB = SOURCE_MODE_ASSET_HUB
+ASSET_SOURCE_LOCAL = SOURCE_MODE_LOCAL
+ASSET_SOURCE_STOCK = SOURCE_MODE_STOCK
 STOCK_SOURCES = {"pexels", "pixabay", "coverr"}
 
 

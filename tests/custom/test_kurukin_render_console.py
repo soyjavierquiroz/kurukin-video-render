@@ -10,7 +10,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
 from app.custom.kurukin_render_console import (
     ASSET_SOURCE_LOCAL,
+    ASSET_SOURCE_ASSET_HUB,
     ASSET_SOURCE_STOCK,
+    SOURCE_MODE_ASSET_HUB,
+    SOURCE_MODE_LOCAL,
+    SOURCE_MODE_STOCK,
     build_operator_summary,
     build_render_console_spec,
     build_workflow_payload,
@@ -40,6 +44,11 @@ def make_spec(**overrides):
 
 
 class TestKurukinRenderConsole(unittest.TestCase):
+    def test_asset_source_constants_are_importable_aliases(self):
+        self.assertEqual(ASSET_SOURCE_ASSET_HUB, SOURCE_MODE_ASSET_HUB)
+        self.assertEqual(ASSET_SOURCE_LOCAL, SOURCE_MODE_LOCAL)
+        self.assertEqual(ASSET_SOURCE_STOCK, SOURCE_MODE_STOCK)
+
     def test_get_manifest_summary_for_ui_with_empty_path(self):
         self.assertEqual(
             get_manifest_summary_for_ui(""),
