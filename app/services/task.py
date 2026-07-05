@@ -7,6 +7,7 @@ from os import path
 from loguru import logger
 
 from app.config import config
+from app.custom import asset_hub_manifest
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import llm, material, subtitle, twelvelabs, video, voice, upload_post
@@ -85,6 +86,62 @@ def save_script_data(task_id, video_script, video_terms, params):
 
     with open(script_file, "w", encoding="utf-8") as f:
         f.write(utils.to_json(script_data))
+
+
+def apply_asset_hub_renderer_manifest(params: VideoParams) -> dict | None:
+    manifest_path = (
+        getattr(params, "asset_hub_renderer_manifest_path", "") or ""
+    ).strip()
+    if not manifest_path:
+        return None
+
+    scene_mode = (
+        getattr(params, "asset_hub_scene_mode", "ordered") or "ordered"
+    ).strip()
+    if scene_mode != "ordered":
+        raise ValueError("asset_hub_scene_mode only supports 'ordered' for MVP")
+
+    manifest = asset_hub_manifest.load_asset_hub_renderer_manifest(manifest_path)
+    asset_hub_manifest.validate_asset_hub_renderer_manifest(manifest)
+
+    expected_bundle_uid = (
+        getattr(params, "asset_hub_bundle_uid", "") or ""
+    ).strip()
+    manifest_bundle_uid = manifest.get("bundle_uid")
+    if expected_bundle_uid and expected_bundle_uid != manifest_bundle_uid:
+        raise ValueError(
+            "asset_hub_bundle_uid does not match renderer manifest bundle_uid: "
+            f"{expected_bundle_uid!r} != {manifest_bundle_uid!r}"
+        )
+
+    if getattr(params, "video_materials", None):
+        logger.info(
+            "asset hub renderer manifest replaces provided video_materials "
+            "for this MVP"
+        )
+
+    materials = asset_hub_manifest.convert_asset_hub_manifest_to_materials(
+        manifest,
+        strict=bool(getattr(params, "asset_hub_strict", True)),
+    )
+    summary = asset_hub_manifest.summarize_asset_hub_manifest(manifest)
+    logger.info(
+        "asset hub manifest loaded: "
+        f"bundle_uid={summary.get('bundle_uid')}, "
+        f"scenes={summary.get('total_scenes')}, "
+        f"assets={summary.get('total_assets')}"
+    )
+    for warning in asset_hub_manifest.collect_asset_hub_render_warnings(manifest):
+        logger.warning(f"asset hub warning: {warning}")
+
+    params.video_source = "local"
+    params.video_materials = materials
+    params.video_terms = []
+    logger.info(
+        "asset hub materials applied: "
+        f"count={len(materials)}, video_source={params.video_source}"
+    )
+    return summary
 
 
 def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> str:
@@ -467,6 +524,8 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, script=video_script
         )
         return {"script": video_script}
+
+    apply_asset_hub_renderer_manifest(params)
 
     # 2. Generate terms
     video_terms = ""

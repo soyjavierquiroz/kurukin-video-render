@@ -71,6 +71,36 @@ Si `video_source == "local"`, `task.get_video_materials()` llama a `video.prepro
 
 La WebUI puede subir archivos locales y guardarlos en `storage/local_videos`. Nuestro `scripts/local_job_wrapper.py` tambien genera payloads locales: valida `selectedAssets`, ordena por `order`, aplica presets de subtitulos, fija `video_source = "local"` y produce `video_materials = [{"provider": "local", "url": <filename>, "duration": 0}]`.
 
+## Asset Hub renderer manifest
+
+`VideoParams.asset_hub_renderer_manifest_path` habilita el consumo opcional de
+un renderer manifest local generado por Kurukin Asset Hub. Se aplica en
+`task.start()` despues de tener `video_script` y antes de `generate_terms()`.
+Cuando existe:
+
+- carga y valida el JSON local bajo `/data/job-assets` o
+  `ASSET_HUB_JOB_ASSETS_DIR`;
+- valida `manifest_version = "1.0"`, `generated_by = "kurukin-asset-hub"`,
+  `bundle_uid`, escenas, assets y paths;
+- si `asset_hub_bundle_uid` viene en el payload, exige que coincida con el
+  manifest;
+- solo acepta `asset_hub_scene_mode = "ordered"` en el MVP;
+- convierte assets `video` e imagenes `.jpg`, `.jpeg` y `.png` a
+  `video_materials` con `provider = "asset_hub"`;
+- fuerza `video_source = "local"` y reemplaza materiales manuales;
+- limpia `video_terms`, por lo que no se llama Pexels, Pixabay ni Coverr.
+
+Si el campo no viene, el flujo original no cambia. MoneyPrinterTurbo no llama
+Asset Hub, no busca assets, no llama OpenAI para assets, no usa rclone, no toca
+Google Drive y no conecta la DB de Asset Hub.
+
+`app/services/video.py` mantiene los materiales `provider = "local"` limitados a
+`storage/local_videos`. Para `provider = "asset_hub"`, permite leer paths
+absolutos seguros bajo `/data/job-assets` y rechaza cualquier escape. Los videos
+se leen directo desde el volumen read-only. Las imagenes de Asset Hub se leen
+desde ese volumen y el clip derivado se escribe en `storage/cache_videos`, no
+dentro del volumen externo.
+
 ## Imagenes locales con image_motion
 
 Las imagenes locales pueden convertirse a clips MP4 temporales antes del render

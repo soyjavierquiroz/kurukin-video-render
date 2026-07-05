@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import itertools
 import io
 import math
@@ -28,6 +29,7 @@ from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
 
 from app.config import config
+from app.custom import asset_hub_manifest
 from app.models import const
 from app.models.schema import (
     MaterialInfo,
@@ -1374,15 +1376,24 @@ def preprocess_video(
             continue
 
         try:
-            material_source_path = file_security.resolve_path_within_directory(
-                local_videos_dir, material.url
-            )
+            if getattr(material, "provider", "") == "asset_hub":
+                material_source_path = str(
+                    asset_hub_manifest.resolve_asset_hub_asset_path(material.url)
+                )
+            else:
+                material_source_path = file_security.resolve_path_within_directory(
+                    local_videos_dir, material.url
+                )
         except ValueError as exc:
             # local video_source 的素材路径来自 API 参数，必须限制在专用素材目录。
             # 允许用户传文件名，也兼容历史返回的绝对路径，但不允许逃逸到系统
             # 其他目录，避免任意文件读取或通过 MoviePy 探测本地敏感文件。
+            if getattr(material, "provider", "") == "asset_hub":
+                message_prefix = "asset hub path rejected"
+            else:
+                message_prefix = "skip unsafe local material"
             logger.warning(
-                f"skip unsafe local material: {material.url}, "
+                f"{message_prefix}: {material.url}, "
                 f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
             )
             continue
@@ -1467,7 +1478,18 @@ def preprocess_video(
                     )
 
                 # Output the video to a file.
-                video_file = f"{material_source_path}.mp4"
+                if getattr(material, "provider", "") == "asset_hub":
+                    processed_dir = utils.storage_dir(
+                        "cache_videos/asset_hub_images",
+                        create=True,
+                    )
+                    digest = hashlib.sha1(
+                        material_source_path.encode("utf-8")
+                    ).hexdigest()[:12]
+                    stem = os.path.splitext(os.path.basename(material_source_path))[0]
+                    video_file = os.path.join(processed_dir, f"{stem}-{digest}.mp4")
+                else:
+                    video_file = f"{material_source_path}.mp4"
                 final_clip.write_videofile(video_file, fps=30, logger=None)
                 close_clip(clip)
                 close_clip(final_clip)

@@ -33,6 +33,10 @@ Campos criticos:
 - `video_count`
 - `video_source`
 - `video_materials`
+- `asset_hub_renderer_manifest_path`
+- `asset_hub_bundle_uid`
+- `asset_hub_scene_mode`
+- `asset_hub_strict`
 - `image_motion_enabled`
 - `image_motion_preset`
 - `image_motion_intensity`
@@ -158,6 +162,13 @@ mantenerlos visibles al comparar contra upstream.
   normaliza presets, valida intensidad y aplica motion still solo a imagenes
   locales durante `preprocess_video()`. Videos locales mantienen el flujo
   previo.
+- `asset hub renderer manifest`: `app/custom/asset_hub_manifest.py` valida y
+  convierte manifests locales generados por Kurukin Asset Hub;
+  `task.apply_asset_hub_renderer_manifest()` corre antes de `generate_terms()`,
+  fuerza `video_source = "local"` y reemplaza `video_materials`; el resolver de
+  `app/services/video.py` permite `provider = "asset_hub"` solo bajo
+  `/data/job-assets`; `docker-compose.local.yml` monta
+  `kurukin-asset-hub_job_assets:/data/job-assets:ro`.
 
 ## Checklist para actualizar desde upstream
 
@@ -185,6 +196,7 @@ El script marca como `HIGH RISK`:
 - `app/models/schema.py`
 - `app/services/task.py`
 - `app/services/video.py`
+- `docker-compose.local.yml`
 - `app/services/material.py`
 - `app/controllers/`
 - `webui/`

@@ -16,6 +16,12 @@
     "correction_enabled": false,
     "optimize": true
   },
+  "asset_hub": {
+    "renderer_manifest_path": "/data/job-assets/jab_b28367fb22d44a40bae507c175f464c4/manifests/renderer-manifest.json",
+    "bundle_uid": "jab_b28367fb22d44a40bae507c175f464c4",
+    "scene_mode": "ordered",
+    "strict": true
+  },
   "selectedAssets": [
     {
       "file": "foto-ritual.png",

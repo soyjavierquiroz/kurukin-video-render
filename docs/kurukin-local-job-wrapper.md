@@ -52,9 +52,13 @@ El JSON debe ser un objeto con:
   `premium`.
 - `image_motion`: objeto opcional para animar imagenes locales JPG/JPEG/PNG con
   movimiento simple. No genera video con IA.
+- `asset_hub`: objeto opcional para consumir un renderer manifest ya
+  materializado por Kurukin Asset Hub. Si existe, el manifest reemplaza
+  `selectedAssets` y `video_materials` para el render.
 - `selectedAssets`: lista no vacia de objetos con `file`; `label` y `order` son
-  metadatos opcionales. En imagenes, `motion` y `motion_intensity` permiten
-  sobreescribir el movimiento global por asset.
+  metadatos opcionales. Puede omitirse cuando `asset_hub.renderer_manifest_path`
+  existe. En imagenes, `motion` y `motion_intensity` permiten sobreescribir el
+  movimiento global por asset.
 - `audio`: objeto opcional. `audio.file` apunta a un archivo dentro de
   `storage/local_audios` o de `--local-audios-dir`.
 - `subtitles`: objeto opcional. `subtitles.mode` acepta `whisper`, `edge`,
@@ -68,6 +72,68 @@ El JSON debe ser un objeto con:
 
 `selectedAssets` se ordena por `order` cuando existe. Si ningun asset tiene
 `order`, se mantiene el orden original.
+
+## Asset Hub renderer manifest
+
+Kurukin Asset Hub sigue siendo catalogo, selector, enriquecedor y
+materializador. MoneyPrinterTurbo sigue siendo renderer/worker: no llama APIs de
+Asset Hub, no usa rclone, no conecta Google Drive y no toca la DB de Asset Hub.
+Para este MVP solo lee un JSON local ya preparado y archivos locales ya
+materializados.
+
+El contenedor `api` debe montar el volumen externo de Asset Hub en modo
+read-only:
+
+```yaml
+kurukin-asset-hub_job_assets:/data/job-assets:ro
+```
+
+Entrada del wrapper:
+
+```json
+{
+  "asset_hub": {
+    "renderer_manifest_path": "/data/job-assets/jab_b28367fb22d44a40bae507c175f464c4/manifests/renderer-manifest.json",
+    "bundle_uid": "jab_b28367fb22d44a40bae507c175f464c4",
+    "scene_mode": "ordered",
+    "strict": true
+  }
+}
+```
+
+Campos:
+
+- `renderer_manifest_path`: path absoluto o relativo bajo `/data/job-assets`.
+  Debe terminar en `.json`.
+- `bundle_uid`: opcional, pero recomendado. El core falla si no coincide con el
+  `bundle_uid` del manifest.
+- `scene_mode`: solo `ordered` en el MVP.
+- `strict`: default `true`. Si es `true`, falta de archivos o paths invalidos
+  falla temprano. Si es `false`, el core salta assets invalidos y sigue solo si
+  queda al menos un asset valido.
+
+El wrapper mapea esos campos a:
+
+```json
+{
+  "asset_hub_renderer_manifest_path": "/data/job-assets/.../renderer-manifest.json",
+  "asset_hub_bundle_uid": "jab_...",
+  "asset_hub_scene_mode": "ordered",
+  "asset_hub_strict": true
+}
+```
+
+`asset_hub` no queda como key raiz del job pendiente; se conserva solo en
+`runner.asset_hub` como metadata. Si `selectedAssets` tambien existe, se valida
+y se conserva dentro de `runner.selectedAssets`, pero el core reemplaza los
+materiales manuales por los assets del manifest.
+
+El core usa `local_path`, preserva el orden por `scene_index` y luego por orden
+del array `assets` o por `rank`/`scene_asset_rank` cuando todos los assets de la
+escena lo traen claramente. `recommended_transform` queda reservado para fases
+futuras. Los warnings de render, `needs_human_review`,
+`safe_for_subtitles=false` y `safe_for_text_overlay=false` se loguean sin
+bloquear; los archivos invalidos bloquean solo con `strict=true`.
 
 ## Calidad de render
 

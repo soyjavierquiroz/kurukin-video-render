@@ -89,6 +89,10 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
+    asset_hub_renderer_manifest_path: str = ""
+    asset_hub_bundle_uid: str = ""
+    asset_hub_scene_mode: str = "ordered"
+    asset_hub_strict: bool = True
     image_motion_enabled: bool = False
     image_motion_preset: str = ""
     image_motion_intensity: float = 0.06
