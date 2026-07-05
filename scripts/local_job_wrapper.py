@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app.custom import kurukin_job_adapter as adapter
+from app.custom.kurukin_job_queue import enqueue_moneyprinter_payload
 
 
 DEFAULT_QUEUE_DIR = "/opt/moneyprinterturbo/storage/nightly_jobs"
@@ -141,21 +142,10 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def enqueue_job(pending_job: dict[str, Any], queue_dir: str | Path) -> Path:
-    pending_dir = Path(queue_dir) / "pending"
-    pending_dir.mkdir(parents=True, exist_ok=True)
-
-    stem = f"{_utc_timestamp()}-{slugify(pending_job.get('job_id'))}"
-    candidate = pending_dir / f"{stem}.json"
-    counter = 1
-    while candidate.exists():
-        candidate = pending_dir / f"{stem}-{counter}.json"
-        counter += 1
-        if counter > 100:
-            candidate = pending_dir / f"{stem}-{time.time_ns()}.json"
-            break
-
-    _write_json_atomic(candidate, pending_job)
-    return candidate
+    return enqueue_moneyprinter_payload(
+        pending_job,
+        queue_dir=Path(queue_dir) / "pending",
+    )
 
 
 def positive_int(value: str) -> int:
