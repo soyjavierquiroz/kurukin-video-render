@@ -26,12 +26,14 @@ DEFAULT_LOCAL_VIDEOS_DIR = "/opt/moneyprinterturbo/storage/local_videos"
 DEFAULT_LOCAL_AUDIOS_DIR = "/opt/moneyprinterturbo/storage/local_audios"
 DEFAULT_LOCAL_SUBTITLES_DIR = "/opt/moneyprinterturbo/storage/local_subtitles"
 DEFAULT_FONTS_DIR = "/opt/moneyprinterturbo/resource/fonts"
+DEFAULT_ASSET_HUB_JOB_ASSETS_DIR = "/data/job-assets"
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png"}
 ALLOWED_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "flac", "ogg"}
 ALLOWED_SUBTITLE_EXTENSIONS = {"srt"}
 ALLOWED_VIDEO_ASPECTS = {"9:16", "16:9"}
 ALLOWED_SUBTITLE_MODES = {"whisper", "edge", "custom_srt", "none"}
 ALLOWED_SUBTITLE_PROVIDERS = {"whisper", "edge"}
+ALLOWED_ASSET_HUB_SCENE_MODES = {"ordered"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RENDER_QUALITY_ALIASES = {
     "draft": "draft_720p",
@@ -224,6 +226,50 @@ def _optional_bool(value: Any, *, default: bool, label: str) -> bool:
     if isinstance(value, bool):
         return value
     raise LocalJobWrapperError(f"{label} must be a boolean")
+
+
+def normalize_asset_hub_manifest_path(
+    value: Any,
+    *,
+    base_dir: str | Path | None = None,
+    label: str,
+) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise LocalJobWrapperError(f"{label} is required and must be a string")
+
+    base = Path(base_dir or DEFAULT_ASSET_HUB_JOB_ASSETS_DIR).resolve()
+    requested = Path(value.strip())
+    candidate = requested if requested.is_absolute() else base / requested
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise LocalJobWrapperError(f"{label} must stay under {base}") from exc
+
+    if resolved.suffix.lower() != ".json":
+        raise LocalJobWrapperError(f"{label} must point to a .json file")
+    if resolved.exists() and not resolved.is_file():
+        raise LocalJobWrapperError(f"{label} exists but is not a file: {resolved}")
+    return resolved.as_posix()
+
+
+def normalize_asset_hub_scene_mode(value: Any, *, label: str) -> str:
+    if value in (None, ""):
+        return "ordered"
+    if not isinstance(value, str):
+        raise LocalJobWrapperError(f"{label} must be a string when provided")
+    mode = value.strip()
+    if mode not in ALLOWED_ASSET_HUB_SCENE_MODES:
+        raise LocalJobWrapperError(f"{label} only supports ordered for MVP")
+    return mode
+
+
+def normalize_asset_hub_bundle_uid(value: Any, *, label: str) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise LocalJobWrapperError(f"{label} must be a string when provided")
+    return value.strip()
 
 
 def _normalize_optional_subtitle_provider(value: Any, *, label: str) -> str:
@@ -431,6 +477,68 @@ def apply_image_motion_contract(
         "intensity",
         DEFAULT_IMAGE_MOTION_INTENSITY,
     )
+
+
+def apply_asset_hub_contract(
+    pending_job: dict[str, Any],
+    spec: dict[str, Any],
+) -> bool:
+    asset_hub = spec.get("asset_hub")
+    if asset_hub is not None and not isinstance(asset_hub, dict):
+        raise LocalJobWrapperError("asset_hub must be a JSON object when provided")
+
+    asset_hub = asset_hub or {}
+    top_level_path = asset_hub.get("renderer_manifest_path")
+    legacy_path = pending_job.get("asset_hub_renderer_manifest_path")
+    if not top_level_path and not legacy_path:
+        return False
+
+    normalized_path = normalize_asset_hub_manifest_path(
+        top_level_path or legacy_path,
+        label=(
+            "asset_hub.renderer_manifest_path"
+            if top_level_path
+            else "video.asset_hub_renderer_manifest_path"
+        ),
+    )
+    if top_level_path and legacy_path:
+        normalized_legacy_path = normalize_asset_hub_manifest_path(
+            legacy_path,
+            label="video.asset_hub_renderer_manifest_path",
+        )
+        if normalized_path != normalized_legacy_path:
+            raise LocalJobWrapperError(
+                "asset_hub.renderer_manifest_path conflicts with "
+                "video.asset_hub_renderer_manifest_path"
+            )
+
+    bundle_uid = normalize_asset_hub_bundle_uid(
+        asset_hub.get("bundle_uid", pending_job.get("asset_hub_bundle_uid")),
+        label="asset_hub.bundle_uid",
+    )
+    scene_mode = normalize_asset_hub_scene_mode(
+        asset_hub.get("scene_mode", pending_job.get("asset_hub_scene_mode")),
+        label="asset_hub.scene_mode",
+    )
+    strict = _optional_bool(
+        asset_hub.get("strict", pending_job.get("asset_hub_strict")),
+        default=True,
+        label="asset_hub.strict",
+    )
+
+    pending_job["asset_hub_renderer_manifest_path"] = normalized_path
+    pending_job["asset_hub_bundle_uid"] = bundle_uid
+    pending_job["asset_hub_scene_mode"] = scene_mode
+    pending_job["asset_hub_strict"] = strict
+    pending_job["video_source"] = "local"
+    pending_job.pop("video_materials", None)
+    pending_job["runner"]["asset_hub"] = {
+        "renderer_manifest_path": normalized_path,
+        "bundle_uid": bundle_uid,
+        "scene_mode": scene_mode,
+        "strict": strict,
+    }
+    return True
 
 
 def apply_audio_contract(
@@ -676,8 +784,17 @@ def validate_job_spec(
     if video_aspect not in ALLOWED_VIDEO_ASPECTS:
         raise LocalJobWrapperError('video.video_aspect must be "9:16" or "16:9"')
 
+    asset_hub = spec.get("asset_hub")
+    has_asset_hub_manifest = (
+        isinstance(asset_hub, dict) and bool(asset_hub.get("renderer_manifest_path"))
+    ) or bool(video.get("asset_hub_renderer_manifest_path"))
+
     assets = spec.get("selectedAssets")
-    if not isinstance(assets, list) or not assets:
+    if assets is None:
+        if has_asset_hub_manifest:
+            return []
+        raise LocalJobWrapperError("selectedAssets must be a non-empty list")
+    if not isinstance(assets, list) or (not assets and not has_asset_hub_manifest):
         raise LocalJobWrapperError("selectedAssets must be a non-empty list")
 
     normalized_assets: list[dict[str, Any]] = []
@@ -770,8 +887,10 @@ def build_pending_job(
         video_materials.append(material)
     pending_job["video_materials"] = video_materials
     pending_job.pop("selectedAssets", None)
+    pending_job.pop("asset_hub", None)
     pending_job.pop("subtitle_style_preset", None)
     pending_job.pop("subtitle_style_overrides", None)
+    apply_asset_hub_contract(pending_job, spec)
     apply_render_quality_contract(pending_job, spec)
     apply_image_motion_contract(pending_job, spec)
     apply_audio_contract(

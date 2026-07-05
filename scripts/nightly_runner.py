@@ -191,7 +191,15 @@ def validate_job(job: Any) -> dict[str, Any]:
     video_source = job.get("video_source")
     if video_source == "local":
         materials = job.get("video_materials")
-        if not isinstance(materials, list) or not materials:
+        asset_hub_manifest_path = job.get("asset_hub_renderer_manifest_path")
+        has_asset_hub_manifest = (
+            isinstance(asset_hub_manifest_path, str)
+            and bool(asset_hub_manifest_path.strip())
+        )
+        if (
+            (not isinstance(materials, list) or not materials)
+            and not has_asset_hub_manifest
+        ):
             raise RunnerError(
                 'video_materials is required and cannot be empty when video_source is "local"'
             )

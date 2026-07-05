@@ -34,6 +34,11 @@ services:
       - ./config.toml:/MoneyPrinterTurbo/config.toml:ro
       - ./app:/MoneyPrinterTurbo/app:ro
       - ./storage:/MoneyPrinterTurbo/storage
+      - kurukin-asset-hub_job_assets:/data/job-assets:ro
     environment:
       - PYTHONDONTWRITEBYTECODE=1
     restart: unless-stopped
+
+volumes:
+  kurukin-asset-hub_job_assets:
+    external: true
