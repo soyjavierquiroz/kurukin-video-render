@@ -181,6 +181,17 @@ mantenerlos visibles al comparar contra upstream.
   render_quality, image_motion, Asset Hub renderer manifests y metadata
   `runner`. `scripts/local_job_wrapper.py` delega en este modulo y conserva
   solo CLI, print-payload, validate-only y enqueue.
+- `kurukin job queue`: `app/custom/kurukin_job_queue.py` centraliza escritura
+  atomica de payloads en `storage/nightly_jobs/pending` y vistas read-only de
+  cola, tasks y storage.
+- `kurukin render console`: `app/custom/kurukin_render_console.py` construye
+  specs desde formulario y delega validacion al adapter; no duplica reglas.
+  `webui/pages/Kurukin_Render_Console.py` expone la consola Streamlit con tabs
+  para formulario, JSON avanzado y cola/storage.
+- `docker-compose.local.yml`: monta `./webui` en el contenedor `webui` para
+  cargar paginas locales y monta
+  `kurukin-asset-hub_job_assets:/data/job-assets:ro` tambien en `webui` para
+  validar paths Asset Hub manifest desde la consola.
 
 ## Checklist para actualizar desde upstream
 

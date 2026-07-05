@@ -4,6 +4,8 @@ Kurukin job specs are reusable JSON inputs for
 `app/custom/kurukin_job_adapter.py`. The adapter validates the spec and returns
 a MoneyPrinterTurbo payload compatible with `POST /api/v1/videos`; it does not
 enqueue, call the API, render, touch rclone, or read Asset Hub databases.
+The Kurukin Render Console also produces this spec shape before delegating to
+the same adapter.
 
 Flow:
 
@@ -66,6 +68,40 @@ Example:
     "bundle_uid": "jab_123",
     "scene_mode": "ordered",
     "strict": true
+  }
+}
+```
+
+Minimal Render Console-style example:
+
+```json
+{
+  "job_id": "render-console-example-001",
+  "asset_hub": {
+    "renderer_manifest_path": "/data/job-assets/jab_123/manifests/renderer-manifest.json",
+    "bundle_uid": "jab_123",
+    "scene_mode": "ordered",
+    "strict": true
+  },
+  "render_quality": "draft_720p",
+  "subtitles": {
+    "mode": "none"
+  },
+  "video": {
+    "video_subject": "Render Console Example",
+    "video_script": "Example script.",
+    "video_aspect": "9:16",
+    "video_concat_mode": "sequential",
+    "video_transition_mode": "None",
+    "video_clip_duration": 4,
+    "video_count": 1,
+    "voice_name": "es-MX-DaliaNeural-Female",
+    "voice_volume": 1.0,
+    "voice_rate": 1.0,
+    "bgm_type": "none",
+    "subtitle_enabled": false,
+    "n_threads": 2,
+    "paragraph_number": 1
   }
 }
 ```
