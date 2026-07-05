@@ -20,6 +20,23 @@ El pipeline en `app/services/task.py` es lineal:
 7. `generate_final_videos()`: concatena clips, monta audio, quema subtitulos y actualiza estado final.
 8. Opcional: cross-posting si `upload_post` esta configurado.
 
+## Resolucion final por job
+
+`VideoParams.video_resolution` permite definir la calidad de render por job sin
+cambiar el default historico. Si el campo falta o viene vacio, el core mantiene
+1080p: `1080x1920` para `9:16` y `1920x1080` para `16:9`.
+
+`app/services/video.py` concentra la decision en `resolve_video_size()`. La
+combinacion de `video_aspect` y perfil determina ancho y alto:
+
+- `draft_720p`: `720x1280` vertical o `1280x720` horizontal.
+- `standard_1080p`: `1080x1920` vertical o `1920x1080` horizontal.
+- `premium_2k`: `1440x2560` vertical o `2560x1440` horizontal.
+
+El pipeline usa ese tamano al preparar clips en `combine_videos()` y al montar
+audio/subtitulos en `generate_video()`. Perfiles 2K son opt-in; el wrapper local
+los expone como `render_quality` y los convierte a `video_resolution`.
+
 ## Idea/topic a guion
 
 `VideoParams.video_subject` es obligatorio. `VideoParams.video_script` es opcional. En `task.generate_script()`, si `video_script.strip()` no esta vacio, el core no llama a IA y usa ese texto tal cual. Si esta vacio, llama a `llm.generate_script(video_subject, video_language, paragraph_number, video_script_prompt, custom_system_prompt)`.

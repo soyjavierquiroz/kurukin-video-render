@@ -86,6 +86,55 @@ _SUPPORTED_VIDEO_CODECS = (
 _runtime_disabled_video_codecs = set()
 
 
+def _normalize_video_resolution(video_resolution: str = "") -> str:
+    raw_value = "" if video_resolution is None else str(video_resolution)
+    normalized = raw_value.strip().lower()
+    aliases = {
+        "": "standard_1080p",
+        "standard": "standard_1080p",
+        "standard_1080p": "standard_1080p",
+        "1080p": "standard_1080p",
+        "draft": "draft_720p",
+        "draft_720p": "draft_720p",
+        "720p": "draft_720p",
+        "premium": "premium_2k",
+        "premium_2k": "premium_2k",
+        "2k": "premium_2k",
+        "1440p": "premium_2k",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported video_resolution {raw_value!r}. Expected 720p, 1080p, or 2k."
+        ) from exc
+
+
+def resolve_video_size(video_aspect: str, video_resolution: str = "") -> tuple[int, int]:
+    profile = _normalize_video_resolution(video_resolution)
+    aspect = VideoAspect(video_aspect)
+    sizes = {
+        VideoAspect.portrait: {
+            "draft_720p": (720, 1280),
+            "standard_1080p": (1080, 1920),
+            "premium_2k": (1440, 2560),
+        },
+        VideoAspect.landscape: {
+            "draft_720p": (1280, 720),
+            "standard_1080p": (1920, 1080),
+            "premium_2k": (2560, 1440),
+        },
+    }
+    if aspect in sizes:
+        return sizes[aspect][profile]
+    if profile == "standard_1080p":
+        return aspect.to_resolution()
+    raise ValueError(
+        f"Unsupported video_aspect {str(video_aspect)!r} for video_resolution "
+        f"{str(video_resolution)!r}. Expected 9:16 or 16:9."
+    )
+
+
 def _get_required_video_duration(audio_duration: float) -> float:
     """
     返回视频素材拼接的目标时长。
@@ -537,6 +586,7 @@ def combine_videos(
     video_paths: List[str],
     audio_file: str,
     video_aspect: VideoAspect = VideoAspect.portrait,
+    video_resolution: str = "",
     video_concat_mode: VideoConcatMode = VideoConcatMode.random,
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: int = 5,
@@ -561,8 +611,12 @@ def combine_videos(
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
     output_dir = os.path.dirname(combined_video_path)
 
-    aspect = VideoAspect(video_aspect)
-    video_width, video_height = aspect.to_resolution()
+    video_width, video_height = resolve_video_size(video_aspect, video_resolution)
+    logger.info(
+        f"video size resolved: {video_width}x{video_height}, "
+        f"aspect={video_aspect}, "
+        f"resolution={_normalize_video_resolution(video_resolution)}"
+    )
 
     processed_clips = []
     subclipped_items = []
@@ -906,9 +960,16 @@ def generate_video(
     output_file: str,
     params: VideoParams,
 ):
-    aspect = VideoAspect(params.video_aspect)
-    video_width, video_height = aspect.to_resolution()
+    video_width, video_height = resolve_video_size(
+        params.video_aspect,
+        getattr(params, "video_resolution", ""),
+    )
 
+    logger.info(
+        f"video size resolved: {video_width}x{video_height}, "
+        f"aspect={params.video_aspect}, "
+        f"resolution={_normalize_video_resolution(getattr(params, 'video_resolution', ''))}"
+    )
     logger.info(f"generating video: {video_width} x {video_height}")
     logger.info(f"  ① video: {video_path}")
     logger.info(f"  ② audio: {audio_path}")
