@@ -9,6 +9,12 @@ class RenderConsoleImportsTest(unittest.TestCase):
     def test_kurukin_render_console_imports(self):
         import app.custom.kurukin_render_console  # noqa: F401
 
+    def test_render_console_ux_helpers_import(self):
+        from app.custom.kurukin_render_console import (  # noqa: F401
+            build_operator_summary,
+            get_manifest_summary_for_ui,
+        )
+
     def test_streamlit_page_imports_or_compiles(self):
         py_compile.compile("webui/pages/Kurukin_Render_Console.py", doraise=True)
 
