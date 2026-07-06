@@ -213,6 +213,17 @@ def _hero_block():
     )
 
 
+def _first_video_guide():
+    st.info(
+        "Para crear tu primer video:\n\n"
+        "1. Pega el código del paquete de assets.\n"
+        "2. Revisa el título, audio, subtítulos y calidad.\n"
+        "3. Presiona Validar video.\n"
+        "4. Si todo está listo, presiona Enviar a cola.\n\n"
+        "Validar video no crea archivos ni renderiza. Enviar a cola solo crea un trabajo pendiente."
+    )
+
+
 def _progress_steps():
     steps = (
         ("1", "Assets", "Elige visuales aprobados"),
@@ -239,6 +250,19 @@ def _asset_mode_description(selected_mode):
     else:
         st.warning(
             "Stock externo: disponible cuando el backend legacy esté configurado."
+        )
+
+
+def _recommended_test_mode_block():
+    with st.container():
+        st.markdown("### Modo recomendado para prueba")
+        st.write("Para una primera prueba, deja las opciones por defecto y solo valida el video.")
+        st.markdown(
+            "- Asset Hub Bundle\n"
+            "- Borrador 720p\n"
+            "- Sin subtítulos\n"
+            "- Sin audio propio\n"
+            "- Movimiento de imágenes activado"
         )
 
 
@@ -285,15 +309,21 @@ def _manifest_summary_block(summary):
 
     if status == "ready":
         st.success(f"{label}. Resumen del paquete de assets seleccionado.")
+        total_scenes = summary.get("total_scenes", 0)
+        total_assets = summary.get("total_assets", 0)
         cols = st.columns(5)
-        cols[0].metric("Escenas", summary.get("total_scenes", 0))
-        cols[1].metric("Assets", summary.get("total_assets", 0))
+        cols[0].metric("Escenas", total_scenes)
+        cols[1].metric("Assets", total_assets)
         cols[2].metric(
             "Duración aprox.",
             _format_duration(summary.get("duration_total_seconds")),
         )
         cols[3].metric("Avisos", summary.get("warnings_count", 0))
         cols[4].metric("Para revisar", summary.get("needs_human_review_count", 0))
+        st.info(
+            f"Este paquete está listo para validarse. Tiene {total_scenes} escenas "
+            f"y {total_assets} assets."
+        )
         st.caption(f"Código del paquete de assets: {summary.get('bundle_uid') or '-'}")
         asset_types = summary.get("asset_types") or {}
         if asset_types:
@@ -306,11 +336,14 @@ def _manifest_summary_block(summary):
             st.caption("Vista rápida: " + ", ".join(filenames))
         if summary.get("warnings_count"):
             st.warning(
-                "Encontramos avisos en el paquete. Puedes continuar, pero conviene "
-                "revisarlos."
+                "Puedes continuar, pero revisa los avisos antes de producir el "
+                "video final."
             )
         if summary.get("needs_human_review_count"):
-            st.warning("Hay elementos que requieren revisión antes de publicar.")
+            st.warning(
+                "Hay elementos marcados para revisión. Para pruebas puedes validar, "
+                "pero antes de publicar conviene revisarlos."
+            )
     elif status == "not_found":
         st.warning(
             "No encontramos el paquete. Verifica que esté disponible dentro del "
@@ -333,7 +366,7 @@ def _operator_summary_block(operator):
     cols[1].metric("Calidad", operator.get("render_quality") or "-")
     cols[2].metric("Fuente", operator.get("mode") or "-")
     cols[3].metric("Subtítulos", operator.get("subtitles") or "none")
-    cols[4].metric("Audio", operator.get("audio") or "-")
+    cols[4].metric("Audio", _operator_audio_label(operator.get("audio")))
     st.caption(f"Título del video: {operator.get('subject') or '-'}")
     if operator.get("bundle_uid"):
         st.caption(f"Código del paquete de assets: {operator.get('bundle_uid')}")
@@ -344,6 +377,14 @@ def _operator_summary_block(operator):
         )
     elif operator.get("note"):
         st.info(operator["note"])
+
+
+def _operator_audio_label(audio_value):
+    if audio_value == "custom":
+        return "Audio propio"
+    if audio_value == "generated":
+        return "Sin audio propio"
+    return audio_value or "-"
 
 
 def render_asset_source_step():
@@ -365,7 +406,7 @@ def render_asset_source_step():
     manifest_summary = {"status": "missing_path", "exists": False}
     if st.session_state["asset_source_mode"] == ASSET_SOURCE_ASSET_HUB:
         st.text_input(
-            "Código del paquete de assets",
+            "Código del paquete de assets (obligatorio)",
             key="asset_hub_bundle_uid",
             help="Identificador del bundle preparado por Asset Hub.",
         )
@@ -435,14 +476,22 @@ def render_content_step():
     left, right = st.columns([1, 1])
     with left:
         st.text_input(
-            "Identificador del video",
-            key="job_id",
-            help="Identificador humano para encontrar el trabajo en la cola.",
+            "Título del video (opcional pero recomendado)",
+            key="video_subject",
         )
     with right:
-        st.text_input("Título del video", key="video_subject")
+        with st.expander("Opciones avanzadas del trabajo", expanded=False):
+            st.text_input(
+                "Identificador del video",
+                key="job_id",
+                help=(
+                    "Se genera automáticamente. Solo cámbialo si necesitas un "
+                    "nombre específico para pruebas."
+                ),
+            )
+            st.caption("Identificador interno del trabajo, generado automáticamente.")
     st.text_area(
-        "Guion o descripción",
+        "Guion o descripción (opcional para este flujo si el bundle ya tiene escenas)",
         key="video_script",
         height=160,
         help="Texto base para voz, subtítulos o contexto del render.",
@@ -662,32 +711,43 @@ def _show_validation_result(spec, payload, manifest_summary, operator):
 def render_validate_enqueue_step(manifest_summary):
     st.markdown("### 5. Revisión")
     st.info(
-        "Enviar a cola no renderiza inmediatamente. El video queda pendiente para "
-        "que el runner lo procese cuando se ejecute."
+        "Primero valida. Después envía a cola.\n\n"
+        "Validar video: revisa que el trabajo esté completo. No crea pending job.\n\n"
+        "Enviar a cola: crea un pending job. No renderiza inmediatamente."
     )
 
-    actions = st.columns([1, 1, 3])
-    validate_clicked = actions[0].button("Validar video", key="form_validate")
-    enqueue_clicked = actions[1].button("Enviar a cola", key="form_enqueue")
+    validate_clicked = st.button("Validar video", key="form_validate")
 
-    if validate_clicked or enqueue_clicked:
+    if validate_clicked:
         try:
-            spec, payload, manifest_summary, operator = _validate_form_payload()
-            _show_validation_result(spec, payload, manifest_summary, operator)
-            if enqueue_clicked:
-                path = enqueue_moneyprinter_payload(payload)
-                st.success("Video enviado a cola. No se ejecutó render.")
-                st.caption(f"Pendiente creado: {path}")
+            _validate_form_payload()
         except Exception as exc:
             _show_error(exc)
-    elif st.session_state.get("form_validated_payload"):
+
+    if st.session_state.get("form_validated_payload"):
         _show_validation_result(
             st.session_state["form_validated_spec"],
             st.session_state["form_validated_payload"],
             st.session_state["form_manifest_summary"],
             st.session_state["form_operator_summary"],
         )
+        if st.button("Enviar a cola", key="form_enqueue"):
+            try:
+                path = enqueue_moneyprinter_payload(
+                    st.session_state["form_validated_payload"]
+                )
+                st.success("Video enviado a cola. No se ejecutó render.")
+                st.caption(f"Pendiente creado: {path}")
+            except Exception as exc:
+                _show_error(exc)
     else:
+        st.button(
+            "Enviar a cola",
+            key="form_enqueue_disabled",
+            disabled=True,
+            help="Primero valida el video para activar este paso.",
+        )
+        st.warning("Enviar a cola se activa después de una validación exitosa.")
         st.caption("Valida el video para ver el resumen y el JSON avanzado.")
         with st.expander("Modo avanzado: ver payload JSON", expanded=False):
             st.caption("El payload aparecerá aquí después de validar el video.")
@@ -696,8 +756,10 @@ def render_validate_enqueue_step(manifest_summary):
 def _new_render_view():
     _initialize_form_state()
     _hero_block()
+    _first_video_guide()
     _progress_steps()
 
+    _recommended_test_mode_block()
     manifest_summary = render_asset_source_step()
     render_content_step()
     render_audio_subtitles_step()
