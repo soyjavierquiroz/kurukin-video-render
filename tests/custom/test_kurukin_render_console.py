@@ -748,6 +748,16 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(command["command"], [])
         self.assertEqual(command["confidence"], "none")
 
+    def test_build_safe_runner_command_reports_missing_container_mount(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "MoneyPrinterTurbo"
+            root.mkdir()
+
+            command = build_safe_runner_command(root)
+
+        self.assertFalse(command["available"])
+        self.assertIn("runner no está montado", command["reason"])
+
     def test_build_safe_runner_command_returns_command_list_for_runner(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -763,6 +773,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(command["runner_name"], "Nightly runner")
         self.assertEqual(command["command"], ["python3", "scripts/nightly_runner.py"])
         self.assertEqual(command["confidence"], "high")
+        self.assertIsInstance(command["command"], list)
 
     def _runner_request_fixture(self):
         preflight = {
