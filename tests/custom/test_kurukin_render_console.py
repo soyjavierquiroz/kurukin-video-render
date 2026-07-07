@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
 from app.custom.kurukin_job_queue import (
+    CONTAINER_NIGHTLY_QUEUE_DIR,
     MANUAL_RUNNER_EXECUTION_MODE,
     MANUAL_RUNNER_MAX_JOBS,
     RUNNER_CONFIRM_TEXT,
@@ -190,6 +191,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Procesa trabajos pendientes solo cuando estés seguro.",
             "Procesar 1 trabajo ahora",
             "salta la ventana nocturna solo para una ejecución manual controlada",
+            "CONTAINER_NIGHTLY_QUEUE_DIR",
             "Máximo de trabajos",
             "Esta acción sí ejecutará el runner",
             "Ejecución desde UI deshabilitada por seguridad.",
@@ -214,6 +216,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
         self.assertFalse(args.ignore_window)
         self.assertEqual(args.max_jobs, 10)
+        self.assertEqual(args.queue_dir, "/opt/moneyprinterturbo/storage/nightly_jobs")
         self.assertFalse(
             runner.is_in_window(
                 runner.dt.datetime(2026, 1, 1, 12, 0),
@@ -225,10 +228,19 @@ class TestKurukinRenderConsole(unittest.TestCase):
     def test_nightly_runner_parser_accepts_manual_window_override(self):
         runner = load_nightly_runner_module()
 
-        args = runner.build_parser().parse_args(["--ignore-window", "--max-jobs", "1"])
+        args = runner.build_parser().parse_args(
+            [
+                "--ignore-window",
+                "--max-jobs",
+                "1",
+                "--queue-dir",
+                CONTAINER_NIGHTLY_QUEUE_DIR,
+            ]
+        )
 
         self.assertTrue(args.ignore_window)
         self.assertEqual(args.max_jobs, 1)
+        self.assertEqual(args.queue_dir, CONTAINER_NIGHTLY_QUEUE_DIR)
 
     def test_webui_page_uses_human_audio_summary_labels(self):
         page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
@@ -841,10 +853,14 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 "--max-jobs",
                 "1",
                 "--ignore-window",
+                "--queue-dir",
+                CONTAINER_NIGHTLY_QUEUE_DIR,
             ],
         )
         self.assertEqual(command["execution_mode"], MANUAL_RUNNER_EXECUTION_MODE)
         self.assertEqual(command["max_jobs"], MANUAL_RUNNER_MAX_JOBS)
+        self.assertEqual(command["queue_dir"], CONTAINER_NIGHTLY_QUEUE_DIR)
+        self.assertNotIn((root / "storage/nightly_jobs").as_posix(), command["command"])
 
     def _runner_request_fixture(self):
         preflight = {
@@ -863,12 +879,15 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 "--max-jobs",
                 "1",
                 "--ignore-window",
+                "--queue-dir",
+                CONTAINER_NIGHTLY_QUEUE_DIR,
             ],
             "cwd": "/tmp/project",
             "reason": "ready",
             "confidence": "high",
             "execution_mode": MANUAL_RUNNER_EXECUTION_MODE,
             "max_jobs": MANUAL_RUNNER_MAX_JOBS,
+            "queue_dir": CONTAINER_NIGHTLY_QUEUE_DIR,
         }
         return preflight, command
 
@@ -942,6 +961,33 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertIn("La ejecución manual solo permite max_jobs=1.", result["errors"])
 
+    def test_validate_runner_execution_request_fails_with_wrong_queue_dir(self):
+        preflight, command = self._runner_request_fixture()
+        command["command"] = [
+            "python3",
+            "scripts/nightly_runner.py",
+            "--max-jobs",
+            "1",
+            "--ignore-window",
+            "--queue-dir",
+            "/tmp/not-the-ui-queue",
+        ]
+        command["queue_dir"] = "/tmp/not-the-ui-queue"
+
+        result = validate_runner_execution_request(
+            feature_enabled=True,
+            preflight_summary=preflight,
+            command_info=command,
+            understood=True,
+            confirm_text=RUNNER_CONFIRM_TEXT,
+            queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+            execution_mode=MANUAL_RUNNER_EXECUTION_MODE,
+            max_jobs=MANUAL_RUNNER_MAX_JOBS,
+        )
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("Queue dir manual seguro incorrecto.", result["errors"])
+
     def test_validate_runner_execution_request_passes_with_all_gates(self):
         preflight, command = self._runner_request_fixture()
 
@@ -1001,6 +1047,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 "--max-jobs",
                 "1",
                 "--ignore-window",
+                "--queue-dir",
+                CONTAINER_NIGHTLY_QUEUE_DIR,
             ],
         )
         self.assertEqual(calls[0]["timeout"], 5)
@@ -1040,6 +1088,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             rendered_text,
         )
         self.assertIn("Máximo de trabajos", rendered_text)
+        self.assertIn(CONTAINER_NIGHTLY_QUEUE_DIR, rendered_text)
         self.assertNotIn("<div", rendered_text)
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
 
