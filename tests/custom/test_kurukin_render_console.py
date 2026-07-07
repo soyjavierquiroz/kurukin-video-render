@@ -8,6 +8,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
+from app.custom.kurukin_job_queue import (
+    detect_task_outputs,
+    infer_task_status,
+    list_pending_jobs,
+    list_task_summaries,
+)
 from app.custom.kurukin_render_console import (
     ASSET_SOURCE_LOCAL,
     ASSET_SOURCE_ASSET_HUB,
@@ -70,6 +76,29 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "No crea pending job",
             "No renderiza inmediatamente",
             "form_enqueue_disabled",
+        )
+
+        for expected in required_copy:
+            self.assertIn(expected, page)
+
+    def test_webui_page_includes_job_lifecycle_dashboard_copy(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        required_copy = (
+            "Cola y resultados",
+            "Revisa trabajos pendientes, resultados generados y errores sin entrar por terminal.",
+            "Esta pantalla solo consulta estado. No ejecuta renders ni modifica archivos.",
+            "Actualizar estado",
+            "Pendientes",
+            "En proceso",
+            "Completados",
+            "Fallidos",
+            "Videos detectados",
+            "No hay trabajos pendientes.",
+            "Todavía no hay renders completados.",
+            "Cuando envíes un video a cola y el runner lo procese, aparecerá aquí.",
         )
 
         for expected in required_copy:
@@ -353,6 +382,115 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 list_local_storage_files(base, allowed_extensions={"mp4", "png"}),
                 ["clip-a.mp4", "clip-b.png"],
             )
+
+    def test_list_pending_jobs_returns_empty_when_directory_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pending_dir = Path(tmp) / "missing"
+
+            self.assertEqual(list_pending_jobs(pending_dir), [])
+            self.assertFalse(pending_dir.exists())
+
+    def test_list_pending_jobs_reads_valid_pending_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pending_dir = Path(tmp) / "pending"
+            pending_dir.mkdir()
+            pending_path = pending_dir / "20260707-120000-render-job-001.json"
+            pending_path.write_text(
+                json.dumps(
+                    {
+                        "job_id": "render-job-001",
+                        "video_subject": "Demo claro",
+                        "asset_hub_bundle_uid": BUNDLE_UID,
+                        "video_resolution": "draft_720p",
+                        "subtitle_enabled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            jobs = list_pending_jobs(pending_dir)
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["job_id"], "render-job-001")
+        self.assertEqual(jobs[0]["title"], "Demo claro")
+        self.assertEqual(jobs[0]["asset_source"], "Asset Hub Bundle")
+        self.assertEqual(jobs[0]["quality"], "draft_720p")
+        self.assertEqual(jobs[0]["subtitles"], "Sin subtítulos")
+        self.assertTrue(jobs[0]["valid_json"])
+        self.assertTrue(jobs[0]["created_at_iso"].startswith("2026-07-07T12:00:00"))
+
+    def test_list_pending_jobs_invalid_json_does_not_break(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pending_dir = Path(tmp) / "pending"
+            pending_dir.mkdir()
+            (pending_dir / "20260707-120000-bad.json").write_text(
+                "{not-json",
+                encoding="utf-8",
+            )
+
+            jobs = list_pending_jobs(pending_dir)
+
+        self.assertEqual(len(jobs), 1)
+        self.assertFalse(jobs[0]["valid_json"])
+        self.assertIn("error", jobs[0])
+
+    def test_list_task_summaries_returns_empty_when_directory_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_dir = Path(tmp) / "tasks"
+
+            self.assertEqual(list_task_summaries(tasks_dir), [])
+            self.assertFalse(tasks_dir.exists())
+
+    def test_detect_task_outputs_finds_mp4_inside_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp) / "task-001"
+            output_dir = task_dir / "final"
+            output_dir.mkdir(parents=True)
+            (output_dir / "final-1.mp4").write_bytes(b"mp4")
+
+            outputs = detect_task_outputs(task_dir)
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]["name"], "final-1.mp4")
+        self.assertEqual(outputs[0]["relative_path"], "final/final-1.mp4")
+        self.assertEqual(outputs[0]["task_id"], "task-001")
+
+    def test_infer_task_status_completed_when_mp4_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp) / "task-001"
+            task_dir.mkdir()
+            (task_dir / "final-1.mp4").write_bytes(b"mp4")
+
+            status = infer_task_status(task_dir)
+
+        self.assertEqual(status, "completed")
+
+    def test_infer_task_status_failed_when_error_log_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp) / "task-001"
+            task_dir.mkdir()
+            (task_dir / "render.log").write_text(
+                "Traceback: render failed",
+                encoding="utf-8",
+            )
+
+            status = infer_task_status(task_dir)
+
+        self.assertEqual(status, "failed")
+
+    def test_list_task_summaries_uses_tempfile_without_storage_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_dir = Path(tmp) / "tasks"
+            task_dir = tasks_dir / "task-001"
+            task_dir.mkdir(parents=True)
+            (task_dir / "final-1.mp4").write_bytes(b"mp4")
+
+            summaries = list_task_summaries(tasks_dir)
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["task_id"], "task-001")
+        self.assertEqual(summaries[0]["status"], "completed")
+        self.assertEqual(summaries[0]["output_count"], 1)
 
     def test_build_workflow_payload_keeps_asset_hub_material_count_zero(self):
         payload = build_workflow_payload(
