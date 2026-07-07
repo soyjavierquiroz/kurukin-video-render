@@ -10,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
 from app.custom.kurukin_job_queue import (
+    RUNNER_CONFIRM_TEXT,
+    RUNNER_QUEUE_CONFIRM_TEXT,
+    build_safe_runner_command,
     build_preflight_checks,
     detect_task_outputs,
     detect_runner_candidates,
@@ -18,8 +21,11 @@ from app.custom.kurukin_job_queue import (
     get_runner_preflight_summary,
     get_storage_usage_summary,
     infer_task_status,
+    is_ui_runner_enabled,
     list_pending_jobs,
     list_task_summaries,
+    run_controlled_runner,
+    validate_runner_execution_request,
 )
 from app.custom.kurukin_render_console import (
     ASSET_SOURCE_LOCAL,
@@ -158,6 +164,31 @@ class TestKurukinRenderConsole(unittest.TestCase):
             self.assertIn(expected, page)
         for forbidden in forbidden_buttons:
             self.assertNotIn(forbidden, page)
+
+    def test_webui_page_includes_controlled_runner_copy(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        required_copy = (
+            "Ejecutar",
+            "Ejecución controlada",
+            "Procesa trabajos pendientes solo cuando estés seguro.",
+            "Esta acción sí ejecutará el runner",
+            "Ejecución desde UI deshabilitada por seguridad.",
+            "KURUKIN_ENABLE_UI_RUNNER=1",
+            "Comando seguro calculado",
+            "Zona peligrosa: ejecutar runner",
+            "Entiendo que esto ejecutará render real.",
+            "Ejecutar runner controlado",
+            "Diagnóstico de ejecución controlada",
+        )
+        forbidden_copy = ("cleanup", "retry", "delete", "cancel")
+
+        for expected in required_copy:
+            self.assertIn(expected, page)
+        for forbidden in forbidden_copy:
+            self.assertNotIn(forbidden, page.lower())
 
     def test_webui_page_uses_human_audio_summary_labels(self):
         page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
@@ -700,6 +731,150 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(pending_check["status"], "Listo")
         self.assertEqual(summary["runner_candidates"][0]["relative_path"], "scripts/nightly_runner.py")
         self.assertFalse(tasks_dir.exists())
+
+    def test_is_ui_runner_enabled_defaults_to_false(self):
+        self.assertFalse(is_ui_runner_enabled({}))
+
+    def test_is_ui_runner_enabled_accepts_enabled_values(self):
+        self.assertTrue(is_ui_runner_enabled({"KURUKIN_ENABLE_UI_RUNNER": "1"}))
+        self.assertTrue(is_ui_runner_enabled({"KURUKIN_ENABLE_UI_RUNNER": "true"}))
+        self.assertTrue(is_ui_runner_enabled({"KURUKIN_ENABLE_UI_RUNNER": "YES"}))
+
+    def test_build_safe_runner_command_unavailable_without_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command = build_safe_runner_command(Path(tmp))
+
+        self.assertFalse(command["available"])
+        self.assertEqual(command["command"], [])
+        self.assertEqual(command["confidence"], "none")
+
+    def test_build_safe_runner_command_returns_command_list_for_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "nightly_runner.py").write_text(
+                "raise RuntimeError('must not execute')\n",
+                encoding="utf-8",
+            )
+
+            command = build_safe_runner_command(root)
+
+        self.assertTrue(command["available"])
+        self.assertEqual(command["runner_name"], "Nightly runner")
+        self.assertEqual(command["command"], ["python3", "scripts/nightly_runner.py"])
+        self.assertEqual(command["confidence"], "high")
+
+    def _runner_request_fixture(self):
+        preflight = {
+            "counts": {"pending": 1},
+            "checks": [
+                {"name": "El runner está disponible", "status": "Listo"},
+                {"name": "El directorio de storage existe", "status": "Listo"},
+            ],
+        }
+        command = {
+            "available": True,
+            "runner_name": "Nightly runner",
+            "command": ["python3", "scripts/nightly_runner.py"],
+            "cwd": "/tmp/project",
+            "reason": "ready",
+            "confidence": "high",
+        }
+        return preflight, command
+
+    def test_validate_runner_execution_request_fails_when_flag_off(self):
+        preflight, command = self._runner_request_fixture()
+
+        result = validate_runner_execution_request(
+            feature_enabled=False,
+            preflight_summary=preflight,
+            command_info=command,
+            understood=True,
+            confirm_text=RUNNER_CONFIRM_TEXT,
+            queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+        )
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("Ejecución desde UI deshabilitada", result["errors"][0])
+
+    def test_validate_runner_execution_request_fails_without_pending(self):
+        preflight, command = self._runner_request_fixture()
+        preflight["counts"]["pending"] = 0
+
+        result = validate_runner_execution_request(
+            feature_enabled=True,
+            preflight_summary=preflight,
+            command_info=command,
+            understood=True,
+            confirm_text=RUNNER_CONFIRM_TEXT,
+            queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+        )
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("No hay trabajos pendientes.", result["errors"])
+
+    def test_validate_runner_execution_request_fails_with_wrong_confirm_text(self):
+        preflight, command = self._runner_request_fixture()
+
+        result = validate_runner_execution_request(
+            feature_enabled=True,
+            preflight_summary=preflight,
+            command_info=command,
+            understood=True,
+            confirm_text="EJECUTAR",
+            queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+        )
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("Texto de confirmación incorrecto.", result["errors"])
+
+    def test_validate_runner_execution_request_passes_with_all_gates(self):
+        preflight, command = self._runner_request_fixture()
+
+        result = validate_runner_execution_request(
+            feature_enabled=True,
+            preflight_summary=preflight,
+            command_info=command,
+            understood=True,
+            confirm_text=RUNNER_CONFIRM_TEXT,
+            queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+        )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["errors"], [])
+
+    def test_run_controlled_runner_uses_fake_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "nightly_runner.py").write_text(
+                "raise RuntimeError('must not execute')\n",
+                encoding="utf-8",
+            )
+            command = build_safe_runner_command(root)
+            calls = []
+
+            def fake_runner(*, command, cwd, timeout):
+                calls.append({"command": command, "cwd": cwd, "timeout": timeout})
+                return {
+                    "returncode": 0,
+                    "stdout": "fake ok",
+                    "stderr": "",
+                    "command": command,
+                    "cwd": cwd,
+                    "timed_out": False,
+                }
+
+            result = run_controlled_runner(
+                command,
+                runner=fake_runner,
+                timeout_seconds=5,
+            )
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["stdout"], "fake ok")
+        self.assertEqual(calls[0]["command"], ["python3", "scripts/nightly_runner.py"])
+        self.assertEqual(calls[0]["timeout"], 5)
 
     def test_build_workflow_payload_keeps_asset_hub_material_count_zero(self):
         payload = build_workflow_payload(

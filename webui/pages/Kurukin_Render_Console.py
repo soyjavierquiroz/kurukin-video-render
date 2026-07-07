@@ -19,9 +19,15 @@ from app.custom.kurukin_job_adapter import (  # noqa: E402
     DEFAULT_LOCAL_VIDEOS_DIR,
 )
 from app.custom.kurukin_job_queue import (  # noqa: E402
+    RUNNER_CONFIRM_TEXT,
+    RUNNER_QUEUE_CONFIRM_TEXT,
+    build_safe_runner_command,
     enqueue_moneyprinter_payload,
     get_job_lifecycle_summary,
     get_runner_preflight_summary,
+    is_ui_runner_enabled,
+    run_controlled_runner,
+    validate_runner_execution_request,
 )
 from app.custom.kurukin_render_console import (  # noqa: E402
     ASSET_SOURCE_ASSET_HUB,
@@ -1001,6 +1007,99 @@ def _preflight_view():
         st.json(preflight)
 
 
+def _controlled_runner_view():
+    st.title("Ejecución controlada")
+    st.write("Procesa trabajos pendientes solo cuando estés seguro.")
+    st.error(
+        "Esta acción sí ejecutará el runner y puede consumir CPU, tiempo y storage. "
+        "Durante este QA no se debe ejecutar."
+    )
+    st.info(
+        "En la siguiente prueba autorizada, este panel podrá ejecutar el runner. "
+        "Por ahora solo valida que el comando seguro esté listo."
+    )
+
+    preflight = get_runner_preflight_summary(project_root=ROOT_DIR)
+    command_info = build_safe_runner_command(project_root=ROOT_DIR)
+    feature_enabled = is_ui_runner_enabled()
+    counts = preflight.get("counts", {})
+    storage = preflight.get("storage", {})
+
+    if feature_enabled:
+        st.success("Habilitada para prueba controlada.")
+    else:
+        st.warning(
+            "Ejecución desde UI deshabilitada por seguridad. Activa "
+            "KURUKIN_ENABLE_UI_RUNNER=1 solo para una prueba controlada."
+        )
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Pendientes", counts.get("pending", 0))
+    metric_cols[1].metric("Runner detectado", "Sí" if command_info.get("available") else "No")
+    metric_cols[2].metric("Storage usado", _human_bytes(storage.get("size_bytes")))
+    metric_cols[3].metric("Feature flag", "Activo" if feature_enabled else "Inactivo")
+
+    with st.expander("Comando seguro calculado", expanded=False):
+        st.json(command_info)
+
+    st.markdown("### Checklist")
+    for check in preflight.get("checks", []):
+        _check_state_message(check)
+
+    st.warning(
+        "Ejecutar render puede consumir CPU, aumentar storage y tardar varios "
+        "minutos. No lo ejecutes si hay jobs no revisados."
+    )
+
+    with st.expander("Zona peligrosa: ejecutar runner", expanded=False):
+        understood = st.checkbox(
+            "Entiendo que esto ejecutará render real.",
+            key="runner_understood_real_render",
+        )
+        confirm_text = st.text_input(
+            "Escribe exactamente EJECUTAR RENDER",
+            key="runner_confirm_text",
+        )
+        queue_confirmation = st.text_input(
+            "Escribe procesar cola pendiente",
+            key="runner_queue_confirmation",
+        )
+        validation = validate_runner_execution_request(
+            feature_enabled=feature_enabled,
+            preflight_summary=preflight,
+            command_info=command_info,
+            understood=understood,
+            confirm_text=confirm_text,
+            queue_confirmation=queue_confirmation,
+        )
+        if validation.get("allowed"):
+            st.success("Todas las confirmaciones están listas.")
+        else:
+            for error in validation.get("errors", []):
+                st.caption(error)
+        if st.button(
+            "Ejecutar runner controlado",
+            key="controlled_runner_execute",
+            disabled=not validation.get("allowed"),
+        ):
+            try:
+                result = run_controlled_runner(command_info)
+                st.json(result)
+            except Exception as exc:
+                _show_error(exc)
+
+    with st.expander("Diagnóstico de ejecución controlada", expanded=False):
+        st.json(
+            {
+                "preflight_counts": counts,
+                "command": command_info,
+                "feature_enabled": feature_enabled,
+                "required_confirm_text": RUNNER_CONFIRM_TEXT,
+                "required_queue_confirmation": RUNNER_QUEUE_CONFIRM_TEXT,
+            }
+        )
+
+
 def _diagnostics_expander():
     with st.expander("Diagnóstico", expanded=False):
         lifecycle = get_job_lifecycle_summary()
@@ -1022,12 +1121,16 @@ def _diagnostics_expander():
 st.set_page_config(page_title="Crear video Kurukin", layout="wide")
 _apply_page_style()
 
-tab_new, tab_queue, tab_preflight = st.tabs(["Crear video", "Cola", "Preflight"])
+tab_new, tab_queue, tab_preflight, tab_execute = st.tabs(
+    ["Crear video", "Cola", "Preflight", "Ejecutar"]
+)
 with tab_new:
     _new_render_view()
 with tab_queue:
     _queue_storage_view()
 with tab_preflight:
     _preflight_view()
+with tab_execute:
+    _controlled_runner_view()
 
 _diagnostics_expander()
