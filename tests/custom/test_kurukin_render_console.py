@@ -44,6 +44,46 @@ def make_spec(**overrides):
 
 
 class TestKurukinRenderConsole(unittest.TestCase):
+    def test_webui_page_does_not_use_raw_structural_html(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        for forbidden in ("<div", "</div>", "class=", "<span", "<strong>"):
+            self.assertNotIn(forbidden, page)
+
+    def test_webui_page_includes_first_video_guidance(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        required_copy = (
+            "Para crear tu primer video",
+            "Validar video no crea archivos ni renderiza",
+            "Enviar a cola solo crea un trabajo pendiente",
+            "Modo recomendado para prueba",
+            "Código del paquete de assets (obligatorio)",
+            "Título del video (opcional pero recomendado)",
+            "Guion o descripción (opcional para este flujo si el bundle ya tiene escenas)",
+            "Opciones avanzadas del trabajo",
+            "Primero valida. Después envía a cola.",
+            "No crea pending job",
+            "No renderiza inmediatamente",
+            "form_enqueue_disabled",
+        )
+
+        for expected in required_copy:
+            self.assertIn(expected, page)
+
+    def test_webui_page_uses_human_audio_summary_labels(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Sin audio propio", page)
+        self.assertIn("Audio propio", page)
+        self.assertNotIn('metric("Audio", operator.get("audio")', page)
+
     def test_asset_source_constants_are_importable_aliases(self):
         self.assertEqual(ASSET_SOURCE_ASSET_HUB, SOURCE_MODE_ASSET_HUB)
         self.assertEqual(ASSET_SOURCE_LOCAL, SOURCE_MODE_LOCAL)
