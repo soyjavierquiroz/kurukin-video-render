@@ -19,6 +19,7 @@ from app.custom.kurukin_job_adapter import (  # noqa: E402
     DEFAULT_LOCAL_VIDEOS_DIR,
 )
 from app.custom.kurukin_job_queue import (  # noqa: E402
+    CONTAINER_NIGHTLY_QUEUE_DIR,
     MANUAL_RUNNER_EXECUTION_MODE,
     MANUAL_RUNNER_MAX_JOBS,
     RUNNER_CONFIRM_TEXT,
@@ -1015,6 +1016,7 @@ def _controlled_runner_view():
     st.markdown("### Procesar 1 trabajo ahora")
     st.info(
         "Este modo salta la ventana nocturna solo para una ejecución manual controlada."
+        f"\n\nCola controlada: {CONTAINER_NIGHTLY_QUEUE_DIR}"
     )
     st.error(
         "Esta acción sí ejecutará el runner y puede consumir CPU, tiempo y storage. "
