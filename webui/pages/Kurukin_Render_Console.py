@@ -21,6 +21,7 @@ from app.custom.kurukin_job_adapter import (  # noqa: E402
 from app.custom.kurukin_job_queue import (  # noqa: E402
     enqueue_moneyprinter_payload,
     get_job_lifecycle_summary,
+    get_runner_preflight_summary,
 )
 from app.custom.kurukin_render_console import (  # noqa: E402
     ASSET_SOURCE_ASSET_HUB,
@@ -936,6 +937,70 @@ def _queue_storage_view():
         st.json(lifecycle)
 
 
+def _check_state_message(check):
+    status = check.get("status") or "Revisar"
+    text = f"{status}: {check.get('name')} - {check.get('detail')}"
+    if status == "Listo":
+        st.success(text)
+    elif status == "No disponible":
+        st.error(text)
+    else:
+        st.warning(text)
+
+
+def _runner_candidates_block(candidates):
+    st.markdown("### Runner detectado")
+    if not candidates:
+        st.warning("No detectado. Revisa que el runner exista en el repo antes de habilitar ejecución.")
+        return
+    for candidate in candidates:
+        with st.expander(candidate.get("name") or "Runner", expanded=False):
+            st.caption(f"Ruta: {candidate.get('path')}")
+            st.caption(f"Comando sugerido para futuro uso controlado: {candidate.get('suggested_command')}")
+            st.caption(f"Confianza: {candidate.get('confidence')}")
+            st.info(candidate.get("notes") or "Detectado por existencia de archivo.")
+
+
+def _preflight_view():
+    st.title("Preflight de render")
+    st.write("Revisa si el worker está listo antes de ejecutar renders.")
+    st.info("Esta pantalla no ejecuta el runner. Solo revisa condiciones de seguridad.")
+
+    preflight = get_runner_preflight_summary(project_root=ROOT_DIR)
+    counts = preflight.get("counts", {})
+    storage = preflight.get("storage", {})
+    runners = preflight.get("runner_candidates", [])
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Pendientes", counts.get("pending", 0))
+    metric_cols[1].metric("Tasks detectados", counts.get("tasks", 0))
+    metric_cols[2].metric("Videos detectados", counts.get("videos", 0))
+    metric_cols[3].metric("Storage usado", _human_bytes(storage.get("size_bytes")))
+    metric_cols[4].metric("Runner detectado", "Sí" if runners else "No")
+
+    st.markdown("### Checklist de seguridad")
+    for check in preflight.get("checks", []):
+        _check_state_message(check)
+
+    _runner_candidates_block(runners)
+
+    st.markdown("### Próximo paso")
+    st.info(
+        "Cuando habilitemos ejecución controlada, aquí aparecerá un botón con "
+        "confirmación doble para procesar trabajos pendientes."
+    )
+
+    st.markdown("### Riesgos")
+    st.warning(
+        "Ejecutar render puede consumir CPU, aumentar storage y tardar varios "
+        "minutos. No debe ejecutarse si hay jobs no revisados."
+    )
+
+    with st.expander("Diagnóstico del preflight", expanded=False):
+        st.caption("Resumen read-only. No ejecuta runner ni modifica archivos.")
+        st.json(preflight)
+
+
 def _diagnostics_expander():
     with st.expander("Diagnóstico", expanded=False):
         lifecycle = get_job_lifecycle_summary()
@@ -957,10 +1022,12 @@ def _diagnostics_expander():
 st.set_page_config(page_title="Crear video Kurukin", layout="wide")
 _apply_page_style()
 
-tab_new, tab_queue = st.tabs(["Crear video", "Cola"])
+tab_new, tab_queue, tab_preflight = st.tabs(["Crear video", "Cola", "Preflight"])
 with tab_new:
     _new_render_view()
 with tab_queue:
     _queue_storage_view()
+with tab_preflight:
+    _preflight_view()
 
 _diagnostics_expander()

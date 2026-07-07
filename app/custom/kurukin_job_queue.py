@@ -18,6 +18,24 @@ MAX_TASK_SCAN_DEPTH = 4
 MAX_TASK_SCAN_FILES = 500
 MAX_LOG_READ_BYTES = 64 * 1024
 MAX_LOG_LINES = 80
+MAX_STORAGE_SCAN_DEPTH = 5
+MAX_STORAGE_SCAN_FILES = 2000
+RUNNER_CANDIDATE_PATHS = (
+    (
+        "Nightly runner",
+        "scripts/nightly_runner.py",
+        "python3 scripts/nightly_runner.py",
+        "high",
+        "Runner de cola detectado por archivo Python.",
+    ),
+    (
+        "Local job wrapper",
+        "scripts/local_job_wrapper.py",
+        "python3 scripts/local_job_wrapper.py --help",
+        "medium",
+        "CLI de preparación/encolado; no ejecuta renders por sí solo.",
+    ),
+)
 
 
 class KurukinJobQueueError(ValueError):
@@ -492,6 +510,183 @@ def get_job_lifecycle_summary(
             "completed": len(completed),
             "failed": len(failed),
             "videos": len(outputs),
+        },
+    }
+
+
+def get_storage_usage_summary(
+    storage_dir: str | Path | None = None,
+    *,
+    max_depth: int = MAX_STORAGE_SCAN_DEPTH,
+    max_files: int = MAX_STORAGE_SCAN_FILES,
+) -> dict[str, Any]:
+    """Return bounded read-only storage usage information."""
+
+    base = Path(storage_dir) if storage_dir is not None else Path("storage")
+    summary: dict[str, Any] = {
+        "path": base.as_posix(),
+        "exists": base.exists(),
+        "total_size_bytes": 0,
+        "size_bytes": 0,
+        "file_count": 0,
+        "dir_count": 0,
+        "scan_truncated": False,
+        "warning": "",
+    }
+    if not base.exists():
+        summary["warning"] = "Storage directory not found"
+        return summary
+    if base.is_file():
+        size = _safe_size(base)
+        summary.update({"total_size_bytes": size, "size_bytes": size, "file_count": 1})
+        return summary
+
+    base_depth = len(base.parts)
+    for root, dirs, files in os.walk(base):
+        root_path = Path(root)
+        depth = len(root_path.parts) - base_depth
+        if depth >= max_depth:
+            dirs[:] = []
+        dirs[:] = sorted(dirs)
+        summary["dir_count"] += len(dirs)
+        for filename in sorted(files):
+            file_path = root_path / filename
+            summary["file_count"] += 1
+            summary["total_size_bytes"] += _safe_size(file_path)
+            if summary["file_count"] >= max_files:
+                summary["scan_truncated"] = True
+                summary["warning"] = "Storage scan reached safety limit"
+                summary["size_bytes"] = summary["total_size_bytes"]
+                return summary
+    summary["size_bytes"] = summary["total_size_bytes"]
+    return summary
+
+
+def detect_runner_candidates(project_root: str | Path | None = None) -> list[dict[str, Any]]:
+    """Detect runner-related files without importing or executing them."""
+
+    root = Path(project_root) if project_root is not None else Path(".")
+    candidates = []
+    for name, relative_path, command, confidence, notes in RUNNER_CANDIDATE_PATHS:
+        path = root / relative_path
+        if not path.exists():
+            continue
+        candidates.append(
+            {
+                "name": name,
+                "path": path.as_posix(),
+                "relative_path": relative_path,
+                "exists": True,
+                "suggested_command": command,
+                "confidence": confidence,
+                "notes": notes,
+            }
+        )
+    return candidates
+
+
+def build_preflight_checks(
+    lifecycle_summary: dict[str, Any],
+    runner_candidates: list[dict[str, Any]],
+    storage_summary: dict[str, Any],
+    *,
+    pending_dir: str | Path | None = None,
+    max_pending_jobs: int = 10,
+) -> list[dict[str, Any]]:
+    """Build human preflight checks from read-only summaries."""
+
+    counts = lifecycle_summary.get("counts", {})
+    pending_count = int(counts.get("pending") or 0)
+    tasks = lifecycle_summary.get("tasks") or []
+    needs_review_tasks = [
+        task
+        for task in tasks
+        if task.get("status") in {"failed", "unknown"}
+    ]
+    pending_path = Path(pending_dir) if pending_dir is not None else DEFAULT_PENDING_DIR
+    storage_exists = bool(storage_summary.get("exists"))
+    checks = [
+        {
+            "name": "Hay al menos un trabajo pendiente",
+            "status": "Listo" if pending_count > 0 else "Revisar",
+            "detail": (
+                f"{pending_count} trabajo(s) pendiente(s)"
+                if pending_count
+                else "No hay trabajos pendientes para procesar."
+            ),
+        },
+        {
+            "name": "El runner está disponible",
+            "status": "Listo" if runner_candidates else "No disponible",
+            "detail": (
+                f"{len(runner_candidates)} candidato(s) detectado(s)"
+                if runner_candidates
+                else "No se detectó un runner en el repo."
+            ),
+        },
+        {
+            "name": "El directorio de storage existe",
+            "status": "Listo" if storage_exists else "No disponible",
+            "detail": storage_summary.get("path") or "storage",
+        },
+        {
+            "name": "El directorio de pending jobs existe",
+            "status": "Listo" if pending_path.exists() else "Revisar",
+            "detail": pending_path.as_posix(),
+        },
+        {
+            "name": "No hay demasiados jobs pendientes",
+            "status": "Listo" if pending_count <= max_pending_jobs else "Revisar",
+            "detail": f"Límite recomendado: {max_pending_jobs}; actual: {pending_count}.",
+        },
+        {
+            "name": "No hay tasks en estado desconocido/fallido sin revisar",
+            "status": "Listo" if not needs_review_tasks else "Revisar",
+            "detail": (
+                "Sin tasks pendientes de revisión."
+                if not needs_review_tasks
+                else f"{len(needs_review_tasks)} task(s) requieren revisión."
+            ),
+        },
+        {
+            "name": "Storage no parece crecer de forma anormal",
+            "status": "Revisar" if storage_summary.get("scan_truncated") else "Listo",
+            "detail": storage_summary.get("warning") or "Escaneo acotado completado.",
+        },
+    ]
+    return checks
+
+
+def get_runner_preflight_summary(
+    *,
+    project_root: str | Path | None = None,
+    storage_dir: str | Path | None = None,
+    pending_dir: str | Path | None = None,
+    tasks_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return a read-only runner preflight summary."""
+
+    lifecycle = get_job_lifecycle_summary(
+        pending_dir=pending_dir,
+        tasks_dir=tasks_dir,
+    )
+    storage = get_storage_usage_summary(storage_dir)
+    runners = detect_runner_candidates(project_root)
+    checks = build_preflight_checks(
+        lifecycle,
+        runners,
+        storage,
+        pending_dir=pending_dir,
+    )
+    return {
+        "lifecycle": lifecycle,
+        "storage": storage,
+        "runner_candidates": runners,
+        "checks": checks,
+        "counts": {
+            **lifecycle.get("counts", {}),
+            "tasks": len(lifecycle.get("tasks", [])),
+            "runner_candidates": len(runners),
         },
     }
 

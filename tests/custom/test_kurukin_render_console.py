@@ -10,9 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
 from app.custom.kurukin_job_queue import (
+    build_preflight_checks,
     detect_task_outputs,
+    detect_runner_candidates,
     enqueue_moneyprinter_payload,
     get_job_lifecycle_summary,
+    get_runner_preflight_summary,
+    get_storage_usage_summary,
     infer_task_status,
     list_pending_jobs,
     list_task_summaries,
@@ -126,6 +130,34 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
         for expected in required_copy:
             self.assertIn(expected, page)
+
+    def test_webui_page_includes_runner_preflight_copy(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        required_copy = (
+            "Preflight",
+            "Preflight de render",
+            "Revisa si el worker está listo antes de ejecutar renders.",
+            "Esta pantalla no ejecuta el runner. Solo revisa condiciones de seguridad.",
+            "Tasks detectados",
+            "Storage usado",
+            "Runner detectado",
+            "Checklist de seguridad",
+            "Runner detectado",
+            "Diagnóstico del preflight",
+        )
+        forbidden_buttons = (
+            'st.button("Ejecutar runner"',
+            'st.button("Renderizar ahora"',
+            'st.button("Procesar trabajos"',
+        )
+
+        for expected in required_copy:
+            self.assertIn(expected, page)
+        for forbidden in forbidden_buttons:
+            self.assertNotIn(forbidden, page)
 
     def test_webui_page_uses_human_audio_summary_labels(self):
         page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
@@ -562,6 +594,112 @@ class TestKurukinRenderConsole(unittest.TestCase):
             self.assertEqual(lifecycle_after_cleanup["tasks"], [])
             self.assertEqual(lifecycle_after_cleanup["outputs"], [])
             self.assertFalse(tasks_dir.exists())
+
+    def test_storage_usage_summary_missing_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_dir = Path(tmp) / "missing-storage"
+
+            summary = get_storage_usage_summary(missing_dir)
+
+        self.assertFalse(summary["exists"])
+        self.assertEqual(summary["total_size_bytes"], 0)
+        self.assertEqual(summary["file_count"], 0)
+        self.assertIn("not found", summary["warning"])
+
+    def test_storage_usage_summary_counts_small_temp_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / "storage"
+            (storage_dir / "nested").mkdir(parents=True)
+            (storage_dir / "a.txt").write_bytes(b"abc")
+            (storage_dir / "nested" / "b.txt").write_bytes(b"de")
+
+            summary = get_storage_usage_summary(storage_dir)
+
+        self.assertTrue(summary["exists"])
+        self.assertEqual(summary["total_size_bytes"], 5)
+        self.assertEqual(summary["file_count"], 2)
+        self.assertGreaterEqual(summary["dir_count"], 1)
+        self.assertFalse(summary["scan_truncated"])
+
+    def test_detect_runner_candidates_uses_existing_files_without_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts_dir = root / "scripts"
+            scripts_dir.mkdir()
+            runner = scripts_dir / "nightly_runner.py"
+            runner.write_text("raise RuntimeError('must not execute')\n", encoding="utf-8")
+
+            candidates = detect_runner_candidates(root)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["name"], "Nightly runner")
+        self.assertEqual(candidates[0]["suggested_command"], "python3 scripts/nightly_runner.py")
+        self.assertEqual(candidates[0]["confidence"], "high")
+
+    def test_preflight_checks_mark_no_pending_as_review(self):
+        lifecycle = {
+            "counts": {"pending": 0, "videos": 0},
+            "tasks": [],
+            "outputs": [],
+        }
+        storage = {"exists": True, "path": "storage", "scan_truncated": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            pending_dir = Path(tmp) / "pending"
+            checks = build_preflight_checks(
+                lifecycle,
+                [{"name": "Nightly runner"}],
+                storage,
+                pending_dir=pending_dir,
+            )
+
+        pending_check = next(
+            item for item in checks if item["name"] == "Hay al menos un trabajo pendiente"
+        )
+        self.assertEqual(pending_check["status"], "Revisar")
+
+    def test_preflight_summary_with_pending_marks_pending_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pending_dir = base / "pending"
+            tasks_dir = base / "tasks"
+            storage_dir = base / "storage"
+            project_root = base / "repo"
+            (project_root / "scripts").mkdir(parents=True)
+            (project_root / "scripts" / "nightly_runner.py").write_text(
+                "# runner marker\n",
+                encoding="utf-8",
+            )
+            storage_dir.mkdir()
+            enqueue_moneyprinter_payload(
+                {
+                    "job_id": "preflight-pending-001",
+                    "video_subject": "Preflight",
+                    "video_resolution": "draft_720p",
+                    "runner": {"job_id": "preflight-pending-001"},
+                },
+                queue_dir=pending_dir,
+                now=datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc),
+            )
+
+            summary = get_runner_preflight_summary(
+                project_root=project_root,
+                storage_dir=storage_dir,
+                pending_dir=pending_dir,
+                tasks_dir=tasks_dir,
+            )
+
+        pending_check = next(
+            item
+            for item in summary["checks"]
+            if item["name"] == "Hay al menos un trabajo pendiente"
+        )
+        self.assertEqual(summary["counts"]["pending"], 1)
+        self.assertEqual(summary["counts"]["tasks"], 0)
+        self.assertEqual(summary["counts"]["videos"], 0)
+        self.assertEqual(summary["counts"]["runner_candidates"], 1)
+        self.assertEqual(pending_check["status"], "Listo")
+        self.assertEqual(summary["runner_candidates"][0]["relative_path"], "scripts/nightly_runner.py")
+        self.assertFalse(tasks_dir.exists())
 
     def test_build_workflow_payload_keeps_asset_hub_material_count_zero(self):
         payload = build_workflow_payload(
