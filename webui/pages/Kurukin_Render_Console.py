@@ -738,7 +738,19 @@ def render_validate_enqueue_step(manifest_summary):
                 path = enqueue_moneyprinter_payload(
                     st.session_state["form_validated_payload"]
                 )
-                st.success("Video enviado a cola. No se ejecutó render.")
+                job_id = st.session_state["form_validated_payload"].get("job_id") or ""
+                st.session_state["last_enqueued_job_id"] = str(job_id)
+                st.session_state["last_enqueued_pending_path"] = path.as_posix()
+                st.session_state["last_enqueued_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                st.success("Video enviado a cola.")
+                st.info(
+                    "El render no empezó todavía. Puedes revisar el estado en la "
+                    "pestaña Cola."
+                )
+                st.caption("Abre la pestaña Cola y presiona Actualizar estado.")
+                st.caption("Enviar a cola no renderiza inmediatamente.")
                 st.caption(f"Pendiente creado: {path}")
             except Exception as exc:
                 _show_error(exc)
@@ -859,6 +871,19 @@ def _outputs_table(outputs):
     )
 
 
+def _last_enqueued_pending_job(pending_jobs):
+    last_job_id = st.session_state.get("last_enqueued_job_id")
+    last_pending_path = st.session_state.get("last_enqueued_pending_path")
+    if not last_job_id and not last_pending_path:
+        return None
+    for job in pending_jobs:
+        if last_pending_path and job.get("path") == last_pending_path:
+            return job
+        if last_job_id and job.get("job_id") == last_job_id:
+            return job
+    return None
+
+
 def _queue_storage_view():
     st.title("Cola y resultados")
     st.write("Revisa trabajos pendientes, resultados generados y errores sin entrar por terminal.")
@@ -880,11 +905,14 @@ def _queue_storage_view():
     metric_cols[4].metric("Videos detectados", counts.get("videos", 0))
 
     st.markdown("### Trabajos pendientes")
+    last_pending_job = _last_enqueued_pending_job(pending_jobs)
+    if last_pending_job:
+        st.success(f"Último video enviado a cola: {last_pending_job.get('job_id')}")
     if pending_jobs:
         for job in pending_jobs:
             _pending_job_block(job)
     else:
-        st.info("No hay trabajos pendientes.")
+        st.info("No hay trabajos pendientes. Cuando envíes un video a cola, aparecerá aquí.")
 
     st.markdown("### Trabajos/tasks detectados")
     if tasks:
