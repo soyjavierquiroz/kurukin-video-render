@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -10,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
 from app.custom.kurukin_job_queue import (
     detect_task_outputs,
+    enqueue_moneyprinter_payload,
+    get_job_lifecycle_summary,
     infer_task_status,
     list_pending_jobs,
     list_task_summaries,
@@ -96,9 +99,29 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Completados",
             "Fallidos",
             "Videos detectados",
-            "No hay trabajos pendientes.",
+            "No hay trabajos pendientes. Cuando envíes un video a cola, aparecerá aquí.",
             "Todavía no hay renders completados.",
             "Cuando envíes un video a cola y el runner lo procese, aparecerá aquí.",
+        )
+
+        for expected in required_copy:
+            self.assertIn(expected, page)
+
+    def test_webui_page_includes_safe_enqueue_feedback_copy(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        required_copy = (
+            "Video enviado a cola.",
+            "El render no empezó todavía. Puedes revisar el estado en la ",
+            "pestaña Cola.",
+            "Abre la pestaña Cola y presiona Actualizar estado.",
+            "Enviar a cola no renderiza inmediatamente.",
+            "last_enqueued_job_id",
+            "last_enqueued_pending_path",
+            "last_enqueued_at",
+            "Último video enviado a cola",
         )
 
         for expected in required_copy:
@@ -491,6 +514,54 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(summaries[0]["task_id"], "task-001")
         self.assertEqual(summaries[0]["status"], "completed")
         self.assertEqual(summaries[0]["output_count"], 1)
+
+    def test_safe_enqueue_pending_lifecycle_uses_temp_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pending_dir = base / "pending"
+            tasks_dir = base / "tasks"
+            payload = {
+                "job_id": "render-console-safe-enqueue-smoke-001",
+                "video_subject": "Safe enqueue smoke",
+                "asset_hub_bundle_uid": BUNDLE_UID,
+                "video_resolution": "draft_720p",
+                "subtitle_enabled": False,
+                "runner": {"job_id": "render-console-safe-enqueue-smoke-001"},
+            }
+
+            pending_path = enqueue_moneyprinter_payload(
+                payload,
+                queue_dir=pending_dir,
+                now=datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc),
+            )
+            jobs = list_pending_jobs(pending_dir)
+            lifecycle = get_job_lifecycle_summary(
+                pending_dir=pending_dir,
+                tasks_dir=tasks_dir,
+            )
+
+            self.assertTrue(pending_path.is_file())
+            self.assertTrue(pending_path.is_relative_to(base))
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(
+                jobs[0]["job_id"],
+                "render-console-safe-enqueue-smoke-001",
+            )
+            self.assertEqual(lifecycle["counts"]["pending"], 1)
+            self.assertEqual(lifecycle["counts"]["videos"], 0)
+            self.assertEqual(lifecycle["tasks"], [])
+            self.assertEqual(lifecycle["outputs"], [])
+
+            pending_path.unlink()
+            lifecycle_after_cleanup = get_job_lifecycle_summary(
+                pending_dir=pending_dir,
+                tasks_dir=tasks_dir,
+            )
+
+            self.assertEqual(lifecycle_after_cleanup["counts"]["pending"], 0)
+            self.assertEqual(lifecycle_after_cleanup["tasks"], [])
+            self.assertEqual(lifecycle_after_cleanup["outputs"], [])
+            self.assertFalse(tasks_dir.exists())
 
     def test_build_workflow_payload_keeps_asset_hub_material_count_zero(self):
         payload = build_workflow_payload(
