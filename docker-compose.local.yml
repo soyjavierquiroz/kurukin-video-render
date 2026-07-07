@@ -19,6 +19,7 @@ services:
     volumes:
       - ./config.toml:/MoneyPrinterTurbo/config.toml:ro
       - ./app:/MoneyPrinterTurbo/app:ro
+      - ./scripts:/MoneyPrinterTurbo/scripts:ro
       - ./webui:/MoneyPrinterTurbo/webui:ro
       - ./storage:/MoneyPrinterTurbo/storage
       - kurukin-asset-hub_job_assets:/data/job-assets:ro

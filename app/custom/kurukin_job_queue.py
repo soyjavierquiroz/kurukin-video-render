@@ -25,6 +25,7 @@ MAX_STORAGE_SCAN_FILES = 2000
 UI_RUNNER_ENABLED_VALUES = {"1", "true", "TRUE", "yes", "YES"}
 SAFE_RUNNER_RELATIVE_PATH = "scripts/nightly_runner.py"
 SAFE_RUNNER_COMMAND = ("python3", SAFE_RUNNER_RELATIVE_PATH)
+CONTAINER_PROJECT_ROOT = Path("/MoneyPrinterTurbo")
 RUNNER_CONFIRM_TEXT = "EJECUTAR RENDER"
 RUNNER_QUEUE_CONFIRM_TEXT = "procesar cola pendiente"
 RUNNER_CANDIDATE_PATHS = (
@@ -708,15 +709,28 @@ def is_ui_runner_enabled(env: Mapping[str, str] | None = None) -> bool:
 def build_safe_runner_command(project_root: str | Path | None = None) -> dict[str, Any]:
     """Build the only supported runner command without executing it."""
 
-    root = Path(project_root) if project_root is not None else Path(".")
+    root = (
+        Path(project_root)
+        if project_root is not None
+        else CONTAINER_PROJECT_ROOT
+        if CONTAINER_PROJECT_ROOT.exists()
+        else Path(".")
+    )
     runner_path = root / SAFE_RUNNER_RELATIVE_PATH
     if not runner_path.is_file():
+        scripts_dir = root / "scripts"
+        reason = "No se detectó scripts/nightly_runner.py."
+        if root.name == "MoneyPrinterTurbo" and root.exists() and not scripts_dir.exists():
+            reason = (
+                "El runner no está montado en este contenedor. "
+                "Revisa docker-compose.local.yml."
+            )
         return {
             "available": False,
             "runner_name": "",
             "command": [],
             "cwd": root.as_posix(),
-            "reason": "No se detectó scripts/nightly_runner.py.",
+            "reason": reason,
             "confidence": "none",
         }
     return {
