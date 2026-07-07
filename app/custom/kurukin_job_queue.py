@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import time
 from typing import Any
 
@@ -20,6 +22,11 @@ MAX_LOG_READ_BYTES = 64 * 1024
 MAX_LOG_LINES = 80
 MAX_STORAGE_SCAN_DEPTH = 5
 MAX_STORAGE_SCAN_FILES = 2000
+UI_RUNNER_ENABLED_VALUES = {"1", "true", "TRUE", "yes", "YES"}
+SAFE_RUNNER_RELATIVE_PATH = "scripts/nightly_runner.py"
+SAFE_RUNNER_COMMAND = ("python3", SAFE_RUNNER_RELATIVE_PATH)
+RUNNER_CONFIRM_TEXT = "EJECUTAR RENDER"
+RUNNER_QUEUE_CONFIRM_TEXT = "procesar cola pendiente"
 RUNNER_CANDIDATE_PATHS = (
     (
         "Nightly runner",
@@ -688,6 +695,144 @@ def get_runner_preflight_summary(
             "tasks": len(lifecycle.get("tasks", [])),
             "runner_candidates": len(runners),
         },
+    }
+
+
+def is_ui_runner_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether controlled UI runner execution is explicitly enabled."""
+
+    values = env if env is not None else os.environ
+    return values.get("KURUKIN_ENABLE_UI_RUNNER", "") in UI_RUNNER_ENABLED_VALUES
+
+
+def build_safe_runner_command(project_root: str | Path | None = None) -> dict[str, Any]:
+    """Build the only supported runner command without executing it."""
+
+    root = Path(project_root) if project_root is not None else Path(".")
+    runner_path = root / SAFE_RUNNER_RELATIVE_PATH
+    if not runner_path.is_file():
+        return {
+            "available": False,
+            "runner_name": "",
+            "command": [],
+            "cwd": root.as_posix(),
+            "reason": "No se detectó scripts/nightly_runner.py.",
+            "confidence": "none",
+        }
+    return {
+        "available": True,
+        "runner_name": "Nightly runner",
+        "command": list(SAFE_RUNNER_COMMAND),
+        "cwd": root.resolve().as_posix(),
+        "reason": "Comando seguro calculado desde candidato high-confidence.",
+        "confidence": "high",
+    }
+
+
+def _has_critical_preflight_errors(checks: list[dict[str, Any]]) -> bool:
+    return any(check.get("status") == "No disponible" for check in checks)
+
+
+def validate_runner_execution_request(
+    *,
+    feature_enabled: bool,
+    preflight_summary: dict[str, Any],
+    command_info: dict[str, Any],
+    understood: bool,
+    confirm_text: str,
+    queue_confirmation: str,
+) -> dict[str, Any]:
+    """Validate all gates required before the UI can execute the runner."""
+
+    counts = preflight_summary.get("counts", {})
+    pending_count = int(counts.get("pending") or 0)
+    checks = preflight_summary.get("checks") or []
+    errors = []
+
+    if not feature_enabled:
+        errors.append("Ejecución desde UI deshabilitada por seguridad.")
+    if pending_count <= 0:
+        errors.append("No hay trabajos pendientes.")
+    if not command_info.get("available") or command_info.get("confidence") != "high":
+        errors.append("Runner high-confidence no disponible.")
+    if _has_critical_preflight_errors(checks):
+        errors.append("Preflight tiene errores críticos.")
+    if not understood:
+        errors.append("Falta confirmar que esto ejecutará render real.")
+    if str(confirm_text or "").strip() != RUNNER_CONFIRM_TEXT:
+        errors.append("Texto de confirmación incorrecto.")
+    if str(queue_confirmation or "").strip() != RUNNER_QUEUE_CONFIRM_TEXT:
+        errors.append("Confirmación de cola pendiente incorrecta.")
+
+    return {
+        "allowed": not errors,
+        "errors": errors,
+        "pending_count": pending_count,
+        "feature_enabled": feature_enabled,
+        "command_available": bool(command_info.get("available")),
+    }
+
+
+def _is_safe_runner_command(command_info: dict[str, Any]) -> bool:
+    return (
+        command_info.get("available") is True
+        and command_info.get("confidence") == "high"
+        and command_info.get("command") == list(SAFE_RUNNER_COMMAND)
+    )
+
+
+def run_controlled_runner(
+    command_info: dict[str, Any],
+    *,
+    runner: Callable[..., Any] | None = None,
+    timeout_seconds: int = 60 * 60,
+) -> dict[str, Any]:
+    """Run the precomputed safe runner command, or an injected fake in tests."""
+
+    if not _is_safe_runner_command(command_info):
+        raise KurukinJobQueueError("unsafe or unavailable runner command")
+
+    command = list(command_info["command"])
+    cwd = command_info["cwd"]
+    if runner is not None:
+        result = runner(command=command, cwd=cwd, timeout=timeout_seconds)
+        if isinstance(result, dict):
+            return result
+        return {
+            "returncode": getattr(result, "returncode", 0),
+            "stdout": getattr(result, "stdout", ""),
+            "stderr": getattr(result, "stderr", ""),
+            "command": command,
+            "cwd": cwd,
+            "timed_out": False,
+        }
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            timeout=timeout_seconds,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "returncode": None,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+            "command": command,
+            "cwd": cwd,
+            "timed_out": True,
+        }
+
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "command": command,
+        "cwd": cwd,
+        "timed_out": False,
     }
 
 
