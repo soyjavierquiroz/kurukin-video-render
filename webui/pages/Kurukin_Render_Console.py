@@ -19,6 +19,8 @@ from app.custom.kurukin_job_adapter import (  # noqa: E402
     DEFAULT_LOCAL_VIDEOS_DIR,
 )
 from app.custom.kurukin_job_queue import (  # noqa: E402
+    MANUAL_RUNNER_EXECUTION_MODE,
+    MANUAL_RUNNER_MAX_JOBS,
     RUNNER_CONFIRM_TEXT,
     RUNNER_QUEUE_CONFIRM_TEXT,
     build_safe_runner_command,
@@ -1010,17 +1012,21 @@ def _preflight_view():
 def _controlled_runner_view():
     st.title("Ejecución controlada")
     st.write("Procesa trabajos pendientes solo cuando estés seguro.")
+    st.markdown("### Procesar 1 trabajo ahora")
+    st.info(
+        "Este modo salta la ventana nocturna solo para ejecución manual controlada."
+    )
     st.error(
         "Esta acción sí ejecutará el runner y puede consumir CPU, tiempo y storage. "
-        "Durante este QA no se debe ejecutar."
-    )
-    st.info(
-        "En la siguiente prueba autorizada, este panel podrá ejecutar el runner. "
-        "Por ahora solo valida que el comando seguro esté listo."
+        "Usa este modo solo para una prueba autorizada."
     )
 
     preflight = get_runner_preflight_summary(project_root=ROOT_DIR)
-    command_info = build_safe_runner_command(project_root=ROOT_DIR)
+    command_info = build_safe_runner_command(
+        project_root=ROOT_DIR,
+        manual_override=True,
+        max_jobs=MANUAL_RUNNER_MAX_JOBS,
+    )
     feature_enabled = is_ui_runner_enabled()
     counts = preflight.get("counts", {})
     storage = preflight.get("storage", {})
@@ -1033,11 +1039,12 @@ def _controlled_runner_view():
             "KURUKIN_ENABLE_UI_RUNNER=1 solo para una prueba controlada."
         )
 
-    metric_cols = st.columns(4)
+    metric_cols = st.columns(5)
     metric_cols[0].metric("Pendientes", counts.get("pending", 0))
     metric_cols[1].metric("Runner detectado", "Sí" if command_info.get("available") else "No")
     metric_cols[2].metric("Storage usado", _human_bytes(storage.get("size_bytes")))
     metric_cols[3].metric("Feature flag", "Activo" if feature_enabled else "Inactivo")
+    metric_cols[4].metric("Máximo de trabajos", MANUAL_RUNNER_MAX_JOBS)
 
     with st.expander("Comando seguro calculado", expanded=False):
         st.json(command_info)
@@ -1071,6 +1078,8 @@ def _controlled_runner_view():
             understood=understood,
             confirm_text=confirm_text,
             queue_confirmation=queue_confirmation,
+            execution_mode=MANUAL_RUNNER_EXECUTION_MODE,
+            max_jobs=MANUAL_RUNNER_MAX_JOBS,
         )
         if validation.get("allowed"):
             st.success("Todas las confirmaciones están listas.")
@@ -1094,6 +1103,8 @@ def _controlled_runner_view():
                 "preflight_counts": counts,
                 "command": command_info,
                 "feature_enabled": feature_enabled,
+                "execution_mode": MANUAL_RUNNER_EXECUTION_MODE,
+                "max_jobs": MANUAL_RUNNER_MAX_JOBS,
                 "required_confirm_text": RUNNER_CONFIRM_TEXT,
                 "required_queue_confirmation": RUNNER_QUEUE_CONFIRM_TEXT,
             }

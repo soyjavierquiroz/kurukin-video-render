@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import sys
 import tempfile
@@ -10,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
 from app.custom.kurukin_job_queue import (
+    MANUAL_RUNNER_EXECUTION_MODE,
+    MANUAL_RUNNER_MAX_JOBS,
     RUNNER_CONFIRM_TEXT,
     RUNNER_QUEUE_CONFIRM_TEXT,
     build_safe_runner_command,
@@ -46,6 +49,17 @@ from app.custom.kurukin_render_console import (
 
 
 BUNDLE_UID = "jab_b28367fb22d44a40bae507c175f464c4"
+
+
+def load_nightly_runner_module():
+    spec = importlib.util.spec_from_file_location(
+        "nightly_runner_for_tests",
+        Path("scripts/nightly_runner.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def make_spec(**overrides):
@@ -174,6 +188,9 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Ejecutar",
             "Ejecución controlada",
             "Procesa trabajos pendientes solo cuando estés seguro.",
+            "Procesar 1 trabajo ahora",
+            "salta la ventana nocturna solo para ejecución manual controlada",
+            "Máximo de trabajos",
             "Esta acción sí ejecutará el runner",
             "Ejecución desde UI deshabilitada por seguridad.",
             "KURUKIN_ENABLE_UI_RUNNER=1",
@@ -189,6 +206,29 @@ class TestKurukinRenderConsole(unittest.TestCase):
             self.assertIn(expected, page)
         for forbidden in forbidden_copy:
             self.assertNotIn(forbidden, page.lower())
+
+    def test_nightly_runner_parser_keeps_window_by_default(self):
+        runner = load_nightly_runner_module()
+
+        args = runner.build_parser().parse_args([])
+
+        self.assertFalse(args.ignore_window)
+        self.assertEqual(args.max_jobs, 10)
+        self.assertFalse(
+            runner.is_in_window(
+                runner.dt.datetime(2026, 1, 1, 12, 0),
+                runner.dt.time(0, 0),
+                runner.dt.time(7, 0),
+            )
+        )
+
+    def test_nightly_runner_parser_accepts_manual_window_override(self):
+        runner = load_nightly_runner_module()
+
+        args = runner.build_parser().parse_args(["--ignore-window", "--max-jobs", "1"])
+
+        self.assertTrue(args.ignore_window)
+        self.assertEqual(args.max_jobs, 1)
 
     def test_webui_page_uses_human_audio_summary_labels(self):
         page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
@@ -774,6 +814,37 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(command["command"], ["python3", "scripts/nightly_runner.py"])
         self.assertEqual(command["confidence"], "high")
         self.assertIsInstance(command["command"], list)
+        self.assertEqual(command["execution_mode"], "nightly_default")
+
+    def test_build_safe_runner_command_returns_manual_override_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "nightly_runner.py").write_text(
+                "raise RuntimeError('must not execute')\n",
+                encoding="utf-8",
+            )
+
+            command = build_safe_runner_command(
+                root,
+                manual_override=True,
+                max_jobs=1,
+            )
+
+        self.assertTrue(command["available"])
+        self.assertIsInstance(command["command"], list)
+        self.assertEqual(
+            command["command"],
+            [
+                "python3",
+                "scripts/nightly_runner.py",
+                "--max-jobs",
+                "1",
+                "--ignore-window",
+            ],
+        )
+        self.assertEqual(command["execution_mode"], MANUAL_RUNNER_EXECUTION_MODE)
+        self.assertEqual(command["max_jobs"], MANUAL_RUNNER_MAX_JOBS)
 
     def _runner_request_fixture(self):
         preflight = {
@@ -786,10 +857,18 @@ class TestKurukinRenderConsole(unittest.TestCase):
         command = {
             "available": True,
             "runner_name": "Nightly runner",
-            "command": ["python3", "scripts/nightly_runner.py"],
+            "command": [
+                "python3",
+                "scripts/nightly_runner.py",
+                "--max-jobs",
+                "1",
+                "--ignore-window",
+            ],
             "cwd": "/tmp/project",
             "reason": "ready",
             "confidence": "high",
+            "execution_mode": MANUAL_RUNNER_EXECUTION_MODE,
+            "max_jobs": MANUAL_RUNNER_MAX_JOBS,
         }
         return preflight, command
 
@@ -803,6 +882,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             understood=True,
             confirm_text=RUNNER_CONFIRM_TEXT,
             queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+            execution_mode=MANUAL_RUNNER_EXECUTION_MODE,
+            max_jobs=MANUAL_RUNNER_MAX_JOBS,
         )
 
         self.assertFalse(result["allowed"])
@@ -819,6 +900,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             understood=True,
             confirm_text=RUNNER_CONFIRM_TEXT,
             queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+            execution_mode=MANUAL_RUNNER_EXECUTION_MODE,
+            max_jobs=MANUAL_RUNNER_MAX_JOBS,
         )
 
         self.assertFalse(result["allowed"])
@@ -834,10 +917,30 @@ class TestKurukinRenderConsole(unittest.TestCase):
             understood=True,
             confirm_text="EJECUTAR",
             queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+            execution_mode=MANUAL_RUNNER_EXECUTION_MODE,
+            max_jobs=MANUAL_RUNNER_MAX_JOBS,
         )
 
         self.assertFalse(result["allowed"])
         self.assertIn("Texto de confirmación incorrecto.", result["errors"])
+
+    def test_validate_runner_execution_request_fails_when_max_jobs_not_one(self):
+        preflight, command = self._runner_request_fixture()
+        command["max_jobs"] = 2
+
+        result = validate_runner_execution_request(
+            feature_enabled=True,
+            preflight_summary=preflight,
+            command_info=command,
+            understood=True,
+            confirm_text=RUNNER_CONFIRM_TEXT,
+            queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+            execution_mode=MANUAL_RUNNER_EXECUTION_MODE,
+            max_jobs=2,
+        )
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("La ejecución manual solo permite max_jobs=1.", result["errors"])
 
     def test_validate_runner_execution_request_passes_with_all_gates(self):
         preflight, command = self._runner_request_fixture()
@@ -849,6 +952,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             understood=True,
             confirm_text=RUNNER_CONFIRM_TEXT,
             queue_confirmation=RUNNER_QUEUE_CONFIRM_TEXT,
+            execution_mode=MANUAL_RUNNER_EXECUTION_MODE,
+            max_jobs=MANUAL_RUNNER_MAX_JOBS,
         )
 
         self.assertTrue(result["allowed"])
@@ -862,7 +967,11 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 "raise RuntimeError('must not execute')\n",
                 encoding="utf-8",
             )
-            command = build_safe_runner_command(root)
+            command = build_safe_runner_command(
+                root,
+                manual_override=True,
+                max_jobs=1,
+            )
             calls = []
 
             def fake_runner(*, command, cwd, timeout):
@@ -884,8 +993,55 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
         self.assertEqual(result["returncode"], 0)
         self.assertEqual(result["stdout"], "fake ok")
-        self.assertEqual(calls[0]["command"], ["python3", "scripts/nightly_runner.py"])
+        self.assertEqual(
+            calls[0]["command"],
+            [
+                "python3",
+                "scripts/nightly_runner.py",
+                "--max-jobs",
+                "1",
+                "--ignore-window",
+            ],
+        )
         self.assertEqual(calls[0]["timeout"], 5)
+
+    def test_app_test_execute_tab_loads_with_flag_off_when_streamlit_available(self):
+        try:
+            from streamlit.testing.v1 import AppTest
+        except ModuleNotFoundError:
+            self.skipTest("streamlit is not installed in this Python environment")
+
+        original_flag = os.environ.pop("KURUKIN_ENABLE_UI_RUNNER", None)
+        original_cwd = Path.cwd()
+        page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.chdir(tmp)
+                at = AppTest.from_file(str(page_path))
+                at.run(timeout=30)
+        finally:
+            os.chdir(original_cwd)
+            if original_flag is not None:
+                os.environ["KURUKIN_ENABLE_UI_RUNNER"] = original_flag
+
+        self.assertEqual(len(at.exception), 0)
+        rendered_text = "\n".join(
+            str(item.value)
+            for collection in (at.title, at.markdown, at.info, at.warning)
+            for item in collection
+        )
+        page = page_path.read_text(encoding="utf-8")
+        for tab_label in ("Crear video", "Cola", "Preflight", "Ejecutar"):
+            self.assertIn(tab_label, page)
+        self.assertIn("Ejecución controlada", rendered_text)
+        self.assertIn("Procesar 1 trabajo ahora", rendered_text)
+        self.assertIn(
+            "salta la ventana nocturna solo para ejecución manual controlada",
+            rendered_text,
+        )
+        self.assertIn("Máximo de trabajos", rendered_text)
+        self.assertNotIn("<div", rendered_text)
+        self.assertTrue(at.button(key="controlled_runner_execute").disabled)
 
     def test_build_workflow_payload_keeps_asset_hub_material_count_zero(self):
         payload = build_workflow_payload(

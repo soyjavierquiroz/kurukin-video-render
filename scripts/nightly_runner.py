@@ -475,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
             "starting Kurukin Nightly Runner "
             f"dry_run={args.dry_run} max_jobs={args.max_jobs}"
         )
+        if args.ignore_window:
+            logger.log("manual window override enabled")
         jobs_started = 0
         while jobs_started < args.max_jobs:
             if not args.ignore_window and not is_in_window(
