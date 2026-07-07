@@ -189,7 +189,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Ejecución controlada",
             "Procesa trabajos pendientes solo cuando estés seguro.",
             "Procesar 1 trabajo ahora",
-            "salta la ventana nocturna solo para ejecución manual controlada",
+            "salta la ventana nocturna solo para una ejecución manual controlada",
             "Máximo de trabajos",
             "Esta acción sí ejecutará el runner",
             "Ejecución desde UI deshabilitada por seguridad.",
@@ -1036,7 +1036,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn("Ejecución controlada", rendered_text)
         self.assertIn("Procesar 1 trabajo ahora", rendered_text)
         self.assertIn(
-            "salta la ventana nocturna solo para ejecución manual controlada",
+            "salta la ventana nocturna solo para una ejecución manual controlada",
             rendered_text,
         )
         self.assertIn("Máximo de trabajos", rendered_text)

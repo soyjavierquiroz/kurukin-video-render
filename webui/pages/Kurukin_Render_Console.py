@@ -1014,7 +1014,7 @@ def _controlled_runner_view():
     st.write("Procesa trabajos pendientes solo cuando estés seguro.")
     st.markdown("### Procesar 1 trabajo ahora")
     st.info(
-        "Este modo salta la ventana nocturna solo para ejecución manual controlada."
+        "Este modo salta la ventana nocturna solo para una ejecución manual controlada."
     )
     st.error(
         "Esta acción sí ejecutará el runner y puede consumir CPU, tiempo y storage. "
