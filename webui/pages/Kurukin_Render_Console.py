@@ -20,9 +20,7 @@ from app.custom.kurukin_job_adapter import (  # noqa: E402
 )
 from app.custom.kurukin_job_queue import (  # noqa: E402
     enqueue_moneyprinter_payload,
-    get_storage_summary,
-    list_nightly_queue,
-    list_render_tasks,
+    get_job_lifecycle_summary,
 )
 from app.custom.kurukin_render_console import (  # noqa: E402
     ASSET_SOURCE_ASSET_HUB,
@@ -93,6 +91,10 @@ def _human_bytes(size_bytes):
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{value:.1f} TB"
+
+
+def _format_datetime(value):
+    return value or "-"
 
 
 def _show_error(exc):
@@ -767,51 +769,153 @@ def _new_render_view():
     render_validate_enqueue_step(manifest_summary)
 
 
-def _queue_table(title, rows):
-    st.markdown(f"**{title}**")
-    if rows:
-        st.dataframe(rows, use_container_width=True)
-    else:
-        st.info("Sin trabajos")
+def _status_label(status):
+    return {
+        "completed": "Completado",
+        "failed": "Fallido",
+        "processing": "En proceso",
+        "unknown": "Sin estado claro",
+    }.get(status, "Sin estado claro")
+
+
+def _pending_job_block(job):
+    title = job.get("title") or "-"
+    job_id = job.get("job_id") or job.get("filename") or "Trabajo pendiente"
+    with st.expander(f"{job_id} - {title}", expanded=False):
+        cols = st.columns(4)
+        cols[0].metric("Calidad", job.get("quality") or "-")
+        cols[1].metric("Fuente", job.get("asset_source") or "-")
+        cols[2].metric("Subtítulos", job.get("subtitles") or "-")
+        cols[3].metric("Tamaño", _human_bytes(job.get("size_bytes")))
+        st.caption(f"Fecha aproximada: {_format_datetime(job.get('created_at_iso') or job.get('modified_at_iso'))}")
+        st.caption(f"Ruta del pending json: {job.get('path')}")
+        if job.get("valid_json"):
+            with st.expander("Detalles JSON", expanded=False):
+                st.json(job.get("raw") or {})
+        else:
+            st.warning("Este pending json no se pudo leer completo.")
+            if job.get("error"):
+                st.caption(job["error"])
+
+
+def _task_block(task):
+    label = _status_label(task.get("status"))
+    with st.expander(f"{task.get('task_id')} - {label}", expanded=False):
+        cols = st.columns(4)
+        cols[0].metric("Estado", label)
+        cols[1].metric("Videos", task.get("output_count", 0))
+        cols[2].metric("Logs", task.get("log_count", 0))
+        cols[3].metric("Tamaño", _human_bytes(task.get("size_bytes")))
+        st.caption(f"Ruta del task: {task.get('path')}")
+        st.caption(f"Última modificación: {_format_datetime(task.get('modified_at_iso'))}")
+        if task.get("status") == "failed":
+            st.warning("Este trabajo parece fallido. Revisa el diagnóstico.")
+        if task.get("outputs"):
+            st.markdown("**Videos detectados**")
+            st.dataframe(
+                [
+                    {
+                        "archivo": item.get("name"),
+                        "tamaño": _human_bytes(item.get("size_bytes")),
+                        "modificado": _format_datetime(item.get("modified_at_iso")),
+                        "ruta": item.get("relative_path"),
+                    }
+                    for item in task["outputs"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        if task.get("errors"):
+            with st.expander("Diagnóstico de errores", expanded=False):
+                for item in task["errors"]:
+                    st.caption(f"{item.get('relative_path')} - {_human_bytes(item.get('size_bytes'))}")
+                    if item.get("preview"):
+                        st.code(item["preview"])
+        if task.get("logs"):
+            with st.expander("Logs detectados", expanded=False):
+                for item in task["logs"]:
+                    st.caption(f"{item.get('relative_path')} - {_human_bytes(item.get('size_bytes'))}")
+                    if item.get("preview"):
+                        st.code(item["preview"])
+
+
+def _outputs_table(outputs):
+    if not outputs:
+        st.info("Todavía no hay renders completados.")
+        return
+    st.dataframe(
+        [
+            {
+                "archivo": item.get("name"),
+                "task": item.get("task_id"),
+                "tamaño": _human_bytes(item.get("size_bytes")),
+                "modificado": _format_datetime(item.get("modified_at_iso")),
+                "ruta": item.get("path"),
+            }
+            for item in outputs
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 def _queue_storage_view():
-    st.subheader("Cola de render")
-    st.button("Actualizar", key="refresh_queue")
+    st.title("Cola y resultados")
+    st.write("Revisa trabajos pendientes, resultados generados y errores sin entrar por terminal.")
+    st.info("Esta pantalla solo consulta estado. No ejecuta renders ni modifica archivos.")
+    st.button("Actualizar estado", key="refresh_queue")
 
-    queue = list_nightly_queue()
-    tasks = list_render_tasks()
-    storage_summary = get_storage_summary()
+    lifecycle = get_job_lifecycle_summary()
+    counts = lifecycle.get("counts", {})
+    pending_jobs = lifecycle.get("pending_jobs", [])
+    tasks = lifecycle.get("tasks", [])
+    outputs = lifecycle.get("outputs", [])
+    failed_tasks = [task for task in tasks if task.get("status") == "failed"]
 
-    final_tasks = [item for item in tasks if item.get("has_final_video")]
-    metric_cols = st.columns(6)
-    metric_cols[0].metric("Pendiente", len(queue.get("pending", [])))
-    metric_cols[1].metric("Procesando", len(queue.get("processing", [])))
-    metric_cols[2].metric("Completado", len(queue.get("completed", [])))
-    metric_cols[3].metric("Fallido", len(queue.get("failed", [])))
-    metric_cols[4].metric("Videos finales", len(final_tasks))
-    metric_cols[5].metric("Storage", _human_bytes(storage_summary.get("size_bytes")))
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Pendientes", counts.get("pending", 0))
+    metric_cols[1].metric("En proceso", counts.get("processing", 0))
+    metric_cols[2].metric("Completados", counts.get("completed", 0))
+    metric_cols[3].metric("Fallidos", counts.get("failed", 0))
+    metric_cols[4].metric("Videos detectados", counts.get("videos", 0))
 
-    for group, label in (
-        ("pending", "Pendiente"),
-        ("processing", "Procesando"),
-        ("completed", "Completado"),
-        ("failed", "Fallido"),
-    ):
-        _queue_table(label, queue.get(group, []))
+    st.markdown("### Trabajos pendientes")
+    if pending_jobs:
+        for job in pending_jobs:
+            _pending_job_block(job)
+    else:
+        st.info("No hay trabajos pendientes.")
+
+    st.markdown("### Trabajos/tasks detectados")
+    if tasks:
+        for task in tasks:
+            _task_block(task)
+    else:
+        st.info("Cuando envíes un video a cola y el runner lo procese, aparecerá aquí.")
+
+    st.markdown("### Outputs detectados")
+    _outputs_table(outputs)
+
+    st.markdown("### Errores y fallos")
+    if failed_tasks:
+        for task in failed_tasks:
+            st.warning(f"{task.get('task_id')}: Este trabajo parece fallido. Revisa el diagnóstico.")
+    else:
+        st.info("No hay errores detectados.")
+
+    with st.expander("Diagnóstico de cola", expanded=False):
+        st.caption("Lectura local de cola y tasks. No modifica archivos.")
+        st.json(lifecycle)
 
 
 def _diagnostics_expander():
     with st.expander("Diagnóstico", expanded=False):
-        queue = list_nightly_queue()
-        tasks = list_render_tasks()
-        storage_summary = get_storage_summary()
+        lifecycle = get_job_lifecycle_summary()
         st.caption("Lectura local de cola y storage. No modifica archivos.")
         st.json(
             {
-                "queue_counts": {group: len(items) for group, items in queue.items()},
-                "task_count": len(tasks),
-                "storage_size": _human_bytes(storage_summary.get("size_bytes")),
+                "queue_counts": lifecycle.get("counts", {}),
+                "task_count": len(lifecycle.get("tasks", [])),
                 "local_dirs": {
                     "videos": DEFAULT_LOCAL_VIDEOS_DIR,
                     "audios": DEFAULT_LOCAL_AUDIOS_DIR,
