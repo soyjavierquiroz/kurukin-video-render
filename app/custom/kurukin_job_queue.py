@@ -25,6 +25,16 @@ MAX_STORAGE_SCAN_FILES = 2000
 UI_RUNNER_ENABLED_VALUES = {"1", "true", "TRUE", "yes", "YES"}
 SAFE_RUNNER_RELATIVE_PATH = "scripts/nightly_runner.py"
 SAFE_RUNNER_COMMAND = ("python3", SAFE_RUNNER_RELATIVE_PATH)
+MANUAL_RUNNER_EXECUTION_MODE = "manual_now"
+DEFAULT_RUNNER_EXECUTION_MODE = "nightly_default"
+MANUAL_RUNNER_MAX_JOBS = 1
+MANUAL_RUNNER_COMMAND = (
+    "python3",
+    SAFE_RUNNER_RELATIVE_PATH,
+    "--max-jobs",
+    str(MANUAL_RUNNER_MAX_JOBS),
+    "--ignore-window",
+)
 CONTAINER_PROJECT_ROOT = Path("/MoneyPrinterTurbo")
 RUNNER_CONFIRM_TEXT = "EJECUTAR RENDER"
 RUNNER_QUEUE_CONFIRM_TEXT = "procesar cola pendiente"
@@ -706,7 +716,12 @@ def is_ui_runner_enabled(env: Mapping[str, str] | None = None) -> bool:
     return values.get("KURUKIN_ENABLE_UI_RUNNER", "") in UI_RUNNER_ENABLED_VALUES
 
 
-def build_safe_runner_command(project_root: str | Path | None = None) -> dict[str, Any]:
+def build_safe_runner_command(
+    project_root: str | Path | None = None,
+    *,
+    manual_override: bool = False,
+    max_jobs: int = MANUAL_RUNNER_MAX_JOBS,
+) -> dict[str, Any]:
     """Build the only supported runner command without executing it."""
 
     root = (
@@ -732,14 +747,43 @@ def build_safe_runner_command(project_root: str | Path | None = None) -> dict[st
             "cwd": root.as_posix(),
             "reason": reason,
             "confidence": "none",
+            "execution_mode": (
+                MANUAL_RUNNER_EXECUTION_MODE
+                if manual_override
+                else DEFAULT_RUNNER_EXECUTION_MODE
+            ),
+            "max_jobs": max_jobs if manual_override else None,
         }
+    if manual_override and int(max_jobs) != MANUAL_RUNNER_MAX_JOBS:
+        return {
+            "available": False,
+            "runner_name": "Nightly runner",
+            "command": [],
+            "cwd": root.resolve().as_posix(),
+            "reason": "La ejecución manual desde UI solo permite max_jobs=1.",
+            "confidence": "none",
+            "execution_mode": MANUAL_RUNNER_EXECUTION_MODE,
+            "max_jobs": int(max_jobs),
+        }
+
+    command = list(MANUAL_RUNNER_COMMAND if manual_override else SAFE_RUNNER_COMMAND)
     return {
         "available": True,
         "runner_name": "Nightly runner",
-        "command": list(SAFE_RUNNER_COMMAND),
+        "command": command,
         "cwd": root.resolve().as_posix(),
-        "reason": "Comando seguro calculado desde candidato high-confidence.",
+        "reason": (
+            "Comando manual seguro: procesa 1 job ahora y salta la ventana nocturna."
+            if manual_override
+            else "Comando seguro calculado desde candidato high-confidence."
+        ),
         "confidence": "high",
+        "execution_mode": (
+            MANUAL_RUNNER_EXECUTION_MODE
+            if manual_override
+            else DEFAULT_RUNNER_EXECUTION_MODE
+        ),
+        "max_jobs": MANUAL_RUNNER_MAX_JOBS if manual_override else None,
     }
 
 
@@ -755,6 +799,8 @@ def validate_runner_execution_request(
     understood: bool,
     confirm_text: str,
     queue_confirmation: str,
+    execution_mode: str = MANUAL_RUNNER_EXECUTION_MODE,
+    max_jobs: int = MANUAL_RUNNER_MAX_JOBS,
 ) -> dict[str, Any]:
     """Validate all gates required before the UI can execute the runner."""
 
@@ -769,6 +815,16 @@ def validate_runner_execution_request(
         errors.append("No hay trabajos pendientes.")
     if not command_info.get("available") or command_info.get("confidence") != "high":
         errors.append("Runner high-confidence no disponible.")
+    if execution_mode != MANUAL_RUNNER_EXECUTION_MODE:
+        errors.append("Modo de ejecución manual no confirmado.")
+    if int(max_jobs) != MANUAL_RUNNER_MAX_JOBS:
+        errors.append("La ejecución manual solo permite max_jobs=1.")
+    if command_info.get("execution_mode") != MANUAL_RUNNER_EXECUTION_MODE:
+        errors.append("Comando manual seguro no disponible.")
+    if command_info.get("max_jobs") != MANUAL_RUNNER_MAX_JOBS:
+        errors.append("Comando manual debe limitarse a max_jobs=1.")
+    if command_info.get("command") != list(MANUAL_RUNNER_COMMAND):
+        errors.append("Comando manual seguro incorrecto.")
     if _has_critical_preflight_errors(checks):
         errors.append("Preflight tiene errores críticos.")
     if not understood:
@@ -784,14 +840,24 @@ def validate_runner_execution_request(
         "pending_count": pending_count,
         "feature_enabled": feature_enabled,
         "command_available": bool(command_info.get("available")),
+        "execution_mode": execution_mode,
+        "max_jobs": max_jobs,
     }
 
 
 def _is_safe_runner_command(command_info: dict[str, Any]) -> bool:
+    command = command_info.get("command")
+    if command == list(SAFE_RUNNER_COMMAND):
+        return (
+            command_info.get("available") is True
+            and command_info.get("confidence") == "high"
+        )
     return (
         command_info.get("available") is True
         and command_info.get("confidence") == "high"
-        and command_info.get("command") == list(SAFE_RUNNER_COMMAND)
+        and command == list(MANUAL_RUNNER_COMMAND)
+        and command_info.get("execution_mode") == MANUAL_RUNNER_EXECUTION_MODE
+        and command_info.get("max_jobs") == MANUAL_RUNNER_MAX_JOBS
     )
 
 
