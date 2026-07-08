@@ -80,6 +80,8 @@ En reposo/default, Render Console no crea pending A-roll/B-roll.
 
 E2E runner PASS registrado: `aroll-broll-runner-smoke-003`.
 
+UI E2E PASS registrado: `aroll-broll-ui-smoke-004`.
+
 ## Runner handler
 
 El runner detecta `render_mode="aroll_broll"` antes del flujo normal de API.
