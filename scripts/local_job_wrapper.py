@@ -21,7 +21,25 @@ from app.custom import kurukin_job_adapter as adapter
 from app.custom.kurukin_job_queue import enqueue_moneyprinter_payload
 
 
-DEFAULT_QUEUE_DIR = "/opt/moneyprinterturbo/storage/nightly_jobs"
+CONTAINER_QUEUE_DIR = Path("/MoneyPrinterTurbo/storage/nightly_jobs")
+
+
+def default_queue_dir(
+    *,
+    project_root: str | Path | None = None,
+    container_queue: str | Path = CONTAINER_QUEUE_DIR,
+) -> Path:
+    """Return the default queue path for container or host execution."""
+
+    container_path = Path(container_queue)
+    if container_path.exists():
+        return container_path
+
+    root = Path(project_root) if project_root is not None else REPO_ROOT
+    return root / "storage" / "nightly_jobs"
+
+
+DEFAULT_QUEUE_DIR = default_queue_dir().as_posix()
 DEFAULT_LOCAL_VIDEOS_DIR = "/opt/moneyprinterturbo/storage/local_videos"
 DEFAULT_LOCAL_AUDIOS_DIR = "/opt/moneyprinterturbo/storage/local_audios"
 DEFAULT_LOCAL_SUBTITLES_DIR = "/opt/moneyprinterturbo/storage/local_subtitles"
@@ -167,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--validate-only", action="store_true")
     actions.add_argument("--enqueue", action="store_true")
     actions.add_argument("--print-payload", action="store_true")
-    parser.add_argument("--queue-dir", default=DEFAULT_QUEUE_DIR)
+    parser.add_argument("--queue-dir", default=default_queue_dir().as_posix())
     parser.add_argument("--local-videos-dir", default=DEFAULT_LOCAL_VIDEOS_DIR)
     parser.add_argument("--local-audios-dir", default=DEFAULT_LOCAL_AUDIOS_DIR)
     parser.add_argument("--local-subtitles-dir", default=DEFAULT_LOCAL_SUBTITLES_DIR)

@@ -19,13 +19,32 @@ from typing import Any
 from urllib import error, request
 
 
-DEFAULT_QUEUE_DIR = "/opt/moneyprinterturbo/storage/nightly_jobs"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONTAINER_QUEUE_DIR = Path("/MoneyPrinterTurbo/storage/nightly_jobs")
 DEFAULT_API_BASE_URL = "http://127.0.0.1:18080/api/v1"
 METADATA_KEYS = {"job_id", "notes", "description", "runner"}
 COMPLETE_STATE = 1
 FAILED_STATE = -1
 PROCESSING_STATE = 4
 DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS = 1800
+
+
+def default_queue_dir(
+    *,
+    project_root: str | Path | None = None,
+    container_queue: str | Path = CONTAINER_QUEUE_DIR,
+) -> Path:
+    """Return the default queue path for container or host execution."""
+
+    container_path = Path(container_queue)
+    if container_path.exists():
+        return container_path
+
+    root = Path(project_root) if project_root is not None else PROJECT_ROOT
+    return root / "storage" / "nightly_jobs"
+
+
+DEFAULT_QUEUE_DIR = default_queue_dir().as_posix()
 
 
 class RunnerError(Exception):
@@ -441,7 +460,7 @@ def positive_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Kurukin Nightly Runner")
-    parser.add_argument("--queue-dir", default=DEFAULT_QUEUE_DIR)
+    parser.add_argument("--queue-dir", default=default_queue_dir().as_posix())
     parser.add_argument("--api-base-url", default=DEFAULT_API_BASE_URL)
     parser.add_argument("--window-start", default="00:00", type=parse_hhmm)
     parser.add_argument("--window-end", default="07:00", type=parse_hhmm)
