@@ -26,6 +26,8 @@ from app.custom.kurukin_job_queue import (
     get_runner_preflight_summary,
     get_storage_usage_summary,
     infer_task_status,
+    is_aroll_broll_queue_enabled,
+    is_aroll_broll_renderer_enabled,
     is_ui_runner_enabled,
     list_rendered_videos,
     list_pending_jobs,
@@ -156,10 +158,13 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Renderer MVP planeado: alternating_fullscreen",
             "Audio final: A-roll original",
             "B-roll audio: muted",
-            "La activación de cola llegará en la siguiente fase de integración.",
+            "La cola puede preparar un pending job protegido",
+            "Cola A-roll/B-roll: protegida",
+            "Activa KURUKIN_ENABLE_AROLL_BROLL_QUEUE=1 solo para pruebas controladas.",
             "Renderer preparado: alternating_fullscreen",
             "B-roll assets estimados desde manifest",
-            "La cola A-roll/B-roll se habilitará en la fase renderer",
+            "El runner no lo renderiza todavía",
+            "aroll_broll_enqueue",
             "aroll_broll_enqueue_disabled",
         )
 
@@ -334,6 +339,26 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertTrue(args.ignore_window)
         self.assertEqual(args.max_jobs, 1)
         self.assertEqual(args.queue_dir, CONTAINER_NIGHTLY_QUEUE_DIR)
+
+    def test_nightly_runner_rejects_aroll_broll_before_api_payload(self):
+        runner = load_nightly_runner_module()
+
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_job(
+                {
+                    "job_id": "aroll-broll-001",
+                    "video_subject": "Presenter edit",
+                    "video_aspect": "9:16",
+                    "render_mode": "aroll_broll",
+                    "aroll_broll": {},
+                    "runner": {"job_id": "aroll-broll-001"},
+                }
+            )
+
+        self.assertIn(
+            "A-roll/B-roll renderer execution is disabled",
+            str(raised.exception),
+        )
 
     def test_nightly_runner_default_queue_dir_uses_container_when_present(self):
         runner = load_nightly_runner_module()
@@ -916,6 +941,18 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertTrue(is_ui_runner_enabled({"KURUKIN_ENABLE_UI_RUNNER": "true"}))
         self.assertTrue(is_ui_runner_enabled({"KURUKIN_ENABLE_UI_RUNNER": "YES"}))
 
+    def test_aroll_broll_feature_flags_default_to_false(self):
+        self.assertFalse(is_aroll_broll_queue_enabled({}))
+        self.assertFalse(is_aroll_broll_renderer_enabled({}))
+
+    def test_aroll_broll_queue_flag_accepts_controlled_values(self):
+        self.assertTrue(
+            is_aroll_broll_queue_enabled({"KURUKIN_ENABLE_AROLL_BROLL_QUEUE": "1"})
+        )
+        self.assertTrue(
+            is_aroll_broll_queue_enabled({"KURUKIN_ENABLE_AROLL_BROLL_QUEUE": "yes"})
+        )
+
     def test_build_safe_runner_command_unavailable_without_runner(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = build_safe_runner_command(Path(tmp))
@@ -1168,6 +1205,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             self.skipTest("streamlit is not installed in this Python environment")
 
         original_flag = os.environ.pop("KURUKIN_ENABLE_UI_RUNNER", None)
+        original_queue_flag = os.environ.pop("KURUKIN_ENABLE_AROLL_BROLL_QUEUE", None)
         original_cwd = Path.cwd()
         page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
         try:
@@ -1179,6 +1217,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             os.chdir(original_cwd)
             if original_flag is not None:
                 os.environ["KURUKIN_ENABLE_UI_RUNNER"] = original_flag
+            if original_queue_flag is not None:
+                os.environ["KURUKIN_ENABLE_AROLL_BROLL_QUEUE"] = original_queue_flag
 
         self.assertEqual(len(at.exception), 0)
         rendered_text = "\n".join(
@@ -1270,11 +1310,19 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn("Audio final: A-roll original", rendered_text)
         self.assertIn("B-roll audio: muted", rendered_text)
         self.assertIn(
-            "La activación de cola llegará en la siguiente fase de integración.",
+            "La cola puede preparar un pending job protegido",
             rendered_text,
         )
         self.assertIn(
-            "La cola A-roll/B-roll se habilitará en la fase renderer",
+            "Cola A-roll/B-roll: protegida",
+            rendered_text,
+        )
+        self.assertIn(
+            "KURUKIN_ENABLE_AROLL_BROLL_QUEUE=<unset>",
+            rendered_text,
+        )
+        self.assertIn(
+            "La cola A-roll/B-roll se activa después de una validación estricta",
             rendered_text,
         )
         self.assertNotIn("<div", rendered_text)

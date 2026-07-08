@@ -24,6 +24,7 @@ from app.custom.aroll_broll_mode import (  # noqa: E402
     SUBTITLES_SOURCE_CUSTOM_SRT,
     SUBTITLES_SOURCE_NONE,
     build_aroll_broll_preview_timeline,
+    build_aroll_broll_queue_payload,
     build_default_aroll_broll_config,
     summarize_aroll_broll_config,
     validate_aroll_broll_config,
@@ -41,6 +42,7 @@ from app.custom.kurukin_job_adapter import (  # noqa: E402
     DEFAULT_LOCAL_VIDEOS_DIR,
 )
 from app.custom.kurukin_job_queue import (  # noqa: E402
+    AROLL_BROLL_QUEUE_FLAG,
     CONTAINER_API_BASE_URL,
     CONTAINER_NIGHTLY_QUEUE_DIR,
     MANUAL_RUNNER_EXECUTION_MODE,
@@ -55,6 +57,7 @@ from app.custom.kurukin_job_queue import (  # noqa: E402
     get_latest_rendered_video,
     get_recommended_result,
     get_runner_preflight_summary,
+    is_aroll_broll_queue_enabled,
     is_ui_runner_enabled,
     list_rendered_videos,
     read_video_bytes_for_download,
@@ -979,8 +982,27 @@ def _aroll_broll_timeline_block(config):
     st.dataframe(timeline, use_container_width=True, hide_index=True)
 
 
+def _build_aroll_broll_queue_payload(config):
+    return build_aroll_broll_queue_payload(
+        config,
+        job_id=st.session_state["job_id"],
+        project_root=ROOT_DIR,
+        render_quality=st.session_state.get("aroll_broll_quality", "draft_720p"),
+        title="A-roll/B-roll",
+        strict=True,
+    )
+
+
+def _aroll_broll_queue_flag_label():
+    value = os.environ.get(AROLL_BROLL_QUEUE_FLAG)
+    if value is None:
+        return f"{AROLL_BROLL_QUEUE_FLAG}=<unset>"
+    return f"{AROLL_BROLL_QUEUE_FLAG}={value}"
+
+
 def _aroll_broll_view():
     st.markdown("### Modo Presentador + B-roll")
+    queue_enabled = is_aroll_broll_queue_enabled()
     st.info(
         "El audio del presentador manda.\n\n"
         "El B-roll se usa como apoyo visual y se silencia por defecto.\n\n"
@@ -990,11 +1012,17 @@ def _aroll_broll_view():
     st.caption("B-roll muted")
     st.caption("alternating_fullscreen")
     st.caption("Renderer preparado: alternating_fullscreen")
+    st.caption("Cola A-roll/B-roll: protegida")
+    st.caption(_aroll_broll_queue_flag_label())
+    st.caption(
+        "Activa KURUKIN_ENABLE_AROLL_BROLL_QUEUE=1 solo para pruebas controladas."
+    )
     st.info(
         "Renderer MVP planeado: alternating_fullscreen\n\n"
         "Audio final: A-roll original\n\n"
         "B-roll audio: muted\n\n"
-        "La activación de cola llegará en la siguiente fase de integración."
+        "La cola puede preparar un pending job protegido; el runner lo rechaza "
+        "hasta habilitar la integración E2E."
     )
 
     left, right = st.columns([1, 1])
@@ -1106,14 +1134,63 @@ def _aroll_broll_view():
         _aroll_broll_summary_block(validation["normalized"])
         _aroll_broll_validation_block(validation)
         _aroll_broll_timeline_block(validation["normalized"])
-
-    st.button(
-        "Enviar a cola",
-        key="aroll_broll_enqueue_disabled",
-        disabled=True,
-        help="La cola A-roll/B-roll se habilitará en la fase renderer.",
-    )
-    st.info("La cola A-roll/B-roll se habilitará en la fase renderer.")
+        try:
+            queue_payload = _build_aroll_broll_queue_payload(validation["normalized"])
+        except Exception as exc:
+            st.button(
+                "Enviar A-roll/B-roll a cola",
+                key="aroll_broll_enqueue_disabled",
+                disabled=True,
+                help="Completa la validación estricta antes de crear el pending.",
+            )
+            st.warning(f"Queue protegido pendiente: {exc}")
+        else:
+            st.info(
+                "Enviar a cola creará un pending job A-roll/B-roll protegido. "
+                "El runner no lo renderiza todavía."
+            )
+            with st.expander("Modo avanzado: ver payload A-roll/B-roll JSON", expanded=False):
+                st.json(queue_payload)
+            if not queue_enabled:
+                st.button(
+                    "Enviar A-roll/B-roll a cola",
+                    key="aroll_broll_enqueue_disabled",
+                    disabled=True,
+                    help=(
+                        "Activa KURUKIN_ENABLE_AROLL_BROLL_QUEUE=1 solo para "
+                        "pruebas controladas."
+                    ),
+                )
+                st.warning(
+                    "Cola A-roll/B-roll protegida: flag de cola apagado; no se crea pending."
+                )
+            elif st.button("Enviar A-roll/B-roll a cola", key="aroll_broll_enqueue"):
+                try:
+                    path = enqueue_moneyprinter_payload(queue_payload)
+                    st.session_state["last_enqueued_job_id"] = queue_payload["job_id"]
+                    st.session_state["last_enqueued_pending_path"] = path.as_posix()
+                    st.session_state["last_enqueued_at"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    st.success("A-roll/B-roll enviado a cola protegida.")
+                    st.info(
+                        "El render no empezó. El runner rechazará este modo hasta "
+                        "la fase de integración E2E."
+                    )
+                    st.caption(f"Pendiente protegido creado: {path}")
+                except Exception as exc:
+                    _show_error(exc)
+    else:
+        st.button(
+            "Enviar A-roll/B-roll a cola",
+            key="aroll_broll_enqueue_disabled",
+            disabled=True,
+            help="Primero valida A-roll/B-roll para activar este paso.",
+        )
+        st.info(
+            "La cola A-roll/B-roll se activa después de una validación estricta "
+            "y con KURUKIN_ENABLE_AROLL_BROLL_QUEUE=1."
+        )
 
 
 def _new_render_view():

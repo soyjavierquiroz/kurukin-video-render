@@ -25,7 +25,11 @@ MAX_STORAGE_SCAN_DEPTH = 5
 MAX_STORAGE_SCAN_FILES = 2000
 VIDEO_PREVIEW_MAX_BYTES = 200 * 1024 * 1024
 VIDEO_DOWNLOAD_MEMORY_MAX_BYTES = 500 * 1024 * 1024
+RENDER_MODE_AROLL_BROLL = "aroll_broll"
 UI_RUNNER_ENABLED_VALUES = {"1", "true", "TRUE", "yes", "YES"}
+FEATURE_FLAG_ENABLED_VALUES = {"1", "true", "yes", "on"}
+AROLL_BROLL_QUEUE_FLAG = "KURUKIN_ENABLE_AROLL_BROLL_QUEUE"
+AROLL_BROLL_RENDERER_FLAG = "KURUKIN_ENABLE_AROLL_BROLL_RENDERER"
 SAFE_RUNNER_RELATIVE_PATH = "scripts/nightly_runner.py"
 SAFE_RUNNER_COMMAND = ("python3", SAFE_RUNNER_RELATIVE_PATH)
 CONTAINER_NIGHTLY_QUEUE_DIR = "/MoneyPrinterTurbo/storage/nightly_jobs"
@@ -262,6 +266,8 @@ def _nested_get(value: dict[str, Any], *keys: str) -> Any:
 
 
 def _pending_asset_source(payload: dict[str, Any]) -> str:
+    if payload.get("render_mode") == RENDER_MODE_AROLL_BROLL:
+        return "A-roll/B-roll"
     if payload.get("asset_hub_renderer_manifest_path") or payload.get(
         "asset_hub_bundle_uid"
     ):
@@ -272,6 +278,13 @@ def _pending_asset_source(payload: dict[str, Any]) -> str:
 
 
 def _pending_subtitles(payload: dict[str, Any]) -> str:
+    if payload.get("render_mode") == RENDER_MODE_AROLL_BROLL:
+        source = _nested_get(payload, "aroll_broll", "subtitles", "source")
+        return {
+            "aroll_audio": "Audio A-roll",
+            "custom_srt": "SRT propio",
+            "none": "Sin subtítulos",
+        }.get(str(source or ""), str(source or "-"))
     runner_mode = _nested_get(payload, "runner", "subtitles", "mode")
     if runner_mode:
         return str(runner_mode)
@@ -1233,6 +1246,23 @@ def is_ui_runner_enabled(env: Mapping[str, str] | None = None) -> bool:
 
     values = env if env is not None else os.environ
     return values.get("KURUKIN_ENABLE_UI_RUNNER", "") in UI_RUNNER_ENABLED_VALUES
+
+
+def _feature_flag_enabled(name: str, env: Mapping[str, str] | None = None) -> bool:
+    values = env if env is not None else os.environ
+    return str(values.get(name, "")).strip().lower() in FEATURE_FLAG_ENABLED_VALUES
+
+
+def is_aroll_broll_queue_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether A-roll/B-roll pending creation is explicitly enabled."""
+
+    return _feature_flag_enabled(AROLL_BROLL_QUEUE_FLAG, env)
+
+
+def is_aroll_broll_renderer_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether A-roll/B-roll runner execution is explicitly enabled."""
+
+    return _feature_flag_enabled(AROLL_BROLL_RENDERER_FLAG, env)
 
 
 def build_safe_runner_command(
