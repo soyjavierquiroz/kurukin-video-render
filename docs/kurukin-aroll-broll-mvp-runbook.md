@@ -3,7 +3,11 @@
 ## Estado
 
 - Stable branch: custom/mvp
-- Latest checkpoint: mvp-aroll-broll-results-queue-polish-2026-07-08
+- Latest checkpoint: mvp-aroll-broll-ui-e2e-pass-2026-07-08
+- MVP técnico: completo
+- E2E runner: completo
+- UI E2E: completo
+- Demo desde Render Console: validado con smoke-004
 - E2E runner PASS: aroll-broll-runner-smoke-003
 - Render mode: render_mode=aroll_broll
 - Layout MVP: alternating_fullscreen
@@ -77,6 +81,31 @@ Runner E2E PASS:
 - completed dir:
   storage/nightly_jobs/completed/20260708-164846-aroll-broll-runner-smoke-003-20260708T164854Z-1560774-1783529334006377018
 
+## UI E2E PASS
+
+- task_id: aroll-broll-ui-smoke-004
+- checkpoint: mvp-aroll-broll-ui-e2e-pass-2026-07-08
+- merge: 1d202aca785227192d09023fd0f9d36ecb29bafa
+- helper UI:
+  app.custom.kurukin_render_console.enqueue_aroll_broll_from_console
+- output: storage/tasks/aroll-broll-ui-smoke-004/final-1.mp4
+- completed dir:
+  storage/nightly_jobs/completed/20260708-204354-aroll-broll-ui-smoke-004-20260708T204415Z-1713769-1783543455820704828
+- duración: 6.000000s
+- resolución: 720x1280
+- video: h264
+- audio: aac
+- Render Console:
+  - Cola/Resultados detectan smoke-004
+  - Presentador + B-roll visible
+  - Audio: A-roll original visible
+  - B-roll muted visible
+  - preview/download OK
+- Guardrails:
+  - sin /api/v1/videos
+  - sin UI runner
+  - flags apagados al final
+
 ## Render Console
 
 - Cola muestra “Presentador + B-roll”
@@ -131,10 +160,8 @@ Runner E2E PASS:
 
 Sin sobreingeniería:
 
-1. UI enable controlado para encolar A-roll/B-roll desde Render Console.
-2. Demo flow con flags temporales.
-3. Mejor preview metadata.
-4. Soportar B-roll múltiples.
+1. Demo controlado con contenido real corto.
+2. B-roll múltiple local.
+3. Mejor metadata/preview.
+4. Subtítulos desde A-roll.
 5. Segundo layout: broll_fullscreen_speaker_bubble.
-6. Subtítulos desde audio A-roll.
-7. Auto crop/face tracking después.
