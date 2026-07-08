@@ -616,6 +616,137 @@ def build_aroll_broll_command(plan: ArollBrollRenderPlan) -> ArollBrollCommand:
     )
 
 
+def _config_section(config: dict[str, Any], key: str) -> dict[str, Any]:
+    value = config.get(key)
+    if not isinstance(value, dict):
+        raise ArollBrollRendererError(f"aroll_broll.{key} must be an object")
+    return value
+
+
+def _local_asset_path(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("path", "local_path", "file_path", "source_path", "resolved_path"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+    return ""
+
+
+def _broll_assets_from_config(
+    b_roll: dict[str, Any],
+    *,
+    project_root: str | Path | None,
+) -> list[ArollBrollAsset]:
+    assets: list[ArollBrollAsset] = []
+    raw_assets = b_roll.get("assets")
+    if isinstance(raw_assets, list):
+        for item in raw_assets:
+            asset_path = _local_asset_path(item)
+            if not asset_path:
+                raise ArollBrollRendererError("b_roll.assets entries must include a path")
+            assets.append(validate_broll_path(asset_path, project_root=project_root))
+        return assets
+
+    raw_paths = b_roll.get("paths")
+    if isinstance(raw_paths, list):
+        for item in raw_paths:
+            asset_path = _local_asset_path(item)
+            if not asset_path:
+                raise ArollBrollRendererError("b_roll.paths entries must include a path")
+            assets.append(validate_broll_path(asset_path, project_root=project_root))
+        return assets
+
+    single_path = _local_asset_path(b_roll.get("path"))
+    if single_path:
+        return [validate_broll_path(single_path, project_root=project_root)]
+
+    manifest_path = b_roll.get("manifest_path")
+    if isinstance(manifest_path, str) and manifest_path.strip():
+        extracted = extract_broll_assets_from_manifest(
+            manifest_path.strip(),
+            project_root=project_root,
+        )
+        return list(extracted.get("assets") or [])
+
+    return []
+
+
+def _positive_duration(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ArollBrollRendererError("A-roll duration must be numeric") from exc
+    if duration <= 0:
+        raise ArollBrollRendererError("A-roll duration must be greater than zero")
+    if duration > MAX_INPUT_VIDEO_SECONDS:
+        raise ArollBrollRendererError("A-roll duration exceeds maximum supported length")
+    return duration
+
+
+def build_aroll_broll_plan_from_job(
+    job: dict[str, Any],
+    *,
+    project_root: str | Path | None = None,
+    task_id: str | None = None,
+    duration_runner: Runner | None = None,
+    aroll_duration_seconds: float | None = None,
+) -> ArollBrollRenderPlan:
+    """Build a direct renderer plan from a guarded pending job without API calls."""
+
+    if not isinstance(job, dict):
+        raise ArollBrollRendererError("job must be a JSON object")
+    if job.get("render_mode") != "aroll_broll":
+        raise ArollBrollRendererError("render_mode must be aroll_broll")
+
+    config = job.get("aroll_broll")
+    if not isinstance(config, dict):
+        raise ArollBrollRendererError("aroll_broll must be an object")
+
+    a_roll = _config_section(config, "a_roll")
+    b_roll = _config_section(config, "b_roll")
+    layout = _config_section(config, "layout")
+
+    layout_preset = str(layout.get("preset") or RENDERER_LAYOUT_ALTERNATING_FULLSCREEN)
+    if layout_preset != RENDERER_LAYOUT_ALTERNATING_FULLSCREEN:
+        raise ArollBrollRendererError("only alternating_fullscreen is supported")
+
+    a_roll_path = _local_asset_path(a_roll.get("path"))
+    if not a_roll_path:
+        raise ArollBrollRendererError("a_roll.path is required")
+    resolved_aroll_path = validate_aroll_path(a_roll_path, project_root=project_root)
+
+    b_roll_assets = _broll_assets_from_config(b_roll, project_root=project_root)
+    if not b_roll_assets:
+        raise ArollBrollRendererError("at least one B-roll asset is required")
+
+    clean_task_id = str(task_id or job.get("task_id") or job.get("job_id") or "").strip()
+    output_path = build_aroll_broll_output_path(clean_task_id, project_root=project_root)
+
+    duration = (
+        _positive_duration(aroll_duration_seconds)
+        or _positive_duration(a_roll.get("duration_seconds"))
+        or get_media_duration_seconds(resolved_aroll_path, runner=duration_runner)
+    )
+    timeline = build_alternating_fullscreen_timeline(
+        duration,
+        b_roll_assets,
+        b_roll.get("clip_seconds", 4),
+        str(b_roll.get("frequency") or "medium"),
+    )
+    return ArollBrollRenderPlan(
+        a_roll_path=resolved_aroll_path,
+        b_roll_assets=b_roll_assets,
+        output_path=output_path,
+        timeline=timeline,
+        aroll_duration_seconds=duration,
+        layout_preset=layout_preset,
+    )
+
+
 def run_aroll_broll_render(
     plan: ArollBrollRenderPlan,
     runner: Runner | None = None,

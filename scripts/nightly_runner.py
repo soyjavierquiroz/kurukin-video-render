@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import time
@@ -24,6 +25,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.custom.kurukin_job_queue import is_aroll_broll_renderer_enabled
+from app.custom.aroll_broll_renderer import (
+    build_aroll_broll_plan_from_job,
+    run_aroll_broll_render,
+)
 
 CONTAINER_QUEUE_DIR = Path("/MoneyPrinterTurbo/storage/nightly_jobs")
 DEFAULT_API_BASE_URL = "http://127.0.0.1:18080/api/v1"
@@ -55,6 +60,25 @@ DEFAULT_QUEUE_DIR = default_queue_dir().as_posix()
 
 class RunnerError(Exception):
     """Expected runner failure that should move the current job to failed."""
+
+
+class ArollBrollRunnerError(RunnerError):
+    """A-roll/B-roll renderer failure with captured process evidence."""
+
+    render_mode = RENDER_MODE_AROLL_BROLL
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        returncode: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+    ):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class JsonApiError(RunnerError):
@@ -182,6 +206,22 @@ def sanitize_name(name: str) -> str:
     return "".join(safe).strip(".-") or "job"
 
 
+def sanitize_task_id(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", str(value or "").strip())
+    safe = safe.strip("-_")
+    return safe or "aroll-broll-job"
+
+
+def is_aroll_broll_job(job: dict[str, Any]) -> bool:
+    return isinstance(job, dict) and job.get("render_mode") == RENDER_MODE_AROLL_BROLL
+
+
+def task_id_for_aroll_broll_job(job: dict[str, Any], reserved_dir: Path) -> str:
+    return sanitize_task_id(
+        str(job.get("task_id") or job.get("job_id") or reserved_dir.name)
+    )
+
+
 def reserve_job(pending_file: Path, processing_dir: Path) -> Path:
     unique_name = (
         f"{sanitize_name(pending_file.stem)}-{timestamp()}-{os.getpid()}-"
@@ -208,11 +248,10 @@ def validate_job(job: Any) -> dict[str, Any]:
     render_mode = job.get("render_mode")
     if render_mode == RENDER_MODE_AROLL_BROLL:
         if not is_aroll_broll_renderer_enabled():
-            raise RunnerError("A-roll/B-roll renderer execution is disabled")
-        raise RunnerError(
-            "A-roll/B-roll renderer execution is enabled, but no runner handler "
-            "is wired for this phase"
-        )
+            raise ArollBrollRunnerError(
+                "A-roll/B-roll renderer execution is disabled"
+            )
+        return {key: value for key, value in job.items() if key not in METADATA_KEYS}
     if render_mode not in (None, ""):
         raise RunnerError(f"unsupported render_mode: {render_mode}")
 
@@ -325,6 +364,14 @@ def api_error_payload(exc: BaseException) -> dict[str, Any]:
         payload["traceback"] = traceback.format_exc()
     else:
         payload["traceback"] = traceback.format_exc()
+    if hasattr(exc, "render_mode"):
+        payload["render_mode"] = getattr(exc, "render_mode")
+    if hasattr(exc, "returncode"):
+        payload["returncode"] = getattr(exc, "returncode")
+    if hasattr(exc, "stdout"):
+        payload["stdout"] = getattr(exc, "stdout")
+    if hasattr(exc, "stderr"):
+        payload["stderr"] = getattr(exc, "stderr")
     return payload
 
 
@@ -359,6 +406,73 @@ def run_dry_job(run_dir: Path, payload: dict[str, Any], logger: Logger) -> Path:
     )
     logger.log(f"dry-run completed {run_dir.name}")
     return run_dir
+
+
+def handle_aroll_broll_job(
+    job: dict[str, Any],
+    reserved_dir: Path,
+    project_root: Path,
+    renderer_runner=None,
+    duration_runner=None,
+) -> dict[str, Any]:
+    """Render an A-roll/B-roll job internally without calling the API."""
+
+    if not is_aroll_broll_job(job):
+        raise RunnerError("job is not an A-roll/B-roll render")
+    if not is_aroll_broll_renderer_enabled():
+        raise ArollBrollRunnerError("A-roll/B-roll renderer execution is disabled")
+
+    task_id = task_id_for_aroll_broll_job(job, reserved_dir)
+    plan = build_aroll_broll_plan_from_job(
+        job,
+        project_root=project_root,
+        task_id=task_id,
+        duration_runner=duration_runner,
+    )
+    if renderer_runner is None:
+        render_result = run_aroll_broll_render(plan)
+    else:
+        render_result = renderer_runner(plan)
+    if not isinstance(render_result, dict):
+        raise ArollBrollRunnerError("A-roll/B-roll renderer returned invalid result")
+
+    write_json(reserved_dir / "render-result.json", render_result)
+    output_path = Path(str(render_result.get("output_path") or plan.output_path))
+    if not bool(render_result.get("ok")):
+        raise ArollBrollRunnerError(
+            "A-roll/B-roll renderer failed",
+            returncode=render_result.get("returncode"),
+            stdout=str(render_result.get("stdout", "")),
+            stderr=str(render_result.get("stderr", "")),
+        )
+
+    video_ref = f"/tasks/{task_id}/final-1.mp4"
+    submit_response = {
+        "status": 200,
+        "message": "success",
+        "data": {"task_id": task_id},
+        "render_mode": RENDER_MODE_AROLL_BROLL,
+    }
+    final_task = {
+        "status": 200,
+        "message": "success",
+        "data": {
+            "task_id": task_id,
+            "state": COMPLETE_STATE,
+            "progress": 100,
+            "videos": [video_ref],
+            "render_mode": RENDER_MODE_AROLL_BROLL,
+        },
+    }
+    write_json(reserved_dir / "submit-response.json", submit_response)
+    write_json(reserved_dir / "final-task.json", final_task)
+    return {
+        "task_id": task_id,
+        "output_path": output_path.as_posix(),
+        "video_ref": video_ref,
+        "plan": plan,
+        "render_result": render_result,
+    }
 
 
 def submit_and_wait(
@@ -429,6 +543,9 @@ def process_one_job(
     paths: dict[str, Path],
     args: argparse.Namespace,
     logger: Logger,
+    *,
+    renderer_runner=None,
+    duration_runner=None,
 ) -> Path:
     run_dir = reserve_job(pending_file, paths["processing"])
     logger.log(f"reserved {pending_file.name} as {run_dir.name}")
@@ -438,7 +555,15 @@ def process_one_job(
         payload = validate_job(job)
         write_json(run_dir / "moneyprinter-payload.json", payload)
 
-        if args.dry_run:
+        if is_aroll_broll_job(job):
+            handle_aroll_broll_job(
+                job,
+                run_dir,
+                Path(getattr(args, "project_root", PROJECT_ROOT)),
+                renderer_runner=renderer_runner,
+                duration_runner=duration_runner,
+            )
+        elif args.dry_run:
             run_dry_job(run_dir, payload, logger)
         else:
             submit_and_wait(
