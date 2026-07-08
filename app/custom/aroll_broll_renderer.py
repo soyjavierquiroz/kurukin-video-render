@@ -50,6 +50,7 @@ class ArollBrollRenderPlan:
     b_roll_assets: list[ArollBrollAsset]
     output_path: Path
     timeline: list[dict[str, Any]]
+    aroll_duration_seconds: float | None = None
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
     fps: int = DEFAULT_FPS
@@ -474,6 +475,50 @@ def _scale_crop_filter(width: int, height: int, fps: int) -> str:
     )
 
 
+def _timeline_duration_seconds(timeline: list[dict[str, Any]]) -> float:
+    try:
+        return max(float(item["end"]) for item in timeline)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArollBrollRendererError("timeline end values must be numeric") from exc
+
+
+def _target_duration_seconds(plan: ArollBrollRenderPlan) -> float:
+    if plan.aroll_duration_seconds is None:
+        duration = _timeline_duration_seconds(plan.timeline)
+    else:
+        try:
+            duration = float(plan.aroll_duration_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ArollBrollRendererError(
+                "A-roll duration must be numeric"
+            ) from exc
+    if duration <= 0:
+        raise ArollBrollRendererError("A-roll duration must be greater than zero")
+    return duration
+
+
+def _clamp_timeline_to_duration(
+    timeline: list[dict[str, Any]],
+    duration_seconds: float,
+) -> list[dict[str, Any]]:
+    clamped: list[dict[str, Any]] = []
+    for item in timeline:
+        try:
+            start = max(0.0, float(item["start"]))
+            end = min(float(item["end"]), duration_seconds)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArollBrollRendererError(
+                "timeline start and end values must be numeric"
+            ) from exc
+        if end <= start:
+            continue
+        segment = dict(item)
+        segment["start"] = start
+        segment["end"] = end
+        clamped.append(segment)
+    return clamped
+
+
 def build_alternating_fullscreen_ffmpeg_command(
     plan: ArollBrollRenderPlan,
 ) -> list[str]:
@@ -484,9 +529,10 @@ def build_alternating_fullscreen_ffmpeg_command(
     if not plan.timeline:
         raise ArollBrollRendererError("timeline is required")
 
-    total_duration = max(float(item["end"]) for item in plan.timeline)
-    if total_duration <= 0:
-        raise ArollBrollRendererError("timeline duration must be greater than zero")
+    total_duration = _target_duration_seconds(plan)
+    timeline = _clamp_timeline_to_duration(plan.timeline, total_duration)
+    if not timeline:
+        raise ArollBrollRendererError("timeline has no renderable segments")
 
     command = ["ffmpeg", "-y", "-i", plan.a_roll_path.as_posix()]
     for asset in plan.b_roll_assets:
@@ -498,7 +544,7 @@ def build_alternating_fullscreen_ffmpeg_command(
     scale_crop = _scale_crop_filter(plan.width, plan.height, plan.fps)
     filters: list[str] = []
     segment_labels: list[str] = []
-    for index, segment in enumerate(plan.timeline):
+    for index, segment in enumerate(timeline):
         start = float(segment["start"])
         end = float(segment["end"])
         duration = end - start

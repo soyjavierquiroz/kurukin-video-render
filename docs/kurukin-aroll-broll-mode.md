@@ -56,6 +56,8 @@ activar todavia la cola desde la UI.
 - El comando ffmpeg se construye como lista segura, sin `shell=True`.
 - La fase actual implementa renderer core, ffprobe/ffmpeg helpers y dry-run.
 - La cola solo crea pending protegido para A-roll/B-roll; el runner no lo ejecuta.
+- La duracion final debe ser igual a la duracion del A-roll.
+- El timeline y el comando ffmpeg se clamplean a la duracion del A-roll.
 
 ## Queue integration protegida
 

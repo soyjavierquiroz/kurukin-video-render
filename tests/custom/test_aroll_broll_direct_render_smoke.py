@@ -35,6 +35,16 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
             *extra,
         ]
 
+    def _execute_argv(self, root: Path, aroll: Path, broll: Path) -> list[str]:
+        return self._argv(
+            root,
+            aroll,
+            broll,
+            "--a-roll-duration-seconds",
+            "6",
+            "--execute",
+        )
+
     def _run_main(self, argv: list[str], *, runner=None) -> tuple[int, str, str]:
         stdout = StringIO()
         stderr = StringIO()
@@ -83,6 +93,38 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
         self.assertTrue(payload["output_path"].endswith("/final-1.mp4"))
         self.assertIsInstance(payload["command"], list)
 
+    def test_dry_run_payload_includes_planned_aroll_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, broll = self._make_project_files(root)
+
+            code, stdout, stderr = self._run_main(self._argv(root, aroll, broll))
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["a_roll_duration_seconds"], 6.0)
+        self.assertLessEqual(payload["timeline_duration_seconds"], 6.0)
+
+    def test_dry_run_command_contains_duration_limit_without_real_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, broll = self._make_project_files(root)
+
+            def runner(*args, **kwargs):
+                raise AssertionError("runner should not execute in dry-run")
+
+            code, stdout, stderr = self._run_main(
+                self._argv(root, aroll, broll),
+                runner=runner,
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        command = payload["command"]
+        self.assertIn("-t", command)
+        self.assertEqual(command[command.index("-t") + 1], "6")
+        self.assertLess(command.index("-t"), command.index(payload["output_path"]))
+
     def test_command_is_list_of_strings(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -111,7 +153,7 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
                 clear=True,
             ):
                 code, stdout, stderr = self._run_main(
-                    self._argv(root, aroll, broll, "--execute"),
+                    self._execute_argv(root, aroll, broll),
                     runner=runner,
                 )
 
@@ -133,7 +175,7 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
                 clear=True,
             ):
                 code, stdout, stderr = self._run_main(
-                    self._argv(root, aroll, broll, "--execute"),
+                    self._execute_argv(root, aroll, broll),
                     runner=runner,
                 )
 
@@ -156,7 +198,7 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {}, clear=True):
                 code, stdout, stderr = self._run_main(
-                    self._argv(root, aroll, broll, "--execute"),
+                    self._execute_argv(root, aroll, broll),
                     runner=runner,
                 )
 
