@@ -32,6 +32,7 @@ from app.custom.kurukin_job_queue import (  # noqa: E402
     enqueue_moneyprinter_payload,
     get_job_lifecycle_summary,
     get_latest_rendered_video,
+    get_recommended_result,
     get_runner_preflight_summary,
     is_ui_runner_enabled,
     list_rendered_videos,
@@ -1006,6 +1007,60 @@ def _results_details(video):
         )
 
 
+def _result_preview_download(video, *, key_prefix):
+    st.markdown("### Preview")
+    if video.get("is_previewable"):
+        st.video(video.get("absolute_path"))
+        st.success("Preview disponible.")
+    else:
+        st.warning(
+            "El video supera el límite de preview automático de "
+            f"{_human_bytes(VIDEO_PREVIEW_MAX_BYTES)}."
+        )
+
+    st.markdown("### Descargar")
+    if video.get("size_bytes", 0) > VIDEO_DOWNLOAD_MEMORY_MAX_BYTES:
+        st.warning(
+            "El video supera el límite de descarga directa de "
+            f"{_human_bytes(VIDEO_DOWNLOAD_MEMORY_MAX_BYTES)}."
+        )
+        return
+
+    data = read_video_bytes_for_download(video)
+    if data is None:
+        st.warning("No se pudo preparar la descarga del video seleccionado.")
+        return
+
+    st.download_button(
+        "Descargar MP4",
+        data=data,
+        file_name=_safe_download_filename(video),
+        mime="video/mp4",
+        key=f"{key_prefix}_download_mp4",
+    )
+
+
+def _highlighted_result_block(video):
+    if video.get("recommendation") == "last_job":
+        title = "Tu video más reciente"
+        st.success(title)
+    else:
+        title = "Último video generado"
+        st.info(title)
+
+    cols = st.columns(5)
+    cols[0].metric("job_id", video.get("job_id") or video.get("completed_job_id") or "-")
+    cols[1].metric("task_id", video.get("task_id") or "-")
+    cols[2].metric("Archivo final", video.get("file_name") or "-")
+    cols[3].metric("Tamaño", video.get("size_label") or _human_bytes(video.get("size_bytes")))
+    cols[4].metric("Estado", "Generado correctamente")
+    st.caption(f"Fecha: {_format_datetime(video.get('modified_at') or video.get('completed_at'))}")
+
+    _result_preview_download(video, key_prefix="recommended_result")
+    with st.expander("Detalles del resultado destacado", expanded=False):
+        _results_details(video)
+
+
 def _results_view():
     st.title("Resultados generados")
     st.write("Reproduce y descarga videos ya generados bajo storage/tasks.")
@@ -1013,6 +1068,9 @@ def _results_view():
 
     videos = list_rendered_videos()
     latest_video = get_latest_rendered_video()
+    recommended_result = get_recommended_result(
+        last_job_id=st.session_state.get("last_enqueued_job_id")
+    )
     lifecycle = get_job_lifecycle_summary()
     counts = lifecycle.get("counts", {})
 
@@ -1032,7 +1090,10 @@ def _results_view():
         )
         return
 
-    st.markdown("### Videos detectados")
+    if recommended_result:
+        _highlighted_result_block(recommended_result)
+
+    st.markdown("### Todos los videos generados")
     st.dataframe(
         [
             {
@@ -1051,8 +1112,9 @@ def _results_view():
 
     option_labels = [_video_option_label(video) for video in videos]
     default_index = 0
-    if latest_video:
-        latest_relative_path = latest_video.get("relative_path")
+    default_video = recommended_result or latest_video
+    if default_video:
+        latest_relative_path = default_video.get("relative_path")
         for index, video in enumerate(videos):
             if video.get("relative_path") == latest_relative_path:
                 default_index = index
@@ -1067,34 +1129,7 @@ def _results_view():
     selected_index = option_labels.index(selected_label)
     selected_video = videos[selected_index]
 
-    st.markdown("### Preview")
-    if selected_video.get("is_previewable"):
-        st.video(selected_video.get("absolute_path"))
-        st.success("Preview disponible.")
-    else:
-        st.warning(
-            "El video supera el límite de preview automático de "
-            f"{_human_bytes(VIDEO_PREVIEW_MAX_BYTES)}."
-        )
-
-    st.markdown("### Descargar")
-    if selected_video.get("size_bytes", 0) > VIDEO_DOWNLOAD_MEMORY_MAX_BYTES:
-        st.warning(
-            "El video supera el límite de descarga directa de "
-            f"{_human_bytes(VIDEO_DOWNLOAD_MEMORY_MAX_BYTES)}."
-        )
-    else:
-        data = read_video_bytes_for_download(selected_video)
-        if data is None:
-            st.warning("No se pudo preparar la descarga del video seleccionado.")
-        else:
-            st.download_button(
-                "Descargar MP4",
-                data=data,
-                file_name=_safe_download_filename(selected_video),
-                mime="video/mp4",
-                key="results_download_mp4",
-            )
+    _result_preview_download(selected_video, key_prefix="results")
 
     with st.expander("Detalles del resultado", expanded=False):
         _results_details(selected_video)

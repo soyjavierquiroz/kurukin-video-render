@@ -237,6 +237,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Jobs completados",
             "Jobs fallidos",
             "Último video generado",
+            "Tu video más reciente",
+            "Todos los videos generados",
             "Videos detectados",
             "Video para preview y descarga",
             "Preview",
@@ -1216,12 +1218,103 @@ class TestKurukinRenderConsole(unittest.TestCase):
             for item in collection
         )
         self.assertIn("Resultados generados", rendered_text)
+        self.assertIn("Último video generado", rendered_text)
+        self.assertIn("Todos los videos generados", rendered_text)
         self.assertIn("task-results-001", rendered_text)
         self.assertIn("final-1.mp4", rendered_text)
         self.assertIn("Preview", rendered_text)
         self.assertIn("Preview disponible", rendered_text)
         self.assertIn("Descargar MP4", rendered_text)
         self.assertNotIn("<div", rendered_text)
+        self.assertTrue(at.button(key="controlled_runner_execute").disabled)
+        self.assertFalse((Path(tmp) / "storage" / "nightly_jobs" / "pending").exists())
+
+    def test_app_test_results_tab_highlights_last_enqueued_job_when_streamlit_available(self):
+        try:
+            from streamlit.testing.v1 import AppTest
+        except ModuleNotFoundError:
+            self.skipTest("streamlit is not installed in this Python environment")
+
+        original_flag = os.environ.pop("KURUKIN_ENABLE_UI_RUNNER", None)
+        original_cwd = Path.cwd()
+        page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                task_id = "task-results-002"
+                job_id = "job-results-002"
+                task_dir = tmp_path / "storage" / "tasks" / task_id
+                completed_dir = (
+                    tmp_path
+                    / "storage"
+                    / "nightly_jobs"
+                    / "completed"
+                    / "done-job-results-002"
+                )
+                task_dir.mkdir(parents=True)
+                completed_dir.mkdir(parents=True)
+                (task_dir / "final-1.mp4").write_bytes(
+                    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+                )
+                (completed_dir / "job.json").write_text(
+                    json.dumps({"job_id": job_id}),
+                    encoding="utf-8",
+                )
+                (completed_dir / "submit-response.json").write_text(
+                    json.dumps({"data": {"task_id": task_id}, "status": 200}),
+                    encoding="utf-8",
+                )
+                (completed_dir / "final-task.json").write_text(
+                    json.dumps(
+                        {
+                            "data": {
+                                "state": "completed",
+                                "progress": 100,
+                                "task_id": task_id,
+                                "videos": [f"/tasks/{task_id}/final-1.mp4"],
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                os.chdir(tmp)
+                at = AppTest.from_file(str(page_path))
+                at.session_state["last_enqueued_job_id"] = job_id
+                at.run(timeout=30)
+                pending_dir_exists = (
+                    tmp_path / "storage" / "nightly_jobs" / "pending"
+                ).exists()
+        finally:
+            os.chdir(original_cwd)
+            if original_flag is not None:
+                os.environ["KURUKIN_ENABLE_UI_RUNNER"] = original_flag
+
+        self.assertEqual(len(at.exception), 0)
+        rendered_text = "\n".join(
+            str(getattr(item, "value", getattr(item, "label", item)))
+            for collection in (
+                at.title,
+                at.markdown,
+                at.info,
+                at.success,
+                at.warning,
+                at.caption,
+                at.json,
+                at.selectbox,
+                at.button,
+            )
+            for item in collection
+        )
+        self.assertIn("Tu video más reciente", rendered_text)
+        self.assertIn("Todos los videos generados", rendered_text)
+        self.assertIn(job_id, rendered_text)
+        self.assertIn(task_id, rendered_text)
+        self.assertIn("final-1.mp4", rendered_text)
+        self.assertIn("Preview", rendered_text)
+        self.assertIn("Preview disponible", rendered_text)
+        self.assertIn("Descargar MP4", rendered_text)
+        self.assertNotIn("<div", rendered_text)
+        self.assertFalse(pending_dir_exists)
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
 
     def test_build_workflow_payload_keeps_asset_hub_material_count_zero(self):
