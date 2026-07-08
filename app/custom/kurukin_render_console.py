@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from app.custom.aroll_broll_mode import build_aroll_broll_queue_payload
 from app.custom.asset_hub_manifest import (
     load_asset_hub_renderer_manifest,
     summarize_asset_hub_manifest,
@@ -22,6 +23,11 @@ from app.custom.kurukin_job_adapter import (
     validate_asset_filename,
     validate_local_filename,
 )
+from app.custom.kurukin_job_queue import (
+    enqueue_moneyprinter_payload,
+    is_aroll_broll_queue_enabled,
+    sanitize_job_id,
+)
 
 
 DEFAULT_VOICE_NAME = "es-MX-DaliaNeural-Female"
@@ -32,6 +38,11 @@ ASSET_SOURCE_ASSET_HUB = SOURCE_MODE_ASSET_HUB
 ASSET_SOURCE_LOCAL = SOURCE_MODE_LOCAL
 ASSET_SOURCE_STOCK = SOURCE_MODE_STOCK
 STOCK_SOURCES = {"pexels", "pixabay", "coverr"}
+AROLL_BROLL_LOCAL_BROLL_ROOTS = (
+    ("storage", "local_videos"),
+    ("storage", "local_assets"),
+    ("storage", "local_images"),
+)
 
 
 def _clean_text(value: str) -> str:
@@ -109,6 +120,131 @@ def list_local_storage_files(
         except Exception:
             continue
     return filenames
+
+
+def _validate_aroll_broll_local_asset_path(value: str) -> str:
+    text = _clean_text(value)
+    if not text:
+        raise ValueError("B-roll local asset path cannot be empty")
+
+    path = PurePosixPath(text)
+    if path.is_absolute() or _has_parent_path(path) or "\\" in text:
+        raise ValueError("B-roll local asset path must stay under storage")
+    if len(path.parts) < 3 or path.parts[:2] not in AROLL_BROLL_LOCAL_BROLL_ROOTS:
+        raise ValueError(
+            "B-roll local asset path must stay under storage/local_videos, "
+            "storage/local_assets, or storage/local_images"
+        )
+    extension = path.suffix.lower().lstrip(".")
+    if extension not in ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        raise ValueError(f"B-roll local asset must use one of: {allowed}")
+    return path.as_posix()
+
+
+def _has_parent_path(path: PurePosixPath) -> bool:
+    return ".." in path.parts
+
+
+def normalize_aroll_broll_local_asset_paths(value: str | list[Any]) -> list[str]:
+    """Return safe storage-relative B-roll asset paths from UI text/list input."""
+
+    if isinstance(value, str):
+        raw_items = [
+            line.strip()
+            for line in value.replace(",", "\n").splitlines()
+            if line.strip()
+        ]
+    elif isinstance(value, list):
+        raw_items = []
+        for item in value:
+            if isinstance(item, dict):
+                raw_items.append(str(item.get("path") or "").strip())
+            else:
+                raw_items.append(str(item or "").strip())
+        raw_items = [item for item in raw_items if item]
+    else:
+        raw_items = []
+
+    normalized: list[str] = []
+    for item in raw_items:
+        safe = _validate_aroll_broll_local_asset_path(item)
+        if safe not in normalized:
+            normalized.append(safe)
+    return normalized
+
+
+def build_aroll_broll_payload_from_console(
+    config: dict[str, Any],
+    *,
+    job_id: str,
+    project_root: str | Path | None = None,
+    render_quality: str = "draft_720p",
+    title: str = "A-roll/B-roll",
+    task_id: str = "",
+    created_by: str = "render_console_ui",
+) -> dict[str, Any]:
+    """Build the guarded A-roll/B-roll payload used by Render Console."""
+
+    clean_job_id = _clean_text(job_id)
+    clean_task_id = _clean_text(task_id) or clean_job_id
+    if sanitize_job_id(clean_job_id) != clean_job_id:
+        raise ValueError("job_id must contain only letters, numbers, - or _")
+    if sanitize_job_id(clean_task_id) != clean_task_id:
+        raise ValueError("task_id must contain only letters, numbers, - or _")
+
+    payload = build_aroll_broll_queue_payload(
+        config,
+        job_id=clean_job_id,
+        project_root=project_root,
+        render_quality=render_quality,
+        title=title,
+        strict=True,
+    )
+    payload["task_id"] = clean_task_id
+    if created_by:
+        payload["created_by"] = _clean_text(created_by)
+    runner = payload.setdefault("runner", {})
+    if isinstance(runner, dict):
+        runner["task_id"] = clean_task_id
+        runner["created_by"] = payload.get("created_by", "")
+    return payload
+
+
+def enqueue_aroll_broll_from_console(
+    config: dict[str, Any],
+    *,
+    job_id: str,
+    project_root: str | Path | None = None,
+    queue_dir: str | Path = "storage/nightly_jobs/pending",
+    render_quality: str = "draft_720p",
+    title: str = "A-roll/B-roll",
+    task_id: str = "",
+    created_by: str = "render_console_ui",
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Create a pending A-roll/B-roll job through the Render Console guard."""
+
+    if not is_aroll_broll_queue_enabled(environ):
+        raise ValueError("A-roll/B-roll queue flag is disabled")
+
+    payload = build_aroll_broll_payload_from_console(
+        config,
+        job_id=job_id,
+        project_root=project_root,
+        render_quality=render_quality,
+        title=title,
+        task_id=task_id,
+        created_by=created_by,
+    )
+    path = enqueue_moneyprinter_payload(payload, queue_dir=queue_dir)
+    return {
+        "pending_path": path.as_posix(),
+        "job_id": payload.get("job_id"),
+        "task_id": payload.get("task_id"),
+        "render_mode": payload.get("render_mode"),
+        "payload": payload,
+    }
 
 
 def build_render_console_spec(

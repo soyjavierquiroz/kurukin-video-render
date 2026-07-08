@@ -24,7 +24,6 @@ from app.custom.aroll_broll_mode import (  # noqa: E402
     SUBTITLES_SOURCE_CUSTOM_SRT,
     SUBTITLES_SOURCE_NONE,
     build_aroll_broll_preview_timeline,
-    build_aroll_broll_queue_payload,
     build_default_aroll_broll_config,
     summarize_aroll_broll_config,
     validate_aroll_broll_config,
@@ -69,11 +68,14 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     ASSET_SOURCE_ASSET_HUB,
     ASSET_SOURCE_LOCAL,
     ASSET_SOURCE_STOCK,
+    build_aroll_broll_payload_from_console,
     build_operator_summary,
     build_render_console_spec,
     default_asset_hub_manifest_path,
+    enqueue_aroll_broll_from_console,
     get_manifest_summary_for_ui,
     list_local_storage_files,
+    normalize_aroll_broll_local_asset_paths,
     safe_relative_path,
     validate_and_build_payload_from_console_spec,
 )
@@ -383,6 +385,7 @@ def _initialize_form_state():
     st.session_state.setdefault("n_threads", 2)
     ar_defaults = build_default_aroll_broll_config()
     st.session_state.setdefault("aroll_broll_a_path", "")
+    st.session_state.setdefault("aroll_broll_local_assets", "")
     st.session_state.setdefault(
         "aroll_broll_source",
         ar_defaults["b_roll"]["source"],
@@ -894,6 +897,10 @@ def _current_aroll_broll_config():
         "aroll_broll_source",
         BROLL_SOURCE_ASSET_HUB_MANIFEST,
     )
+    if config["b_roll"]["source"] == BROLL_SOURCE_LOCAL_ASSETS:
+        config["b_roll"]["assets"] = normalize_aroll_broll_local_asset_paths(
+            st.session_state.get("aroll_broll_local_assets", "")
+        )
     config["b_roll"]["bundle_uid"] = st.session_state.get(
         "aroll_broll_bundle_uid",
         "",
@@ -983,13 +990,14 @@ def _aroll_broll_timeline_block(config):
 
 
 def _build_aroll_broll_queue_payload(config):
-    return build_aroll_broll_queue_payload(
+    return build_aroll_broll_payload_from_console(
         config,
         job_id=st.session_state["job_id"],
         project_root=ROOT_DIR,
         render_quality=st.session_state.get("aroll_broll_quality", "draft_720p"),
         title="A-roll/B-roll",
-        strict=True,
+        task_id=st.session_state["job_id"],
+        created_by=st.session_state.get("aroll_broll_created_by", "render_console_ui"),
     )
 
 
@@ -1028,6 +1036,14 @@ def _aroll_broll_view():
     left, right = st.columns([1, 1])
     with left:
         st.text_input(
+            "Identificador del video",
+            key="job_id",
+            help=(
+                "Se usa también como task_id para pruebas controladas "
+                "A-roll/B-roll."
+            ),
+        )
+        st.text_input(
             "Ruta del video A-roll local",
             key="aroll_broll_a_path",
             placeholder="storage/local_videos/presentador.mp4",
@@ -1048,6 +1064,19 @@ def _aroll_broll_view():
             st.text_input("Bundle UID", key="aroll_broll_bundle_uid")
         else:
             st.info("Assets locales queda preparado para la fase renderer.")
+            st.text_area(
+                "Rutas B-roll locales",
+                key="aroll_broll_local_assets",
+                placeholder=(
+                    "storage/local_videos/cutaway.mp4\n"
+                    "storage/local_assets/visual.mp4"
+                ),
+                help=(
+                    "Una ruta por línea bajo storage/local_videos, "
+                    "storage/local_assets o storage/local_images."
+                ),
+                height=88,
+            )
         st.selectbox("Layout preset", AROLL_BROLL_LAYOUTS, key="aroll_broll_layout")
         st.selectbox("Crop del presentador", AROLL_BROLL_CROPS, key="aroll_broll_crop")
 
@@ -1166,9 +1195,25 @@ def _aroll_broll_view():
                 )
             elif st.button("Enviar A-roll/B-roll a cola", key="aroll_broll_enqueue"):
                 try:
-                    path = enqueue_moneyprinter_payload(queue_payload)
-                    st.session_state["last_enqueued_job_id"] = queue_payload["job_id"]
-                    st.session_state["last_enqueued_pending_path"] = path.as_posix()
+                    result = enqueue_aroll_broll_from_console(
+                        validation["normalized"],
+                        job_id=st.session_state["job_id"],
+                        project_root=ROOT_DIR,
+                        render_quality=st.session_state.get(
+                            "aroll_broll_quality",
+                            "draft_720p",
+                        ),
+                        title="A-roll/B-roll",
+                        task_id=st.session_state["job_id"],
+                        created_by=st.session_state.get(
+                            "aroll_broll_created_by",
+                            "render_console_ui",
+                        ),
+                    )
+                    st.session_state["last_enqueued_job_id"] = str(result["job_id"])
+                    st.session_state["last_enqueued_pending_path"] = str(
+                        result["pending_path"]
+                    )
                     st.session_state["last_enqueued_at"] = datetime.now(
                         timezone.utc
                     ).isoformat()
@@ -1177,7 +1222,7 @@ def _aroll_broll_view():
                         "El render no empezó. El runner rechazará este modo hasta "
                         "la fase de integración E2E."
                     )
-                    st.caption(f"Pendiente protegido creado: {path}")
+                    st.caption(f"Pendiente protegido creado: {result['pending_path']}")
                 except Exception as exc:
                     _show_error(exc)
     else:

@@ -42,12 +42,15 @@ from app.custom.kurukin_render_console import (
     SOURCE_MODE_ASSET_HUB,
     SOURCE_MODE_LOCAL,
     SOURCE_MODE_STOCK,
+    build_aroll_broll_payload_from_console,
     build_operator_summary,
     build_render_console_spec,
     build_workflow_payload,
     default_asset_hub_manifest_path,
+    enqueue_aroll_broll_from_console,
     get_manifest_summary_for_ui,
     list_local_storage_files,
+    normalize_aroll_broll_local_asset_paths,
     safe_relative_path,
     validate_and_build_payload_from_console_spec,
 )
@@ -93,6 +96,121 @@ def make_spec(**overrides):
 
 
 class TestKurukinRenderConsole(unittest.TestCase):
+    def _aroll_broll_local_config(self, root: Path) -> dict:
+        aroll = root / "storage" / "local_videos" / "presenter.mp4"
+        broll = root / "storage" / "local_videos" / "cutaway.mp4"
+        aroll.parent.mkdir(parents=True, exist_ok=True)
+        broll.parent.mkdir(parents=True, exist_ok=True)
+        aroll.write_bytes(b"aroll")
+        broll.write_bytes(b"broll")
+        return {
+            "render_mode": "aroll_broll",
+            "a_roll": {
+                "source": "local_video",
+                "path": "storage/local_videos/presenter.mp4",
+                "audio_policy": "original",
+                "crop": "center",
+            },
+            "b_roll": {
+                "source": "local_assets",
+                "assets": ["storage/local_videos/cutaway.mp4"],
+                "clip_seconds": 2,
+                "frequency": "medium",
+                "audio_policy": "muted",
+                "image_motion": "slow_zoom_in",
+            },
+            "layout": {
+                "preset": "alternating_fullscreen",
+                "aspect_ratio": "9:16",
+                "speaker_position": "center",
+                "subtitle_safe_area": True,
+            },
+            "subtitles": {
+                "source": "none",
+                "provider": "none",
+                "custom_srt_path": "",
+            },
+        }
+
+    def test_normalize_aroll_broll_local_asset_paths_accepts_storage_paths(self):
+        paths = normalize_aroll_broll_local_asset_paths(
+            "storage/local_videos/cutaway.mp4\nstorage/local_images/still.png"
+        )
+
+        self.assertEqual(
+            paths,
+            [
+                "storage/local_videos/cutaway.mp4",
+                "storage/local_images/still.png",
+            ],
+        )
+
+    def test_normalize_aroll_broll_local_asset_paths_rejects_traversal(self):
+        with self.assertRaises(ValueError):
+            normalize_aroll_broll_local_asset_paths(
+                "storage/local_videos/../secret.mp4"
+            )
+
+    def test_build_aroll_broll_payload_from_console_sets_task_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = build_aroll_broll_payload_from_console(
+                self._aroll_broll_local_config(root),
+                job_id="aroll-broll-ui-smoke-004",
+                project_root=root,
+                render_quality="draft_720p",
+                task_id="aroll-broll-ui-smoke-004",
+                created_by="render_console_ui_smoke_004",
+            )
+
+        self.assertEqual(payload["render_mode"], "aroll_broll")
+        self.assertEqual(payload["job_id"], "aroll-broll-ui-smoke-004")
+        self.assertEqual(payload["task_id"], "aroll-broll-ui-smoke-004")
+        self.assertEqual(payload["created_by"], "render_console_ui_smoke_004")
+        self.assertEqual(
+            payload["aroll_broll"]["b_roll"]["assets"],
+            ["storage/local_videos/cutaway.mp4"],
+        )
+
+    def test_enqueue_aroll_broll_from_console_requires_queue_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_dir = root / "storage" / "nightly_jobs" / "pending"
+            with self.assertRaises(ValueError):
+                enqueue_aroll_broll_from_console(
+                    self._aroll_broll_local_config(root),
+                    job_id="aroll-broll-ui-smoke-004",
+                    project_root=root,
+                    queue_dir=queue_dir,
+                    environ={},
+                )
+
+        self.assertFalse(queue_dir.exists())
+
+    def test_enqueue_aroll_broll_from_console_writes_pending_with_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_dir = root / "storage" / "nightly_jobs" / "pending"
+            result = enqueue_aroll_broll_from_console(
+                self._aroll_broll_local_config(root),
+                job_id="aroll-broll-ui-smoke-004",
+                project_root=root,
+                queue_dir=queue_dir,
+                render_quality="draft_720p",
+                task_id="aroll-broll-ui-smoke-004",
+                created_by="render_console_ui_smoke_004",
+                environ={"KURUKIN_ENABLE_AROLL_BROLL_QUEUE": "1"},
+            )
+            pending_path = Path(result["pending_path"])
+            payload = json.loads(pending_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(pending_path.name.endswith("aroll-broll-ui-smoke-004.json"))
+        self.assertEqual(payload["render_mode"], "aroll_broll")
+        self.assertEqual(payload["job_id"], "aroll-broll-ui-smoke-004")
+        self.assertEqual(payload["task_id"], "aroll-broll-ui-smoke-004")
+        self.assertEqual(payload["video_resolution"], "draft_720p")
+        self.assertEqual(payload["created_by"], "render_console_ui_smoke_004")
+
     def test_webui_page_does_not_use_raw_structural_html(self):
         page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
             encoding="utf-8"
