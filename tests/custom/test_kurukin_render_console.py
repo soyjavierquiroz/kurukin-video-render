@@ -106,6 +106,14 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
         required_copy = (
             "Para crear tu primer video",
+            "Flujo completo",
+            "END_TO_END_FLOW_STEPS",
+            "Crear video",
+            "Validar",
+            "Ejecutar runner controlado",
+            "API Docker",
+            "Render",
+            "MP4",
             "Validar video no crea archivos ni renderiza",
             "Enviar a cola solo crea un trabajo pendiente",
             "Modo recomendado para prueba",
@@ -140,6 +148,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "No hay trabajos pendientes. Cuando envíes un video a cola, aparecerá aquí.",
             "Todavía no hay renders completados.",
             "Cuando envíes un video a cola y el runner lo procese, aparecerá aquí.",
+            "Después de Enviar a cola, ejecuta el runner controlado",
+            "haga el render y deje el MP4 en Resultados.",
         )
 
         for expected in required_copy:
@@ -206,6 +216,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "salta la ventana nocturna solo para una ejecución manual controlada",
             "CONTAINER_NIGHTLY_QUEUE_DIR",
             "CONTAINER_API_BASE_URL",
+            "API Docker",
             "Máximo de trabajos",
             "Esta acción sí ejecutará el runner",
             "Ejecución desde UI deshabilitada por seguridad.",
