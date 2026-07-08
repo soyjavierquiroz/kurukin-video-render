@@ -19,6 +19,7 @@ from app.custom.kurukin_job_adapter import (  # noqa: E402
     DEFAULT_LOCAL_VIDEOS_DIR,
 )
 from app.custom.kurukin_job_queue import (  # noqa: E402
+    CONTAINER_API_BASE_URL,
     CONTAINER_NIGHTLY_QUEUE_DIR,
     MANUAL_RUNNER_EXECUTION_MODE,
     MANUAL_RUNNER_MAX_JOBS,
@@ -1107,6 +1108,8 @@ def _controlled_runner_view():
                 "feature_enabled": feature_enabled,
                 "execution_mode": MANUAL_RUNNER_EXECUTION_MODE,
                 "max_jobs": MANUAL_RUNNER_MAX_JOBS,
+                "queue_dir": CONTAINER_NIGHTLY_QUEUE_DIR,
+                "api_base_url": CONTAINER_API_BASE_URL,
                 "required_confirm_text": RUNNER_CONFIRM_TEXT,
                 "required_queue_confirmation": RUNNER_QUEUE_CONFIRM_TEXT,
             }

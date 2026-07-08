@@ -8,8 +8,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_queue import (
+    CONTAINER_API_BASE_URL,
+    CONTAINER_NIGHTLY_QUEUE_DIR,
     KurukinJobQueueError,
     build_pending_job_filename,
+    build_safe_runner_command,
     enqueue_moneyprinter_payload,
     get_storage_summary,
     list_nightly_queue,
@@ -105,6 +108,33 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertGreaterEqual(summary["size_bytes"], 3)
         self.assertEqual(summary["total_size_bytes"], summary["size_bytes"])
         self.assertEqual(summary["subdirs"][0]["name"], "tasks")
+
+    def test_manual_runner_command_uses_fixed_container_api_url(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "nightly_runner.py").write_text(
+                "raise RuntimeError('must not execute')\n",
+                encoding="utf-8",
+            )
+
+            command = build_safe_runner_command(
+                root,
+                manual_override=True,
+                max_jobs=1,
+            )
+
+        self.assertIsInstance(command["command"], list)
+        self.assertIn("--max-jobs", command["command"])
+        self.assertIn("1", command["command"])
+        self.assertIn("--ignore-window", command["command"])
+        self.assertIn("--queue-dir", command["command"])
+        self.assertIn(CONTAINER_NIGHTLY_QUEUE_DIR, command["command"])
+        self.assertIn("--api-base-url", command["command"])
+        api_url = command["command"][command["command"].index("--api-base-url") + 1]
+        self.assertEqual(api_url, CONTAINER_API_BASE_URL)
+        self.assertEqual(command["api_base_url"], CONTAINER_API_BASE_URL)
+        self.assertNotIn("127.0.0.1:18080", api_url)
 
 
 if __name__ == "__main__":

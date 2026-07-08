@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
 from app.custom.kurukin_job_queue import (
+    CONTAINER_API_BASE_URL,
     CONTAINER_NIGHTLY_QUEUE_DIR,
     MANUAL_RUNNER_EXECUTION_MODE,
     MANUAL_RUNNER_MAX_JOBS,
@@ -50,6 +51,17 @@ from app.custom.kurukin_render_console import (
 
 
 BUNDLE_UID = "jab_b28367fb22d44a40bae507c175f464c4"
+EXPECTED_MANUAL_RUNNER_COMMAND = [
+    "python3",
+    "scripts/nightly_runner.py",
+    "--max-jobs",
+    "1",
+    "--ignore-window",
+    "--queue-dir",
+    CONTAINER_NIGHTLY_QUEUE_DIR,
+    "--api-base-url",
+    CONTAINER_API_BASE_URL,
+]
 
 
 def load_nightly_runner_module():
@@ -192,6 +204,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Procesar 1 trabajo ahora",
             "salta la ventana nocturna solo para una ejecución manual controlada",
             "CONTAINER_NIGHTLY_QUEUE_DIR",
+            "CONTAINER_API_BASE_URL",
             "Máximo de trabajos",
             "Esta acción sí ejecutará el runner",
             "Ejecución desde UI deshabilitada por seguridad.",
@@ -208,6 +221,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             self.assertIn(expected, page)
         for forbidden in forbidden_copy:
             self.assertNotIn(forbidden, page.lower())
+        self.assertNotIn('key="api_base_url"', page)
+        self.assertNotIn('key="runner_api_base_url"', page)
 
     def test_nightly_runner_parser_keeps_window_by_default(self):
         runner = load_nightly_runner_module()
@@ -879,19 +894,16 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIsInstance(command["command"], list)
         self.assertEqual(
             command["command"],
-            [
-                "python3",
-                "scripts/nightly_runner.py",
-                "--max-jobs",
-                "1",
-                "--ignore-window",
-                "--queue-dir",
-                CONTAINER_NIGHTLY_QUEUE_DIR,
-            ],
+            EXPECTED_MANUAL_RUNNER_COMMAND,
         )
         self.assertEqual(command["execution_mode"], MANUAL_RUNNER_EXECUTION_MODE)
         self.assertEqual(command["max_jobs"], MANUAL_RUNNER_MAX_JOBS)
         self.assertEqual(command["queue_dir"], CONTAINER_NIGHTLY_QUEUE_DIR)
+        self.assertEqual(command["api_base_url"], CONTAINER_API_BASE_URL)
+        self.assertIn("--api-base-url", command["command"])
+        api_url = command["command"][command["command"].index("--api-base-url") + 1]
+        self.assertEqual(api_url, CONTAINER_API_BASE_URL)
+        self.assertNotIn("127.0.0.1:18080", api_url)
         self.assertNotIn((root / "storage/nightly_jobs").as_posix(), command["command"])
 
     def _runner_request_fixture(self):
@@ -905,21 +917,14 @@ class TestKurukinRenderConsole(unittest.TestCase):
         command = {
             "available": True,
             "runner_name": "Nightly runner",
-            "command": [
-                "python3",
-                "scripts/nightly_runner.py",
-                "--max-jobs",
-                "1",
-                "--ignore-window",
-                "--queue-dir",
-                CONTAINER_NIGHTLY_QUEUE_DIR,
-            ],
+            "command": list(EXPECTED_MANUAL_RUNNER_COMMAND),
             "cwd": "/tmp/project",
             "reason": "ready",
             "confidence": "high",
             "execution_mode": MANUAL_RUNNER_EXECUTION_MODE,
             "max_jobs": MANUAL_RUNNER_MAX_JOBS,
             "queue_dir": CONTAINER_NIGHTLY_QUEUE_DIR,
+            "api_base_url": CONTAINER_API_BASE_URL,
         }
         return preflight, command
 
@@ -1003,6 +1008,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "--ignore-window",
             "--queue-dir",
             "/tmp/not-the-ui-queue",
+            "--api-base-url",
+            CONTAINER_API_BASE_URL,
         ]
         command["queue_dir"] = "/tmp/not-the-ui-queue"
 
@@ -1073,15 +1080,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(result["stdout"], "fake ok")
         self.assertEqual(
             calls[0]["command"],
-            [
-                "python3",
-                "scripts/nightly_runner.py",
-                "--max-jobs",
-                "1",
-                "--ignore-window",
-                "--queue-dir",
-                CONTAINER_NIGHTLY_QUEUE_DIR,
-            ],
+            EXPECTED_MANUAL_RUNNER_COMMAND,
         )
         self.assertEqual(calls[0]["timeout"], 5)
 
@@ -1107,7 +1106,14 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(len(at.exception), 0)
         rendered_text = "\n".join(
             str(item.value)
-            for collection in (at.title, at.markdown, at.info, at.warning)
+            for collection in (
+                at.title,
+                at.markdown,
+                at.info,
+                at.warning,
+                at.caption,
+                at.json,
+            )
             for item in collection
         )
         page = page_path.read_text(encoding="utf-8")
@@ -1121,6 +1127,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
         )
         self.assertIn("Máximo de trabajos", rendered_text)
         self.assertIn(CONTAINER_NIGHTLY_QUEUE_DIR, rendered_text)
+        self.assertIn(CONTAINER_API_BASE_URL, rendered_text)
+        self.assertIn("--api-base-url", rendered_text)
         self.assertNotIn("<div", rendered_text)
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
 

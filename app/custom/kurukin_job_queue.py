@@ -26,6 +26,7 @@ UI_RUNNER_ENABLED_VALUES = {"1", "true", "TRUE", "yes", "YES"}
 SAFE_RUNNER_RELATIVE_PATH = "scripts/nightly_runner.py"
 SAFE_RUNNER_COMMAND = ("python3", SAFE_RUNNER_RELATIVE_PATH)
 CONTAINER_NIGHTLY_QUEUE_DIR = "/MoneyPrinterTurbo/storage/nightly_jobs"
+CONTAINER_API_BASE_URL = "http://api:8080/api/v1"
 MANUAL_RUNNER_EXECUTION_MODE = "manual_now"
 DEFAULT_RUNNER_EXECUTION_MODE = "nightly_default"
 MANUAL_RUNNER_MAX_JOBS = 1
@@ -37,6 +38,8 @@ MANUAL_RUNNER_COMMAND = (
     "--ignore-window",
     "--queue-dir",
     CONTAINER_NIGHTLY_QUEUE_DIR,
+    "--api-base-url",
+    CONTAINER_API_BASE_URL,
 )
 CONTAINER_PROJECT_ROOT = Path("/MoneyPrinterTurbo")
 RUNNER_CONFIRM_TEXT = "EJECUTAR RENDER"
@@ -788,6 +791,7 @@ def build_safe_runner_command(
         ),
         "max_jobs": MANUAL_RUNNER_MAX_JOBS if manual_override else None,
         "queue_dir": CONTAINER_NIGHTLY_QUEUE_DIR if manual_override else None,
+        "api_base_url": CONTAINER_API_BASE_URL if manual_override else None,
     }
 
 
@@ -808,6 +812,22 @@ def _manual_runner_queue_dir_is_safe(command_info: dict[str, Any]) -> bool:
     return (
         command[option_index + 1] == CONTAINER_NIGHTLY_QUEUE_DIR
         and command_info.get("queue_dir") == CONTAINER_NIGHTLY_QUEUE_DIR
+    )
+
+
+def _manual_runner_api_base_url_is_safe(command_info: dict[str, Any]) -> bool:
+    command = command_info.get("command")
+    if not isinstance(command, list):
+        return False
+    try:
+        option_index = command.index("--api-base-url")
+    except ValueError:
+        return False
+    if option_index + 1 >= len(command):
+        return False
+    return (
+        command[option_index + 1] == CONTAINER_API_BASE_URL
+        and command_info.get("api_base_url") == CONTAINER_API_BASE_URL
     )
 
 
@@ -847,6 +867,8 @@ def validate_runner_execution_request(
         errors.append("Comando manual seguro incorrecto.")
     if not _manual_runner_queue_dir_is_safe(command_info):
         errors.append("Queue dir manual seguro incorrecto.")
+    if not _manual_runner_api_base_url_is_safe(command_info):
+        errors.append("API base URL manual seguro incorrecto.")
     if _has_critical_preflight_errors(checks):
         errors.append("Preflight tiene errores críticos.")
     if not understood:
@@ -881,6 +903,7 @@ def _is_safe_runner_command(command_info: dict[str, Any]) -> bool:
         and command_info.get("execution_mode") == MANUAL_RUNNER_EXECUTION_MODE
         and command_info.get("max_jobs") == MANUAL_RUNNER_MAX_JOBS
         and command_info.get("queue_dir") == CONTAINER_NIGHTLY_QUEUE_DIR
+        and command_info.get("api_base_url") == CONTAINER_API_BASE_URL
     )
 
 
