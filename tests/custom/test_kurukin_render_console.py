@@ -1396,7 +1396,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
         self.assertFalse((Path(tmp) / "storage" / "nightly_jobs" / "pending").exists())
 
-    def test_app_test_results_tab_highlights_last_enqueued_job_when_streamlit_available(self):
+    def test_app_test_results_and_queue_show_aroll_broll_completed_job_when_streamlit_available(self):
         try:
             from streamlit.testing.v1 import AppTest
         except ModuleNotFoundError:
@@ -1408,15 +1408,15 @@ class TestKurukinRenderConsole(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 tmp_path = Path(tmp)
-                task_id = "task-results-002"
-                job_id = "job-results-002"
+                task_id = "aroll-broll-runner-smoke-003"
+                job_id = "aroll-broll-runner-smoke-003"
                 task_dir = tmp_path / "storage" / "tasks" / task_id
                 completed_dir = (
                     tmp_path
                     / "storage"
                     / "nightly_jobs"
                     / "completed"
-                    / "done-job-results-002"
+                    / "20260708-164846-aroll-broll-runner-smoke-003"
                 )
                 task_dir.mkdir(parents=True)
                 completed_dir.mkdir(parents=True)
@@ -1424,20 +1424,38 @@ class TestKurukinRenderConsole(unittest.TestCase):
                     b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
                 )
                 (completed_dir / "job.json").write_text(
-                    json.dumps({"job_id": job_id}),
+                    json.dumps(
+                        {
+                            "job_id": job_id,
+                            "render_mode": "aroll_broll",
+                            "aroll_broll": {
+                                "layout": {"preset": "alternating_fullscreen"},
+                            },
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 (completed_dir / "submit-response.json").write_text(
-                    json.dumps({"data": {"task_id": task_id}, "status": 200}),
+                    json.dumps(
+                        {
+                            "data": {"task_id": task_id},
+                            "status": 200,
+                            "render_mode": "aroll_broll",
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 (completed_dir / "final-task.json").write_text(
                     json.dumps(
                         {
+                            "status": 200,
+                            "message": "success",
                             "data": {
                                 "state": "completed",
                                 "progress": 100,
                                 "task_id": task_id,
+                                "render_mode": "aroll_broll",
+                                "layout_preset": "alternating_fullscreen",
                                 "videos": [f"/tasks/{task_id}/final-1.mp4"],
                             }
                         }
@@ -1473,6 +1491,14 @@ class TestKurukinRenderConsole(unittest.TestCase):
             for item in collection
         )
         self.assertIn("Tu video más reciente", rendered_text)
+        self.assertIn("Cola y resultados", rendered_text)
+        self.assertIn("Jobs completados", rendered_text)
+        self.assertIn("Presentador + B-roll", rendered_text)
+        self.assertIn("Tipo: Presentador + B-roll", rendered_text)
+        self.assertIn("Layout: alternating_fullscreen", rendered_text)
+        self.assertIn("Audio: A-roll original", rendered_text)
+        self.assertIn("B-roll muted", rendered_text)
+        self.assertIn("Task ID: aroll-broll-runner-smoke-003", rendered_text)
         self.assertIn("Todos los videos generados", rendered_text)
         self.assertIn(job_id, rendered_text)
         self.assertIn(task_id, rendered_text)

@@ -14,6 +14,7 @@ from app.custom.kurukin_job_queue import (
     KurukinJobQueueError,
     build_pending_job_filename,
     build_safe_runner_command,
+    detect_render_mode_for_job,
     enqueue_moneyprinter_payload,
     find_result_for_job,
     get_recommended_result,
@@ -26,6 +27,7 @@ from app.custom.kurukin_job_queue import (
     list_render_tasks,
     read_video_bytes_for_download,
     sanitize_job_id,
+    summarize_render_mode,
     summarize_pending_job,
 )
 
@@ -39,6 +41,8 @@ class TestKurukinJobQueue(unittest.TestCase):
         task_id: str = "task-results-001",
         final_bytes: bytes | None = b"final",
         combined_bytes: bytes | None = None,
+        job_payload: dict | None = None,
+        submit_payload: dict | None = None,
         final_task_payload: dict | None = None,
     ) -> tuple[Path, Path, Path]:
         completed_dir = base / "storage" / "nightly_jobs" / "completed" / f"done-{job_id}"
@@ -47,11 +51,11 @@ class TestKurukinJobQueue(unittest.TestCase):
         completed_dir.mkdir(parents=True)
         task_dir.mkdir(parents=True)
         (completed_dir / "job.json").write_text(
-            json.dumps({"job_id": job_id}),
+            json.dumps(job_payload or {"job_id": job_id}),
             encoding="utf-8",
         )
         (completed_dir / "submit-response.json").write_text(
-            json.dumps({"data": {"task_id": task_id}, "status": 200}),
+            json.dumps(submit_payload or {"data": {"task_id": task_id}, "status": 200}),
             encoding="utf-8",
         )
         payload = final_task_payload or {
@@ -156,8 +160,17 @@ class TestKurukinJobQueue(unittest.TestCase):
             summary = summarize_pending_job(pending_path)
 
         self.assertTrue(summary["valid_json"])
+        self.assertEqual(summary["render_mode"], "aroll_broll")
+        self.assertEqual(summary["render_mode_label"], "Presentador + B-roll")
+        self.assertEqual(summary["layout_preset"], "alternating_fullscreen")
+        self.assertEqual(summary["audio_summary"], "A-roll original")
+        self.assertEqual(summary["broll_summary"], "B-roll muted")
         self.assertEqual(summary["asset_source"], "A-roll/B-roll")
         self.assertEqual(summary["subtitles"], "SRT propio")
+
+    def test_summarize_render_mode_returns_human_labels(self):
+        self.assertEqual(summarize_render_mode("normal"), "Video normal")
+        self.assertEqual(summarize_render_mode("aroll_broll"), "Presentador + B-roll")
 
     def test_list_nightly_queue_counts_groups(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -328,7 +341,91 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertEqual(jobs[0]["completed_dir"], completed_dir.name)
         self.assertEqual(jobs[0]["state"], "completed")
         self.assertEqual(jobs[0]["progress"], 100)
+        self.assertEqual(jobs[0]["render_mode"], "normal")
+        self.assertEqual(jobs[0]["render_mode_label"], "Video normal")
         self.assertEqual(jobs[0]["final_video_paths"], ["task-results-001/final-1.mp4"])
+
+    def test_list_completed_render_jobs_detects_aroll_broll_from_job_json(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                job_id="aroll-job-json",
+                task_id="task-job-json",
+                job_payload={
+                    "job_id": "aroll-job-json",
+                    "render_mode": "aroll_broll",
+                    "aroll_broll": {"layout": {"preset": "alternating_fullscreen"}},
+                },
+            )
+
+            jobs = list_completed_render_jobs(completed_dir.parent, tasks_dir=tasks_dir)
+
+        self.assertEqual(jobs[0]["render_mode"], "aroll_broll")
+        self.assertEqual(jobs[0]["render_mode_label"], "Presentador + B-roll")
+        self.assertEqual(jobs[0]["layout_preset"], "alternating_fullscreen")
+        self.assertEqual(jobs[0]["audio_summary"], "A-roll original")
+        self.assertEqual(jobs[0]["broll_summary"], "B-roll muted")
+
+    def test_list_completed_render_jobs_detects_aroll_broll_from_final_task_data(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                job_id="job-final-render-mode",
+                task_id="task-final-render-mode",
+                final_task_payload={
+                    "data": {
+                        "state": "completed",
+                        "progress": 100,
+                        "task_id": "task-final-render-mode",
+                        "render_mode": "aroll_broll",
+                        "layout_preset": "alternating_fullscreen",
+                        "videos": ["/tasks/task-final-render-mode/final-1.mp4"],
+                    }
+                },
+            )
+
+            jobs = list_completed_render_jobs(completed_dir.parent, tasks_dir=tasks_dir)
+
+        self.assertEqual(jobs[0]["render_mode"], "aroll_broll")
+        self.assertEqual(jobs[0]["render_mode_label"], "Presentador + B-roll")
+
+    def test_list_completed_render_jobs_detects_aroll_broll_from_submit_response(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                job_id="job-submit-render-mode",
+                task_id="task-submit-render-mode",
+                submit_payload={
+                    "status": 200,
+                    "render_mode": "aroll_broll",
+                    "data": {"task_id": "task-submit-render-mode"},
+                },
+            )
+
+            jobs = list_completed_render_jobs(completed_dir.parent, tasks_dir=tasks_dir)
+
+        self.assertEqual(jobs[0]["render_mode"], "aroll_broll")
+        self.assertEqual(jobs[0]["render_mode_label"], "Presentador + B-roll")
+
+    def test_list_completed_render_jobs_falls_back_to_aroll_broll_task_id(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                job_id="job-fallback",
+                task_id="aroll-broll-runner-smoke-003",
+            )
+
+            jobs = list_completed_render_jobs(completed_dir.parent, tasks_dir=tasks_dir)
+            detected_mode = detect_render_mode_for_job(completed_dir)
+
+        self.assertEqual(jobs[0]["task_id"], "aroll-broll-runner-smoke-003")
+        self.assertEqual(jobs[0]["render_mode"], "aroll_broll")
+        self.assertEqual(jobs[0]["render_mode_label"], "Presentador + B-roll")
+        self.assertEqual(detected_mode, "aroll_broll")
 
     def test_find_result_for_job_prefers_final_before_combined(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -349,6 +446,29 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertEqual(result["kind"], "final")
         self.assertEqual(result["file_name"], "final-1.mp4")
         self.assertEqual(result["completed_job_id"], "job-results-001")
+
+    def test_find_result_for_job_preserves_aroll_broll_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                job_id="job-aroll-result",
+                task_id="aroll-broll-result-001",
+                job_payload={"job_id": "job-aroll-result", "render_mode": "aroll_broll"},
+            )
+
+            result = find_result_for_job(
+                "job-aroll-result",
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["render_mode"], "aroll_broll")
+        self.assertEqual(result["render_mode_label"], "Presentador + B-roll")
+        self.assertEqual(result["layout_preset"], "alternating_fullscreen")
+        self.assertEqual(result["audio_summary"], "A-roll original")
+        self.assertEqual(result["broll_summary"], "B-roll muted")
 
     def test_find_result_for_job_returns_none_without_mp4(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
