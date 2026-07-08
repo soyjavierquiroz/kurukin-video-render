@@ -35,6 +35,16 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
             *extra,
         ]
 
+    def _execute_argv(self, root: Path, aroll: Path, broll: Path) -> list[str]:
+        return self._argv(
+            root,
+            aroll,
+            broll,
+            "--a-roll-duration-seconds",
+            "6",
+            "--execute",
+        )
+
     def _run_main(self, argv: list[str], *, runner=None) -> tuple[int, str, str]:
         stdout = StringIO()
         stderr = StringIO()
@@ -71,6 +81,50 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             self.assertFalse(output.exists())
 
+    def test_dry_run_payload_includes_output_path_and_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, broll = self._make_project_files(root)
+
+            code, stdout, stderr = self._run_main(self._argv(root, aroll, broll))
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertTrue(payload["output_path"].endswith("/final-1.mp4"))
+        self.assertIsInstance(payload["command"], list)
+
+    def test_dry_run_payload_includes_planned_aroll_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, broll = self._make_project_files(root)
+
+            code, stdout, stderr = self._run_main(self._argv(root, aroll, broll))
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["a_roll_duration_seconds"], 6.0)
+        self.assertLessEqual(payload["timeline_duration_seconds"], 6.0)
+
+    def test_dry_run_command_contains_duration_limit_without_real_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, broll = self._make_project_files(root)
+
+            def runner(*args, **kwargs):
+                raise AssertionError("runner should not execute in dry-run")
+
+            code, stdout, stderr = self._run_main(
+                self._argv(root, aroll, broll),
+                runner=runner,
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        command = payload["command"]
+        self.assertIn("-t", command)
+        self.assertEqual(command[command.index("-t") + 1], "6")
+        self.assertLess(command.index("-t"), command.index(payload["output_path"]))
+
     def test_command_is_list_of_strings(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -99,7 +153,7 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
                 clear=True,
             ):
                 code, stdout, stderr = self._run_main(
-                    self._argv(root, aroll, broll, "--execute"),
+                    self._execute_argv(root, aroll, broll),
                     runner=runner,
                 )
 
@@ -107,17 +161,50 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertFalse(json.loads(stdout)["dry_run"])
 
+    def test_execute_fake_runner_failure_includes_stderr_and_returncode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, broll = self._make_project_files(root)
+
+            def runner(command, cwd, timeout):
+                return {"returncode": 1, "stdout": "partial", "stderr": "ffmpeg failed"}
+
+            with mock.patch.dict(
+                os.environ,
+                {smoke.DIRECT_RENDER_ENV: "1"},
+                clear=True,
+            ):
+                code, stdout, stderr = self._run_main(
+                    self._execute_argv(root, aroll, broll),
+                    runner=runner,
+                )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["returncode"], 1)
+        self.assertEqual(payload["stdout"], "partial")
+        self.assertEqual(payload["stderr"], "ffmpeg failed")
+
     def test_execute_without_env_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             aroll, broll = self._make_project_files(root)
+            calls = []
+
+            def runner(command, cwd, timeout):
+                calls.append((command, cwd, timeout))
+                return {"returncode": 0, "stdout": "ok", "stderr": ""}
+
             with mock.patch.dict(os.environ, {}, clear=True):
                 code, stdout, stderr = self._run_main(
-                    self._argv(root, aroll, broll, "--execute")
+                    self._execute_argv(root, aroll, broll),
+                    runner=runner,
                 )
 
         self.assertEqual(code, 2)
         self.assertEqual(stdout, "")
+        self.assertEqual(calls, [])
         self.assertIn(
             "Direct A-roll/B-roll render execution is disabled",
             stderr,

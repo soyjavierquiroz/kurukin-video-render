@@ -56,6 +56,8 @@ activar todavia la cola desde la UI.
 - El comando ffmpeg se construye como lista segura, sin `shell=True`.
 - La fase actual implementa renderer core, ffprobe/ffmpeg helpers y dry-run.
 - La cola solo crea pending protegido para A-roll/B-roll; el runner no lo ejecuta.
+- La duracion final debe ser igual a la duracion del A-roll.
+- El timeline y el comando ffmpeg se clamplean a la duracion del A-roll.
 
 ## Queue integration protegida
 
@@ -87,6 +89,10 @@ de direct render A-roll/B-roll.
 - En dry-run no crea task dir, pending job ni archivo MP4.
 - `--execute` requiere `KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER=1`; sin ese
   flag aborta con `Direct A-roll/B-roll render execution is disabled`.
+- En execute crea el directorio padre del output antes de invocar ffmpeg.
+- Los failures imprimen `returncode`, `stdout` y `stderr` en el JSON para
+  diagnostico.
+- Una prueba real fallida no debe repetirse sin nueva autorizacion explicita.
 
 La siguiente fase requiere autorizacion explicita para ejecutar ffmpeg real con
 un fixture pequeno y controlado.

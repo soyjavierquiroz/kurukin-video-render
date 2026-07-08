@@ -44,7 +44,11 @@ class TestArollBrollRenderer(unittest.TestCase):
             b_roll_assets=assets,
             output_path=build_aroll_broll_output_path("task_001", root),
             timeline=timeline,
+            aroll_duration_seconds=18,
         )
+
+    def _segment_duration_sum(self, timeline):
+        return sum(float(item["end"]) - float(item["start"]) for item in timeline)
 
     def test_build_ffprobe_duration_command_returns_list_with_ffprobe(self):
         command = build_ffprobe_duration_command("/tmp/video.mp4")
@@ -151,6 +155,63 @@ class TestArollBrollRenderer(unittest.TestCase):
 
         self.assertLessEqual(max(item["end"] for item in timeline), 11)
 
+    def test_timeline_clamps_final_broll_to_aroll_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, broll, _ = self._make_project_files(root)
+            timeline = build_alternating_fullscreen_timeline(
+                6,
+                [ArollBrollAsset(path=broll, kind="video")],
+                4,
+                "medium",
+            )
+
+        self.assertEqual(timeline[-1]["visual"], "b_roll")
+        self.assertEqual(timeline[-1]["start"], 5.0)
+        self.assertEqual(timeline[-1]["end"], 6.0)
+
+    def test_timeline_does_not_produce_zero_or_negative_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, broll, _ = self._make_project_files(root)
+            timeline = build_alternating_fullscreen_timeline(
+                6,
+                [ArollBrollAsset(path=broll, kind="video")],
+                4,
+                "medium",
+            )
+
+        self.assertTrue(timeline)
+        self.assertTrue(
+            all(float(item["end"]) > float(item["start"]) for item in timeline)
+        )
+
+    def test_timeline_for_six_second_aroll_medium_frequency_ends_within_aroll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, broll, _ = self._make_project_files(root)
+            timeline = build_alternating_fullscreen_timeline(
+                6,
+                [ArollBrollAsset(path=broll, kind="video")],
+                4,
+                "medium",
+            )
+
+        self.assertLessEqual(max(item["end"] for item in timeline), 6)
+
+    def test_timeline_segment_duration_sum_does_not_exceed_aroll_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, broll, _ = self._make_project_files(root)
+            timeline = build_alternating_fullscreen_timeline(
+                6,
+                [ArollBrollAsset(path=broll, kind="video")],
+                4,
+                "medium",
+            )
+
+        self.assertLessEqual(self._segment_duration_sum(timeline), 6)
+
     def test_command_builder_returns_list_not_string(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = build_alternating_fullscreen_ffmpeg_command(
@@ -192,6 +253,50 @@ class TestArollBrollRenderer(unittest.TestCase):
 
         self.assertIn("0:a?", command)
 
+    def test_command_includes_aroll_duration_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+            command = build_alternating_fullscreen_ffmpeg_command(plan)
+
+        self.assertIn("-t", command)
+        self.assertEqual(command[command.index("-t") + 1], "18")
+
+    def test_command_duration_limit_appears_before_output_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+            command = build_alternating_fullscreen_ffmpeg_command(plan)
+
+        self.assertLess(command.index("-t"), command.index(plan.output_path.as_posix()))
+
+    def test_command_uses_aroll_duration_when_timeline_exceeds_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, broll, _ = self._make_project_files(root)
+            plan = ArollBrollRenderPlan(
+                a_roll_path=aroll,
+                b_roll_assets=[ArollBrollAsset(path=broll, kind="video")],
+                output_path=build_aroll_broll_output_path("task_001", root),
+                timeline=[
+                    {"start": 0, "end": 5, "visual": "a_roll"},
+                    {
+                        "start": 5,
+                        "end": 9,
+                        "visual": "b_roll",
+                        "broll_index": 0,
+                    },
+                    {"start": 9, "end": 12, "visual": "a_roll"},
+                ],
+                aroll_duration_seconds=6,
+            )
+
+            command = build_alternating_fullscreen_ffmpeg_command(plan)
+            filtergraph = command[command.index("-filter_complex") + 1]
+
+        self.assertEqual(command[command.index("-t") + 1], "6")
+        self.assertIn("trim=start=0:end=5", filtergraph)
+        self.assertIn("trim=start=0:duration=1", filtergraph)
+        self.assertNotIn("trim=start=9:end=12", filtergraph)
+
     def test_command_does_not_map_broll_audio(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = build_alternating_fullscreen_ffmpeg_command(
@@ -222,6 +327,16 @@ class TestArollBrollRenderer(unittest.TestCase):
         self.assertTrue(result["dry_run"])
         self.assertIsNone(result["returncode"])
 
+    def test_run_aroll_broll_render_dry_run_does_not_create_output_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+            output_parent = plan.output_path.parent
+
+            result = run_aroll_broll_render(plan, dry_run=True)
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(output_parent.exists())
+
     def test_run_aroll_broll_render_with_fake_runner_uses_command_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             calls = []
@@ -236,6 +351,48 @@ class TestArollBrollRenderer(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIsInstance(calls[0][0], list)
         self.assertEqual(result["stdout"], "ok")
+
+    def test_run_aroll_broll_render_execute_creates_output_parent_before_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+            output_parent = plan.output_path.parent
+
+            def runner(command, cwd, timeout):
+                self.assertTrue(output_parent.exists())
+                return {"returncode": 0, "stdout": "ok", "stderr": ""}
+
+            result = run_aroll_broll_render(plan, runner=runner)
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(output_parent.exists())
+
+    def test_run_aroll_broll_render_execute_success_returns_ok_true(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+
+            def runner(command, cwd, timeout):
+                return {"returncode": 0, "stdout": "done", "stderr": ""}
+
+            result = run_aroll_broll_render(plan, runner=runner)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(result["returncode"], 0)
+
+    def test_run_aroll_broll_render_execute_failure_returns_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+
+            def runner(command, cwd, timeout):
+                return {"returncode": 1, "stdout": "partial", "stderr": "boom"}
+
+            result = run_aroll_broll_render(plan, runner=runner)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["stdout"], "partial")
+        self.assertEqual(result["stderr"], "boom")
 
     def test_output_path_stays_under_task_final_mp4(self):
         with tempfile.TemporaryDirectory() as tmp:
