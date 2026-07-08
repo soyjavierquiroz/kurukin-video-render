@@ -26,22 +26,22 @@ El primer layout real de renderer sera `alternating_fullscreen`.
 
 ## MVP por fases
 
-Fase actual: foundation/schema/UI skeleton.
+Fase actual: runner handler con tests/fakes.
 
 - Helper puro en `app/custom/aroll_broll_mode.py`.
 - Validacion de rutas y defaults seguros.
 - Timeline conceptual sin leer video real.
 - Skeleton en Render Console.
-- Boton de cola deshabilitado para A-roll/B-roll.
-- Tests unitarios y AppTest.
+- Cola protegida por flag para A-roll/B-roll.
+- Renderer directo core para `alternating_fullscreen`.
+- Handler de runner protegido por flag, validado con fake renderer.
+- Tests unitarios y AppTest sin runner real ni ffmpeg real.
 
-Siguiente fase: renderer `alternating_fullscreen`.
+Siguiente fase: E2E controlado con runner smoke 003.
 
-- Leer duracion real del A-roll.
-- Usar audio original del A-roll como audio principal.
-- Componer visualmente A-roll y B-roll.
-- Conectar subtitles desde audio del A-roll o SRT.
-- Habilitar enqueue solo cuando el renderer soporte este payload.
+- Ejecutar un pending fixture pequeno con runner real solo bajo autorizacion.
+- Verificar output real y limpieza de cola.
+- Mantener ffmpeg real fuera de esta fase.
 
 ## Renderer alternating_fullscreen
 
@@ -54,8 +54,9 @@ activar todavia la cola desde la UI.
 - El output objetivo es vertical 9:16, por defecto 720x1280.
 - El crop/fit usa center crop seguro para normalizar cada segmento.
 - El comando ffmpeg se construye como lista segura, sin `shell=True`.
-- La fase actual implementa renderer core, ffprobe/ffmpeg helpers y dry-run.
-- La cola solo crea pending protegido para A-roll/B-roll; el runner no lo ejecuta.
+- La fase actual implementa renderer core, ffprobe/ffmpeg helpers, dry-run y
+  handler de runner con fakes.
+- La cola solo crea pending protegido para A-roll/B-roll con flag explicito.
 - La duracion final debe ser igual a la duracion del A-roll.
 - El timeline y el comando ffmpeg se clamplean a la duracion del A-roll.
 
@@ -71,11 +72,30 @@ En reposo/default, Render Console no crea pending A-roll/B-roll.
 - Render Console solo encola despues de validacion estricta y flag explicito.
 - La ejecucion esta protegida por `KURUKIN_ENABLE_AROLL_BROLL_RENDERER`.
 - Con renderer flag off, el runner rechaza antes de llamar `/api/v1/videos`.
-- Esta fase no ejecuta renderer real ni crea task.
-- La proteccion existe hasta conectar el handler real.
+- Con renderer flag on, el runner usa el renderer directo interno y no llama
+  `/api/v1/videos`.
+- Esta fase implementa handler con tests/fakes; no ejecuta runner real ni
+  ffmpeg real.
 
-Siguiente fase: conectar handler real y validar E2E con un fixture pequeno y
-controlado.
+Siguiente fase: validar E2E con runner smoke 003 y un fixture pequeno y
+controlado, solo con autorizacion explicita.
+
+## Runner handler
+
+El runner detecta `render_mode="aroll_broll"` antes del flujo normal de API.
+
+- Con `KURUKIN_ENABLE_AROLL_BROLL_RENDERER` apagado, rechaza antes de API.
+- Con `KURUKIN_ENABLE_AROLL_BROLL_RENDERER=1`, usa el renderer directo interno.
+- El handler no llama `/api/v1/videos`.
+- El output esperado es `storage/tasks/<task_id>/final-1.mp4`.
+- Escribe `submit-response.json` con `status: 200`, `message: success` y
+  `data.task_id`.
+- Escribe `final-task.json` compatible con `state=1`, `progress=100` y
+  `videos=["/tasks/<task_id>/final-1.mp4"]`.
+- En failure escribe `error.json` con `type`, `error`, `returncode`, `stdout`,
+  `stderr`, `timestamp` y `render_mode`.
+- Esta fase solo valida el handler con tempfile, fake duration y fake renderer.
+  El E2E real con runner queda para la siguiente rama.
 
 ## Direct render smoke
 
@@ -107,4 +127,4 @@ un fixture pequeno y controlado.
 - Manifests de Asset Hub deben vivir bajo `/data/job-assets/<bundle_uid>/manifests/renderer-manifest.json`.
 - En reposo/default no crea pending; solo puede crearlo con flag explicito de
   cola para pruebas controladas.
-- La fase actual no ejecuta renderer real ni crea task.
+- La fase actual no ejecuta runner real ni ffmpeg real.
