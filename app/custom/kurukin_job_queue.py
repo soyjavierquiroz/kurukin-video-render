@@ -324,7 +324,39 @@ def _extract_layout_preset(*payloads: dict[str, Any] | None) -> str:
     return AROLL_BROLL_DEFAULT_LAYOUT
 
 
-def _render_mode_metadata(render_mode: str, *, layout_preset: str = "") -> dict[str, str]:
+def _extract_broll_asset_count(*payloads: dict[str, Any] | None) -> int | None:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        candidates = (
+            payload.get("b_roll_asset_count"),
+            _nested_get(payload, "data", "b_roll_asset_count"),
+            _nested_get(payload, "task", "b_roll_asset_count"),
+        )
+        for value in candidates:
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                return count
+
+        asset_lists = (
+            _nested_get(payload, "aroll_broll", "b_roll", "assets"),
+            _nested_get(payload, "data", "aroll_broll", "b_roll", "assets"),
+        )
+        for assets in asset_lists:
+            if isinstance(assets, list) and assets:
+                return len(assets)
+    return None
+
+
+def _render_mode_metadata(
+    render_mode: str,
+    *,
+    layout_preset: str = "",
+    b_roll_asset_count: int | None = None,
+) -> dict[str, Any]:
     normalized = _normalize_render_mode(render_mode)
     metadata = {
         "render_mode": normalized,
@@ -338,6 +370,8 @@ def _render_mode_metadata(render_mode: str, *, layout_preset: str = "") -> dict[
                 "broll_summary": AROLL_BROLL_BROLL_SUMMARY,
             }
         )
+        if b_roll_asset_count is not None and b_roll_asset_count > 0:
+            metadata["b_roll_asset_count"] = b_roll_asset_count
     return metadata
 
 
@@ -505,6 +539,7 @@ def summarize_pending_job(path: str | Path) -> dict[str, Any]:
         _render_mode_metadata(
             render_mode,
             layout_preset=_extract_layout_preset(payload),
+            b_roll_asset_count=_extract_broll_asset_count(payload),
         )
     )
     return summary
@@ -673,6 +708,7 @@ def _summarize_final_task(task_dir: Path) -> dict[str, Any]:
         _render_mode_metadata(
             render_mode,
             layout_preset=_extract_layout_preset(payload),
+            b_roll_asset_count=_extract_broll_asset_count(payload),
         )
     )
     return summary
@@ -810,6 +846,13 @@ def _completed_job_metadata_by_task(
                     render_result_payload,
                     error_payload,
                 ),
+                b_roll_asset_count=_extract_broll_asset_count(
+                    job_payload,
+                    submit_payload,
+                    final_task_payload,
+                    render_result_payload,
+                    error_payload,
+                ),
             )
         )
         by_task[task_id] = metadata
@@ -887,6 +930,11 @@ def list_completed_render_jobs(
         mode_metadata = _render_mode_metadata(
             render_mode,
             layout_preset=_extract_layout_preset(
+                job_payload,
+                submit_payload,
+                final_task_payload,
+            ),
+            b_roll_asset_count=_extract_broll_asset_count(
                 job_payload,
                 submit_payload,
                 final_task_payload,
@@ -1009,6 +1057,9 @@ def list_rendered_videos(
                 _render_mode_metadata(
                     render_mode,
                     layout_preset=str(final_task_summary.get("layout_preset") or ""),
+                    b_roll_asset_count=_extract_broll_asset_count(
+                        final_task_summary
+                    ),
                 )
             )
             metadata = completed_metadata.get(task_id)
@@ -1302,6 +1353,7 @@ def list_task_summaries(tasks_dir: str | Path | None = None) -> list[dict[str, A
         mode_metadata = _render_mode_metadata(
             render_mode,
             layout_preset=str(final_task_summary.get("layout_preset") or ""),
+            b_roll_asset_count=_extract_broll_asset_count(final_task_summary),
         )
         for output in outputs:
             output.update(mode_metadata)

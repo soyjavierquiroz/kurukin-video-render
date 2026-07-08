@@ -118,6 +118,16 @@ Runner E2E PASS:
 - Preview/download funcionan desde storage/tasks
 - Listar resultados no ejecuta runner/render/API
 
+## Multiple B-roll assets
+
+- El MVP acepta entre 1 y 8 paths B-roll locales.
+- Render Console acepta uno o varios paths, uno por linea.
+- Los assets se rotan en orden dentro de `alternating_fullscreen`.
+- El audio final sigue siendo el A-roll original y el audio B-roll no se mapea.
+- La duracion final sigue clampleada a la duracion del A-roll.
+- No existe seleccion semantica en esta fase.
+- No se llama Asset Hub API.
+
 ## Guardrails
 
 - MPT no llama Asset Hub API para A-roll/B-roll

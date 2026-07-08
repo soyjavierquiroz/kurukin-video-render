@@ -61,6 +61,7 @@ FREQUENCY_INTERVAL_SECONDS = {
     "medium": 10.0,
     "high": 6.0,
 }
+MAX_BROLL_ASSETS = 8
 
 
 def build_default_aroll_broll_config() -> dict[str, Any]:
@@ -99,6 +100,27 @@ def build_default_aroll_broll_config() -> dict[str, Any]:
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def normalize_broll_asset_values(value: Any) -> list[str]:
+    """Normalize UI/config B-roll path values, preserving first-seen order."""
+
+    if isinstance(value, str):
+        raw_items: list[Any] = value.splitlines()
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = []
+
+    normalized: list[str] = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            text = _clean_text(item.get("path"))
+        else:
+            text = _clean_text(item)
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
 
 
 def _merge_default_config(config: Any) -> dict[str, Any]:
@@ -341,6 +363,32 @@ def validate_aroll_broll_config(
             )
         elif strict:
             errors.append("b_roll.manifest_path is required for Asset Hub B-roll")
+    elif b_roll_source == BROLL_SOURCE_LOCAL_ASSETS:
+        asset_values = normalize_broll_asset_values(b_roll.get("assets"))
+        if not asset_values:
+            errors.append("b_roll.assets must include at least one local asset")
+        if len(asset_values) > MAX_BROLL_ASSETS:
+            errors.append(
+                f"b_roll.assets cannot include more than {MAX_BROLL_ASSETS} assets"
+            )
+
+        normalized_assets: list[str] = []
+        for index, asset_value in enumerate(asset_values[:MAX_BROLL_ASSETS]):
+            normalized_path = _normalize_local_path(
+                asset_value,
+                project_root=root,
+                roots=(
+                    *LOCAL_VIDEO_ROOTS,
+                    "storage/local_images",
+                ),
+                label=f"b_roll.assets[{index}]",
+                strict=strict,
+                errors=errors,
+                warnings=warnings,
+            )
+            if normalized_path and normalized_path not in normalized_assets:
+                normalized_assets.append(normalized_path)
+        b_roll["assets"] = normalized_assets
 
     return {
         "ok": not errors,
@@ -489,10 +537,11 @@ def build_aroll_broll_queue_payload(
 
     normalized = validation["normalized"]
     subtitles_source = normalized.get("subtitles", {}).get("source")
+    b_roll_assets = normalized.get("b_roll", {}).get("assets")
     video_title = _clean_text(title) or "A-roll/B-roll"
     quality = _clean_text(render_quality) or "draft_720p"
 
-    return {
+    payload = {
         "job_id": clean_job_id,
         "description": "A-roll/B-roll queued job; renderer execution disabled",
         "render_mode": RENDER_MODE_AROLL_BROLL,
@@ -513,3 +562,6 @@ def build_aroll_broll_queue_payload(
             ),
         },
     }
+    if isinstance(b_roll_assets, list) and b_roll_assets:
+        payload["b_roll_asset_count"] = len(b_roll_assets)
+    return payload

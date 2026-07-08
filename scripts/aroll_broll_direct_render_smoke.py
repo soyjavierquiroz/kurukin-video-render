@@ -24,6 +24,10 @@ from app.custom.aroll_broll_renderer import (  # noqa: E402
     validate_aroll_path,
     validate_broll_path,
 )
+from app.custom.aroll_broll_mode import (  # noqa: E402
+    MAX_BROLL_ASSETS,
+    normalize_broll_asset_values,
+)
 
 
 DIRECT_RENDER_ENV = "KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER"
@@ -107,8 +111,16 @@ def build_smoke_plan(
 ) -> tuple[ArollBrollRenderPlan, list[str]]:
     project_root = Path(args.project_root).resolve(strict=False)
     a_roll_path = validate_aroll_path(args.a_roll, project_root=project_root)
+    b_roll_paths = normalize_broll_asset_values(args.b_roll)
+    if not b_roll_paths:
+        raise ArollBrollRendererError("at least one B-roll asset is required")
+    if len(b_roll_paths) > MAX_BROLL_ASSETS:
+        raise ArollBrollRendererError(
+            f"B-roll supports at most {MAX_BROLL_ASSETS} assets"
+        )
     b_roll_assets = [
-        validate_broll_path(path, project_root=project_root) for path in args.b_roll
+        validate_broll_path(path, project_root=project_root)
+        for path in b_roll_paths
     ]
     output_path = build_aroll_broll_output_path(args.task_id, project_root=project_root)
     aroll_duration_seconds, warnings = _plan_duration_seconds(
@@ -154,6 +166,9 @@ def run_smoke(
         "a_roll_path": plan.a_roll_path.as_posix(),
         "a_roll_duration_seconds": plan.aroll_duration_seconds,
         "b_roll_count": len(plan.b_roll_assets),
+        "b_roll_asset_count": len(plan.b_roll_assets),
+        "b_roll_assets": [asset.path.as_posix() for asset in plan.b_roll_assets],
+        "timeline": plan.timeline,
         "timeline_duration_seconds": timeline_duration,
         "output_path": result["output_path"],
         "command": result["command"],

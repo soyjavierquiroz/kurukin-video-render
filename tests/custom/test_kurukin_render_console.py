@@ -169,8 +169,59 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(payload["created_by"], "render_console_ui_smoke_004")
         self.assertEqual(
             payload["aroll_broll"]["b_roll"]["assets"],
-            ["storage/local_videos/cutaway.mp4"],
+            [(root / "storage" / "local_videos" / "cutaway.mp4").as_posix()],
         )
+        self.assertEqual(payload["b_roll_asset_count"], 1)
+
+    def test_enqueue_aroll_broll_from_console_accepts_asset_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._aroll_broll_local_config(root)
+            second = root / "storage" / "local_images" / "still.png"
+            second.parent.mkdir(parents=True)
+            second.write_bytes(b"broll")
+            config["b_roll"]["assets"] = [
+                "storage/local_videos/cutaway.mp4",
+                "storage/local_images/still.png",
+            ]
+            result = enqueue_aroll_broll_from_console(
+                config,
+                job_id="aroll-broll-list",
+                project_root=root,
+                queue_dir=root / "pending",
+                environ={"KURUKIN_ENABLE_AROLL_BROLL_QUEUE": "1"},
+            )
+            payload = json.loads(
+                Path(result["pending_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["b_roll_asset_count"], 2)
+        self.assertEqual(len(payload["aroll_broll"]["b_roll"]["assets"]), 2)
+
+    def test_enqueue_aroll_broll_from_console_accepts_multiline_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._aroll_broll_local_config(root)
+            second = root / "storage" / "local_assets" / "second.mp4"
+            second.parent.mkdir(parents=True, exist_ok=True)
+            second.write_bytes(b"broll")
+            config["b_roll"]["assets"] = (
+                "\nstorage/local_videos/cutaway.mp4\n\n"
+                "storage/local_assets/second.mp4\n"
+            )
+            result = enqueue_aroll_broll_from_console(
+                config,
+                job_id="aroll-broll-multiline",
+                project_root=root,
+                queue_dir=root / "pending",
+                environ={"KURUKIN_ENABLE_AROLL_BROLL_QUEUE": "1"},
+            )
+            payload = json.loads(
+                Path(result["pending_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["b_roll_asset_count"], 2)
+        self.assertEqual(len(payload["aroll_broll"]["b_roll"]["assets"]), 2)
 
     def test_enqueue_aroll_broll_from_console_requires_queue_flag(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,7 +331,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Cola A-roll/B-roll: protegida",
             "Activa KURUKIN_ENABLE_AROLL_BROLL_QUEUE=1 solo para pruebas controladas.",
             "Renderer preparado: alternating_fullscreen",
-            "B-roll assets estimados desde manifest",
+            "Uno o varios paths B-roll locales",
+            "B-roll assets:",
             "El runner no lo renderiza todavía",
             "aroll_broll_enqueue",
             "aroll_broll_enqueue_disabled",
@@ -1386,6 +1438,13 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 at.run(timeout=30)
                 at.selectbox(key="video_type_label").set_value("Presentador + B-roll")
                 at.run(timeout=30)
+                at.radio(key="aroll_broll_source_label").set_value("Assets locales")
+                at.run(timeout=30)
+                at.text_area(key="aroll_broll_local_assets").set_value(
+                    "storage/local_videos/one.mp4\n"
+                    "storage/local_assets/two.mp4"
+                )
+                at.run(timeout=30)
                 at.button(key="aroll_broll_validate").click()
                 at.run(timeout=30)
                 pending_dir_exists = (
@@ -1420,6 +1479,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn("Presentador + B-roll", rendered_text)
         self.assertIn("El audio del presentador manda", rendered_text)
         self.assertIn("B-roll muted", rendered_text)
+        self.assertIn("B-roll assets: 2", rendered_text)
         self.assertIn("alternating_fullscreen", rendered_text)
         self.assertIn(
             "Renderer MVP planeado: alternating_fullscreen",
@@ -1548,6 +1608,13 @@ class TestKurukinRenderConsole(unittest.TestCase):
                             "render_mode": "aroll_broll",
                             "aroll_broll": {
                                 "layout": {"preset": "alternating_fullscreen"},
+                                "b_roll": {
+                                    "assets": [
+                                        "storage/local_assets/one.mp4",
+                                        "storage/local_assets/two.mp4",
+                                        "storage/local_assets/three.mp4",
+                                    ]
+                                },
                             },
                         }
                     ),
@@ -1616,6 +1683,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn("Layout: alternating_fullscreen", rendered_text)
         self.assertIn("Audio: A-roll original", rendered_text)
         self.assertIn("B-roll muted", rendered_text)
+        self.assertIn("B-roll assets: 3", rendered_text)
         self.assertIn("Task ID: aroll-broll-runner-smoke-003", rendered_text)
         self.assertIn("Todos los videos generados", rendered_text)
         self.assertIn(job_id, rendered_text)

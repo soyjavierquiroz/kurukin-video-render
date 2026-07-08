@@ -25,6 +25,7 @@ from app.custom.aroll_broll_mode import (  # noqa: E402
     SUBTITLES_SOURCE_NONE,
     build_aroll_broll_preview_timeline,
     build_default_aroll_broll_config,
+    normalize_broll_asset_values,
     summarize_aroll_broll_config,
     validate_aroll_broll_config,
 )
@@ -936,6 +937,9 @@ def _aroll_broll_summary_block(config):
     cols[3].metric("Layout", summary["layout"])
     cols[4].metric("Crop", summary["crop"])
     st.caption(summary["renderer"])
+    asset_count = len(config.get("b_roll", {}).get("assets") or [])
+    if asset_count:
+        st.caption(f"B-roll assets: {asset_count}")
 
 
 def _aroll_broll_manifest_assets_block(config):
@@ -953,7 +957,7 @@ def _aroll_broll_manifest_assets_block(config):
     except (ArollBrollRendererError, OSError, json.JSONDecodeError):
         return
     if result.get("assets"):
-        st.caption(f"B-roll assets estimados desde manifest: {len(result['assets'])}")
+        st.caption(f"B-roll assets: {len(result['assets'])}")
     for warning in result.get("warnings", [])[:2]:
         st.caption(f"Manifest read-only: {warning}")
 
@@ -1063,20 +1067,29 @@ def _aroll_broll_view():
         if st.session_state["aroll_broll_source"] == BROLL_SOURCE_ASSET_HUB_MANIFEST:
             st.text_input("Bundle UID", key="aroll_broll_bundle_uid")
         else:
-            st.info("Assets locales queda preparado para la fase renderer.")
+            st.info(
+                "Usa uno o varios paths B-roll locales (1..8), una ruta por línea."
+            )
             st.text_area(
-                "Rutas B-roll locales",
+                "Uno o varios paths B-roll locales",
                 key="aroll_broll_local_assets",
                 placeholder=(
                     "storage/local_videos/cutaway.mp4\n"
                     "storage/local_assets/visual.mp4"
                 ),
                 help=(
-                    "Una ruta por línea bajo storage/local_videos, "
-                    "storage/local_assets o storage/local_images."
+                    "Entre 1 y 8 rutas, una por línea, bajo storage/local_videos, "
+                    "storage/local_assets o storage/local_images. Los duplicados "
+                    "exactos se ignoran."
                 ),
                 height=88,
             )
+            local_asset_count = len(
+                normalize_broll_asset_values(
+                    st.session_state.get("aroll_broll_local_assets", "")
+                )
+            )
+            st.caption(f"B-roll assets: {local_asset_count}")
         st.selectbox("Layout preset", AROLL_BROLL_LAYOUTS, key="aroll_broll_layout")
         st.selectbox("Crop del presentador", AROLL_BROLL_CROPS, key="aroll_broll_crop")
 
@@ -1284,6 +1297,8 @@ def _aroll_broll_visibility_block(item):
     st.caption(f"Layout: {item.get('layout_preset') or 'alternating_fullscreen'}")
     st.caption(f"Audio: {item.get('audio_summary') or 'A-roll original'}")
     st.caption(item.get("broll_summary") or "B-roll muted")
+    if item.get("b_roll_asset_count"):
+        st.caption(f"B-roll assets: {item['b_roll_asset_count']}")
     task_id = item.get("task_id")
     job_id = item.get("job_id") or item.get("completed_job_id")
     if task_id:

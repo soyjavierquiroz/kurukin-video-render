@@ -105,6 +105,56 @@ class TestArollBrollDirectRenderSmoke(unittest.TestCase):
         self.assertEqual(payload["a_roll_duration_seconds"], 6.0)
         self.assertLessEqual(payload["timeline_duration_seconds"], 6.0)
 
+    def test_dry_run_accepts_multiple_broll_arguments_and_reports_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, first = self._make_project_files(root)
+            second = root / "storage" / "local_assets" / "second.mp4"
+            third = root / "storage" / "local_assets" / "third.mp4"
+            second.write_bytes(b"media")
+            third.write_bytes(b"media")
+            argv = [
+                "--a-roll",
+                aroll.as_posix(),
+                "--b-roll",
+                first.as_posix(),
+                "--b-roll",
+                second.as_posix(),
+                "--b-roll",
+                third.as_posix(),
+                "--task-id",
+                "aroll-broll-direct-smoke-multiple",
+                "--project-root",
+                root.as_posix(),
+                "--a-roll-duration-seconds",
+                "50",
+            ]
+
+            code, stdout, stderr = self._run_main(argv)
+            output_parent = (
+                root
+                / "storage"
+                / "tasks"
+                / "aroll-broll-direct-smoke-multiple"
+            )
+            output_parent_exists = output_parent.exists()
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["b_roll_asset_count"], 3)
+        self.assertEqual(
+            payload["b_roll_assets"],
+            [first.as_posix(), second.as_posix(), third.as_posix()],
+        )
+        broll_segments = [
+            item for item in payload["timeline"] if item["visual"] == "b_roll"
+        ]
+        self.assertEqual(
+            [item["broll_index"] for item in broll_segments[:4]],
+            [0, 1, 2, 0],
+        )
+        self.assertFalse(output_parent_exists)
+
     def test_dry_run_command_contains_duration_limit_without_real_ffmpeg(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

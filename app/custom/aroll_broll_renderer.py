@@ -10,7 +10,10 @@ import subprocess
 from typing import Any, Callable, Literal
 from urllib.parse import unquote, urlparse
 
-from app.custom.aroll_broll_mode import FREQUENCY_INTERVAL_SECONDS
+from app.custom.aroll_broll_mode import (
+    FREQUENCY_INTERVAL_SECONDS,
+    MAX_BROLL_ASSETS,
+)
 
 
 RENDERER_LAYOUT_ALTERNATING_FULLSCREEN = "alternating_fullscreen"
@@ -391,6 +394,10 @@ def build_alternating_fullscreen_timeline(
     clip_seconds: int | float,
     frequency: str,
 ) -> list[dict[str, Any]]:
+    if len(broll_assets) > MAX_BROLL_ASSETS:
+        raise ArollBrollRendererError(
+            f"B-roll supports at most {MAX_BROLL_ASSETS} assets"
+        )
     try:
         total_duration = max(0.0, float(aroll_duration_seconds))
     except (TypeError, ValueError):
@@ -640,13 +647,23 @@ def _broll_assets_from_config(
     project_root: str | Path | None,
 ) -> list[ArollBrollAsset]:
     assets: list[ArollBrollAsset] = []
+
+    def add_asset(asset_path: str) -> None:
+        asset = validate_broll_path(asset_path, project_root=project_root)
+        if all(existing.path != asset.path for existing in assets):
+            assets.append(asset)
+        if len(assets) > MAX_BROLL_ASSETS:
+            raise ArollBrollRendererError(
+                f"B-roll supports at most {MAX_BROLL_ASSETS} assets"
+            )
+
     raw_assets = b_roll.get("assets")
     if isinstance(raw_assets, list):
         for item in raw_assets:
             asset_path = _local_asset_path(item)
             if not asset_path:
                 raise ArollBrollRendererError("b_roll.assets entries must include a path")
-            assets.append(validate_broll_path(asset_path, project_root=project_root))
+            add_asset(asset_path)
         return assets
 
     raw_paths = b_roll.get("paths")
@@ -655,7 +672,7 @@ def _broll_assets_from_config(
             asset_path = _local_asset_path(item)
             if not asset_path:
                 raise ArollBrollRendererError("b_roll.paths entries must include a path")
-            assets.append(validate_broll_path(asset_path, project_root=project_root))
+            add_asset(asset_path)
         return assets
 
     single_path = _local_asset_path(b_roll.get("path"))
@@ -668,7 +685,12 @@ def _broll_assets_from_config(
             manifest_path.strip(),
             project_root=project_root,
         )
-        return list(extracted.get("assets") or [])
+        assets = list(extracted.get("assets") or [])
+        if len(assets) > MAX_BROLL_ASSETS:
+            raise ArollBrollRendererError(
+                f"B-roll supports at most {MAX_BROLL_ASSETS} assets"
+            )
+        return assets
 
     return []
 

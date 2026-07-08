@@ -10,7 +10,9 @@ import app.custom.aroll_broll_mode as aroll_broll_mode
 from app.custom.aroll_broll_mode import (
     AROLL_AUDIO_ORIGINAL,
     BROLL_AUDIO_MUTED,
+    BROLL_SOURCE_LOCAL_ASSETS,
     LAYOUT_ALTERNATING_FULLSCREEN,
+    MAX_BROLL_ASSETS,
     RENDER_MODE_AROLL_BROLL,
     build_aroll_broll_preview_timeline,
     build_aroll_broll_queue_payload,
@@ -21,6 +23,22 @@ from app.custom.aroll_broll_mode import (
 
 
 class TestArollBrollMode(unittest.TestCase):
+    def _local_config(self, root: Path, assets) -> dict:
+        aroll = root / "storage" / "local_videos" / "presenter.mp4"
+        aroll.parent.mkdir(parents=True, exist_ok=True)
+        aroll.write_bytes(b"video")
+        config = build_default_aroll_broll_config()
+        config["a_roll"]["path"] = "storage/local_videos/presenter.mp4"
+        config["b_roll"]["source"] = BROLL_SOURCE_LOCAL_ASSETS
+        config["b_roll"]["assets"] = assets
+        return config
+
+    def _write_broll(self, root: Path, name: str) -> Path:
+        path = root / "storage" / "local_assets" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"broll")
+        return path
+
     def test_default_config_has_aroll_broll_render_mode(self):
         config = build_default_aroll_broll_config()
 
@@ -98,6 +116,132 @@ class TestArollBrollMode(unittest.TestCase):
         self.assertNotIn(
             "b_roll.manifest_path must match /data/job-assets/<bundle_uid>/manifests/renderer-manifest.json",
             result["errors"],
+        )
+
+    def test_validate_normalizes_one_local_broll_asset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            asset = self._write_broll(root, "one.mp4")
+            result = validate_aroll_broll_config(
+                self._local_config(root, ["storage/local_assets/one.mp4"]),
+                project_root=root,
+            )
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["normalized"]["b_roll"]["assets"], [asset.as_posix()])
+
+    def test_validate_normalizes_multiple_local_broll_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = [
+                self._write_broll(root, "one.mp4"),
+                self._write_broll(root, "two.mp4"),
+                self._write_broll(root, "three.mp4"),
+            ]
+            result = validate_aroll_broll_config(
+                self._local_config(
+                    root,
+                    [f"storage/local_assets/{asset.name}" for asset in assets],
+                ),
+                project_root=root,
+            )
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(
+            result["normalized"]["b_roll"]["assets"],
+            [asset.as_posix() for asset in assets],
+        )
+
+    def test_validate_deduplicates_local_broll_assets_preserving_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._write_broll(root, "first.mp4")
+            second = self._write_broll(root, "second.mp4")
+            result = validate_aroll_broll_config(
+                self._local_config(
+                    root,
+                    [
+                        "storage/local_assets/first.mp4",
+                        "storage/local_assets/second.mp4",
+                        "storage/local_assets/first.mp4",
+                    ],
+                ),
+                project_root=root,
+            )
+
+        self.assertEqual(
+            result["normalized"]["b_roll"]["assets"],
+            [first.as_posix(), second.as_posix()],
+        )
+
+    def test_validate_rejects_empty_local_broll_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = validate_aroll_broll_config(
+                self._local_config(root, []),
+                project_root=root,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "b_roll.assets must include at least one local asset",
+            result["errors"],
+        )
+
+    def test_validate_rejects_more_than_eight_local_broll_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index in range(MAX_BROLL_ASSETS + 1):
+                asset = self._write_broll(root, f"asset-{index}.mp4")
+                paths.append(f"storage/local_assets/{asset.name}")
+            result = validate_aroll_broll_config(
+                self._local_config(root, paths),
+                project_root=root,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "b_roll.assets cannot include more than 8 assets",
+            result["errors"],
+        )
+
+    def test_validate_rejects_local_broll_asset_outside_allowed_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside.mp4"
+            outside.write_bytes(b"broll")
+            result = validate_aroll_broll_config(
+                self._local_config(root, [outside.as_posix()]),
+                project_root=root,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(
+                error.startswith("b_roll.assets[0] must stay under")
+                for error in result["errors"]
+            )
+        )
+
+    def test_validate_parses_multiline_local_broll_assets_ignoring_empty_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._write_broll(root, "first.mp4")
+            second = self._write_broll(root, "second.mp4")
+            result = validate_aroll_broll_config(
+                self._local_config(
+                    root,
+                    "\nstorage/local_assets/first.mp4\n\n"
+                    "storage/local_assets/second.mp4\n",
+                ),
+                project_root=root,
+            )
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(
+            result["normalized"]["b_roll"]["assets"],
+            [first.as_posix(), second.as_posix()],
         )
 
     def test_timeline_without_broll_returns_full_aroll(self):
