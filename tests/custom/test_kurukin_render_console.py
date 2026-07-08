@@ -125,6 +125,36 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "No crea pending job",
             "No renderiza inmediatamente",
             "form_enqueue_disabled",
+            "Tipo de video",
+            "Video normal con assets",
+        )
+
+        for expected in required_copy:
+            self.assertIn(expected, page)
+
+    def test_webui_page_includes_aroll_broll_foundation_copy(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        required_copy = (
+            "Presentador + B-roll",
+            "Modo Presentador + B-roll",
+            "A-roll / B-roll",
+            "El audio del presentador manda",
+            "B-roll muted",
+            "Ruta del video A-roll local",
+            "Fuente B-roll",
+            "Bundle UID",
+            "Layout preset",
+            "Crop del presentador",
+            "Frecuencia B-roll",
+            "Duración promedio por clip",
+            "aroll_audio (futuro)",
+            "Calidad",
+            "alternating_fullscreen",
+            "La cola A-roll/B-roll se habilitará en la fase renderer",
+            "aroll_broll_enqueue_disabled",
         )
 
         for expected in required_copy:
@@ -1173,6 +1203,66 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn(CONTAINER_API_BASE_URL, rendered_text)
         self.assertIn("--api-base-url", rendered_text)
         self.assertNotIn("<div", rendered_text)
+        self.assertTrue(at.button(key="controlled_runner_execute").disabled)
+
+    def test_app_test_aroll_broll_skeleton_does_not_enqueue_when_streamlit_available(self):
+        try:
+            from streamlit.testing.v1 import AppTest
+        except ModuleNotFoundError:
+            self.skipTest("streamlit is not installed in this Python environment")
+
+        original_flag = os.environ.pop("KURUKIN_ENABLE_UI_RUNNER", None)
+        original_cwd = Path.cwd()
+        page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                os.chdir(tmp)
+                at = AppTest.from_file(str(page_path))
+                at.run(timeout=30)
+                at.selectbox(key="video_type_label").set_value("Presentador + B-roll")
+                at.run(timeout=30)
+                at.button(key="aroll_broll_validate").click()
+                at.run(timeout=30)
+                pending_dir_exists = (
+                    tmp_path / "storage" / "nightly_jobs" / "pending"
+                ).exists()
+        finally:
+            os.chdir(original_cwd)
+            if original_flag is not None:
+                os.environ["KURUKIN_ENABLE_UI_RUNNER"] = original_flag
+
+        self.assertEqual(len(at.exception), 0)
+        rendered_text = "\n".join(
+            str(getattr(item, "value", getattr(item, "label", item)))
+            for collection in (
+                at.title,
+                at.markdown,
+                at.info,
+                at.success,
+                at.warning,
+                at.caption,
+                at.json,
+                at.selectbox,
+                at.radio,
+                at.button,
+            )
+            for item in collection
+        )
+        page = page_path.read_text(encoding="utf-8")
+        for tab_label in ("Crear video", "Cola", "Preflight", "Ejecutar", "Resultados"):
+            self.assertIn(tab_label, page)
+        self.assertIn("Presentador + B-roll", rendered_text)
+        self.assertIn("El audio del presentador manda", rendered_text)
+        self.assertIn("B-roll muted", rendered_text)
+        self.assertIn("alternating_fullscreen", rendered_text)
+        self.assertIn(
+            "La cola A-roll/B-roll se habilitará en la fase renderer",
+            rendered_text,
+        )
+        self.assertNotIn("<div", rendered_text)
+        self.assertFalse(pending_dir_exists)
+        self.assertTrue(at.button(key="aroll_broll_enqueue_disabled").disabled)
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
 
     def test_app_test_results_tab_shows_temp_mp4_when_streamlit_available(self):
