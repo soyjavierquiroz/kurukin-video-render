@@ -11,6 +11,23 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__fi
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
+from app.custom.aroll_broll_mode import (  # noqa: E402
+    ALLOWED_LAYOUT_PRESETS,
+    BROLL_SOURCE_ASSET_HUB_MANIFEST,
+    BROLL_SOURCE_LOCAL_ASSETS,
+    LAYOUT_ALTERNATING_FULLSCREEN,
+    RENDER_MODE_AROLL_BROLL,
+    SPEAKER_CROP_BOTTOM,
+    SPEAKER_CROP_CENTER,
+    SPEAKER_CROP_TOP,
+    SUBTITLES_SOURCE_AROLL_AUDIO,
+    SUBTITLES_SOURCE_CUSTOM_SRT,
+    SUBTITLES_SOURCE_NONE,
+    build_aroll_broll_preview_timeline,
+    build_default_aroll_broll_config,
+    summarize_aroll_broll_config,
+    validate_aroll_broll_config,
+)
 from app.custom.kurukin_job_adapter import (  # noqa: E402
     ALLOWED_AUDIO_EXTENSIONS,
     ALLOWED_EXTENSIONS,
@@ -56,6 +73,11 @@ from app.custom.kurukin_render_console import (  # noqa: E402
 
 
 DEFAULT_BUNDLE_UID = "jab_b28367fb22d44a40bae507c175f464c4"
+VIDEO_TYPE_LABELS = {
+    "Video normal con assets": "normal_assets",
+    "Presentador + B-roll": RENDER_MODE_AROLL_BROLL,
+}
+VIDEO_TYPE_LABEL_BY_VALUE = {value: key for key, value in VIDEO_TYPE_LABELS.items()}
 ASSET_SOURCE_LABELS = {
     "Asset Hub Bundle": ASSET_SOURCE_ASSET_HUB,
     "Assets locales": ASSET_SOURCE_LOCAL,
@@ -75,6 +97,27 @@ QUALITY_LABELS = {
     "Premium 2K": "premium_2k",
 }
 QUALITY_LABEL_BY_VALUE = {value: key for key, value in QUALITY_LABELS.items()}
+AROLL_BROLL_SOURCE_LABELS = {
+    "Asset Hub Bundle": BROLL_SOURCE_ASSET_HUB_MANIFEST,
+    "Assets locales": BROLL_SOURCE_LOCAL_ASSETS,
+}
+AROLL_BROLL_SUBTITLE_LABELS = {
+    "none": SUBTITLES_SOURCE_NONE,
+    "custom_srt": SUBTITLES_SOURCE_CUSTOM_SRT,
+    "aroll_audio (futuro)": SUBTITLES_SOURCE_AROLL_AUDIO,
+}
+AROLL_BROLL_LAYOUTS = [
+    LAYOUT_ALTERNATING_FULLSCREEN,
+    "vertical_split_a_top",
+    "vertical_split_b_top",
+    "broll_fullscreen_speaker_bubble",
+    "aroll_main_broll_lower_panel",
+]
+AROLL_BROLL_CROPS = [
+    SPEAKER_CROP_CENTER,
+    SPEAKER_CROP_TOP,
+    SPEAKER_CROP_BOTTOM,
+]
 END_TO_END_FLOW_STEPS = (
     "Crear video",
     "Validar",
@@ -306,6 +349,7 @@ def _recommended_test_mode_block():
 
 
 def _initialize_form_state():
+    st.session_state.setdefault("video_type_mode", "normal_assets")
     st.session_state.setdefault("job_id", _default_job_id())
     st.session_state.setdefault("video_subject", "Video Kurukin de prueba")
     st.session_state.setdefault("video_script", "Example script.")
@@ -330,6 +374,34 @@ def _initialize_form_state():
     st.session_state.setdefault("image_motion_intensity", 0.06)
     st.session_state.setdefault("video_clip_duration", 4)
     st.session_state.setdefault("n_threads", 2)
+    ar_defaults = build_default_aroll_broll_config()
+    st.session_state.setdefault("aroll_broll_a_path", "")
+    st.session_state.setdefault(
+        "aroll_broll_source",
+        ar_defaults["b_roll"]["source"],
+    )
+    st.session_state.setdefault("aroll_broll_bundle_uid", "")
+    st.session_state.setdefault(
+        "aroll_broll_layout",
+        ar_defaults["layout"]["preset"],
+    )
+    st.session_state.setdefault("aroll_broll_crop", ar_defaults["a_roll"]["crop"])
+    st.session_state.setdefault(
+        "aroll_broll_frequency",
+        ar_defaults["b_roll"]["frequency"],
+    )
+    st.session_state.setdefault(
+        "aroll_broll_clip_seconds",
+        ar_defaults["b_roll"]["clip_seconds"],
+    )
+    st.session_state.setdefault(
+        "aroll_broll_subtitles_source",
+        ar_defaults["subtitles"]["source"],
+    )
+    st.session_state.setdefault("aroll_broll_custom_srt_path", "")
+    st.session_state.setdefault("aroll_broll_quality", "draft_720p")
+    st.session_state.setdefault("aroll_broll_duration_seconds", 0.0)
+    st.session_state.setdefault("aroll_broll_count", 3)
 
 
 def _current_manifest_path():
@@ -804,13 +876,234 @@ def render_validate_enqueue_step(manifest_summary):
             st.caption("El payload aparecerá aquí después de validar el video.")
 
 
+def _current_aroll_broll_config():
+    config = build_default_aroll_broll_config()
+    config["a_roll"]["path"] = st.session_state.get("aroll_broll_a_path", "")
+    config["a_roll"]["crop"] = st.session_state.get(
+        "aroll_broll_crop",
+        SPEAKER_CROP_CENTER,
+    )
+    config["b_roll"]["source"] = st.session_state.get(
+        "aroll_broll_source",
+        BROLL_SOURCE_ASSET_HUB_MANIFEST,
+    )
+    config["b_roll"]["bundle_uid"] = st.session_state.get(
+        "aroll_broll_bundle_uid",
+        "",
+    )
+    config["b_roll"]["clip_seconds"] = int(
+        st.session_state.get("aroll_broll_clip_seconds", 4)
+    )
+    config["b_roll"]["frequency"] = st.session_state.get(
+        "aroll_broll_frequency",
+        "medium",
+    )
+    config["layout"]["preset"] = st.session_state.get(
+        "aroll_broll_layout",
+        LAYOUT_ALTERNATING_FULLSCREEN,
+    )
+    config["subtitles"]["source"] = st.session_state.get(
+        "aroll_broll_subtitles_source",
+        SUBTITLES_SOURCE_NONE,
+    )
+    config["subtitles"]["custom_srt_path"] = st.session_state.get(
+        "aroll_broll_custom_srt_path",
+        "",
+    )
+    return config
+
+
+def _aroll_broll_summary_block(config):
+    summary = summarize_aroll_broll_config(config)
+    cols = st.columns(5)
+    cols[0].metric("Audio", summary["audio"])
+    cols[1].metric("B-roll", summary["b-roll"])
+    cols[2].metric("Subtítulos", summary["subtitles"])
+    cols[3].metric("Layout", summary["layout"])
+    cols[4].metric("Crop", summary["crop"])
+
+
+def _aroll_broll_validation_block(result):
+    if result["ok"]:
+        st.success("A-roll / B-roll validado para foundation.")
+    else:
+        st.error("Revisa los errores antes de continuar.")
+    for error in result.get("errors", []):
+        st.error(error)
+    for warning in result.get("warnings", []):
+        st.warning(warning)
+    with st.expander("Diagnóstico A-roll / B-roll", expanded=False):
+        st.json(result["normalized"])
+
+
+def _aroll_broll_timeline_block(config):
+    duration = float(st.session_state.get("aroll_broll_duration_seconds", 0.0) or 0.0)
+    if duration <= 0:
+        st.info(
+            "Ingresa una duración manual del A-roll si quieres ver un timeline conceptual."
+        )
+        return
+    timeline = build_aroll_broll_preview_timeline(
+        duration,
+        int(st.session_state.get("aroll_broll_count", 0)),
+        int(config["b_roll"]["clip_seconds"]),
+        config["b_roll"]["frequency"],
+        config["layout"]["preset"],
+    )
+    st.markdown("### Timeline conceptual")
+    st.dataframe(timeline, use_container_width=True, hide_index=True)
+
+
+def _aroll_broll_view():
+    st.markdown("### Modo Presentador + B-roll")
+    st.info(
+        "El audio del presentador manda.\n\n"
+        "El B-roll se usa como apoyo visual y se silencia por defecto.\n\n"
+        "Los subtítulos pueden generarse desde el audio del presentador, usar SRT propio o desactivarse."
+    )
+    st.caption("A-roll / B-roll")
+    st.caption("B-roll muted")
+    st.caption("alternating_fullscreen")
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.text_input(
+            "Ruta del video A-roll local",
+            key="aroll_broll_a_path",
+            placeholder="storage/local_videos/presentador.mp4",
+        )
+        source_label = st.radio(
+            "Fuente B-roll",
+            list(AROLL_BROLL_SOURCE_LABELS),
+            index=_index_for_value(
+                AROLL_BROLL_SOURCE_LABELS,
+                st.session_state["aroll_broll_source"],
+                BROLL_SOURCE_ASSET_HUB_MANIFEST,
+            ),
+            horizontal=True,
+            key="aroll_broll_source_label",
+        )
+        st.session_state["aroll_broll_source"] = AROLL_BROLL_SOURCE_LABELS[source_label]
+        if st.session_state["aroll_broll_source"] == BROLL_SOURCE_ASSET_HUB_MANIFEST:
+            st.text_input("Bundle UID", key="aroll_broll_bundle_uid")
+        else:
+            st.info("Assets locales queda preparado para la fase renderer.")
+        st.selectbox("Layout preset", AROLL_BROLL_LAYOUTS, key="aroll_broll_layout")
+        st.selectbox("Crop del presentador", AROLL_BROLL_CROPS, key="aroll_broll_crop")
+
+    with right:
+        st.selectbox(
+            "Frecuencia B-roll",
+            ["low", "medium", "high"],
+            key="aroll_broll_frequency",
+        )
+        st.number_input(
+            "Duración promedio por clip",
+            min_value=2,
+            max_value=12,
+            step=1,
+            key="aroll_broll_clip_seconds",
+        )
+        subtitle_label_by_value = {
+            value: label for label, value in AROLL_BROLL_SUBTITLE_LABELS.items()
+        }
+        subtitle_label = st.selectbox(
+            "Subtítulos",
+            list(AROLL_BROLL_SUBTITLE_LABELS),
+            index=list(AROLL_BROLL_SUBTITLE_LABELS).index(
+                subtitle_label_by_value.get(
+                    st.session_state["aroll_broll_subtitles_source"],
+                    "none",
+                )
+            ),
+            key="aroll_broll_subtitles_label",
+        )
+        st.session_state["aroll_broll_subtitles_source"] = (
+            AROLL_BROLL_SUBTITLE_LABELS[subtitle_label]
+        )
+        if st.session_state["aroll_broll_subtitles_source"] == SUBTITLES_SOURCE_AROLL_AUDIO:
+            st.warning("aroll_audio queda marcado como futuro hasta la fase renderer.")
+        if st.session_state["aroll_broll_subtitles_source"] == SUBTITLES_SOURCE_CUSTOM_SRT:
+            st.text_input(
+                "Ruta SRT propia",
+                key="aroll_broll_custom_srt_path",
+                placeholder="storage/local_subtitles/subtitulos.srt",
+            )
+        quality_label = st.selectbox(
+            "Calidad",
+            list(QUALITY_LABELS),
+            index=_index_for_value(
+                QUALITY_LABELS,
+                st.session_state["aroll_broll_quality"],
+                "draft_720p",
+            ),
+            key="aroll_broll_quality_label",
+        )
+        st.session_state["aroll_broll_quality"] = QUALITY_LABELS[quality_label]
+
+    st.markdown("### Preview")
+    preview_cols = st.columns([1, 1])
+    with preview_cols[0]:
+        st.number_input(
+            "Duración manual A-roll (segundos, opcional)",
+            min_value=0.0,
+            step=1.0,
+            key="aroll_broll_duration_seconds",
+        )
+    with preview_cols[1]:
+        st.number_input(
+            "Cantidad conceptual de B-roll",
+            min_value=0,
+            max_value=30,
+            step=1,
+            key="aroll_broll_count",
+        )
+
+    config = _current_aroll_broll_config()
+    if st.button("Validar A-roll / B-roll", key="aroll_broll_validate"):
+        st.session_state["aroll_broll_validation"] = validate_aroll_broll_config(
+            config,
+            project_root=ROOT_DIR,
+            strict=False,
+        )
+
+    validation = st.session_state.get("aroll_broll_validation")
+    if validation:
+        _aroll_broll_summary_block(validation["normalized"])
+        _aroll_broll_validation_block(validation)
+        _aroll_broll_timeline_block(validation["normalized"])
+
+    st.button(
+        "Enviar a cola",
+        key="aroll_broll_enqueue_disabled",
+        disabled=True,
+        help="La cola A-roll/B-roll se habilitará en la fase renderer.",
+    )
+    st.info("La cola A-roll/B-roll se habilitará en la fase renderer.")
+
+
 def _new_render_view():
     _initialize_form_state()
     _hero_block()
     _end_to_end_flow_block()
+    video_type_label = st.selectbox(
+        "Tipo de video",
+        list(VIDEO_TYPE_LABELS),
+        index=_index_for_value(
+            VIDEO_TYPE_LABELS,
+            st.session_state["video_type_mode"],
+            "normal_assets",
+        ),
+        key="video_type_label",
+    )
+    st.session_state["video_type_mode"] = VIDEO_TYPE_LABELS[video_type_label]
+
+    if st.session_state["video_type_mode"] == RENDER_MODE_AROLL_BROLL:
+        _aroll_broll_view()
+        return
+
     _first_video_guide()
     _progress_steps()
-
     _recommended_test_mode_block()
     manifest_summary = render_asset_source_step()
     render_content_step()
