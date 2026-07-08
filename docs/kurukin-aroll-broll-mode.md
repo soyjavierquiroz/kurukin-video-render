@@ -75,6 +75,22 @@ En reposo/default, Render Console no crea pending A-roll/B-roll.
 Siguiente fase: conectar handler real y validar E2E con un fixture pequeno y
 controlado.
 
+## Direct render smoke
+
+`scripts/aroll_broll_direct_render_smoke.py` prepara un smoke minimo para la fase
+de direct render A-roll/B-roll.
+
+- Por defecto corre en dry-run y no ejecuta ffmpeg.
+- Valida rutas locales, arma el render plan y construye el comando como
+  `list[str]`.
+- El output planificado apunta a `storage/tasks/<task-id>/final-1.mp4`.
+- En dry-run no crea task dir, pending job ni archivo MP4.
+- `--execute` requiere `KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER=1`; sin ese
+  flag aborta con `Direct A-roll/B-roll render execution is disabled`.
+
+La siguiente fase requiere autorizacion explicita para ejecutar ffmpeg real con
+un fixture pequeno y controlado.
+
 ## Guardrails
 
 - MoneyPrinterTurbo no llama Asset Hub API para este modo.
