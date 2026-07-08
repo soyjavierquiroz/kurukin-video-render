@@ -451,4 +451,5 @@ def summarize_aroll_broll_config(config: dict[str, Any]) -> dict[str, str]:
             or LAYOUT_ALTERNATING_FULLSCREEN
         ),
         "crop": str(normalized.get("a_roll", {}).get("crop") or SPEAKER_CROP_CENTER),
+        "renderer": "Renderer preparado: alternating_fullscreen",
     }

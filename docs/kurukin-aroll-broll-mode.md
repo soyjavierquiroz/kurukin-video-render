@@ -43,6 +43,23 @@ Siguiente fase: renderer `alternating_fullscreen`.
 - Conectar subtitles desde audio del A-roll o SRT.
 - Habilitar enqueue solo cuando el renderer soporte este payload.
 
+## Renderer alternating_fullscreen
+
+El renderer core del layout `alternating_fullscreen` prepara la composicion MVP sin
+activar todavia la cola desde la UI.
+
+- El audio A-roll corre continuo y se mapea como audio final.
+- El B-roll queda muted porque su audio no se mapea.
+- La visual alterna entre A-roll full screen y B-roll full screen.
+- El output objetivo es vertical 9:16, por defecto 720x1280.
+- El crop/fit usa center crop seguro para normalizar cada segmento.
+- El comando ffmpeg se construye como lista segura, sin `shell=True`.
+- La fase actual implementa renderer core, ffprobe/ffmpeg helpers y dry-run.
+- La cola sigue deshabilitada para A-roll/B-roll en Render Console.
+
+Siguiente fase: integrar queue/runner y validar E2E con un fixture pequeno y
+controlado.
+
 ## Guardrails
 
 - MoneyPrinterTurbo no llama Asset Hub API para este modo.

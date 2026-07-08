@@ -28,6 +28,10 @@ from app.custom.aroll_broll_mode import (  # noqa: E402
     summarize_aroll_broll_config,
     validate_aroll_broll_config,
 )
+from app.custom.aroll_broll_renderer import (  # noqa: E402
+    ArollBrollRendererError,
+    extract_broll_assets_from_manifest,
+)
 from app.custom.kurukin_job_adapter import (  # noqa: E402
     ALLOWED_AUDIO_EXTENSIONS,
     ALLOWED_EXTENSIONS,
@@ -921,6 +925,27 @@ def _aroll_broll_summary_block(config):
     cols[2].metric("Subtítulos", summary["subtitles"])
     cols[3].metric("Layout", summary["layout"])
     cols[4].metric("Crop", summary["crop"])
+    st.caption(summary["renderer"])
+
+
+def _aroll_broll_manifest_assets_block(config):
+    b_roll = config.get("b_roll", {})
+    if b_roll.get("source") != BROLL_SOURCE_ASSET_HUB_MANIFEST:
+        return
+    manifest_path = b_roll.get("manifest_path")
+    if not manifest_path:
+        return
+    try:
+        result = extract_broll_assets_from_manifest(
+            manifest_path,
+            project_root=ROOT_DIR,
+        )
+    except (ArollBrollRendererError, OSError, json.JSONDecodeError):
+        return
+    if result.get("assets"):
+        st.caption(f"B-roll assets estimados desde manifest: {len(result['assets'])}")
+    for warning in result.get("warnings", [])[:2]:
+        st.caption(f"Manifest read-only: {warning}")
 
 
 def _aroll_broll_validation_block(result):
@@ -964,6 +989,13 @@ def _aroll_broll_view():
     st.caption("A-roll / B-roll")
     st.caption("B-roll muted")
     st.caption("alternating_fullscreen")
+    st.caption("Renderer preparado: alternating_fullscreen")
+    st.info(
+        "Renderer MVP planeado: alternating_fullscreen\n\n"
+        "Audio final: A-roll original\n\n"
+        "B-roll audio: muted\n\n"
+        "La activación de cola llegará en la siguiente fase de integración."
+    )
 
     left, right = st.columns([1, 1])
     with left:
@@ -1060,12 +1092,14 @@ def _aroll_broll_view():
         )
 
     config = _current_aroll_broll_config()
+    read_only_validation = validate_aroll_broll_config(
+        config,
+        project_root=ROOT_DIR,
+        strict=False,
+    )
+    _aroll_broll_manifest_assets_block(read_only_validation["normalized"])
     if st.button("Validar A-roll / B-roll", key="aroll_broll_validate"):
-        st.session_state["aroll_broll_validation"] = validate_aroll_broll_config(
-            config,
-            project_root=ROOT_DIR,
-            strict=False,
-        )
+        st.session_state["aroll_broll_validation"] = read_only_validation
 
     validation = st.session_state.get("aroll_broll_validation")
     if validation:

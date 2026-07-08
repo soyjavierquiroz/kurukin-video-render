@@ -153,6 +153,12 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "aroll_audio (futuro)",
             "Calidad",
             "alternating_fullscreen",
+            "Renderer MVP planeado: alternating_fullscreen",
+            "Audio final: A-roll original",
+            "B-roll audio: muted",
+            "La activación de cola llegará en la siguiente fase de integración.",
+            "Renderer preparado: alternating_fullscreen",
+            "B-roll assets estimados desde manifest",
             "La cola A-roll/B-roll se habilitará en la fase renderer",
             "aroll_broll_enqueue_disabled",
         )
@@ -1227,6 +1233,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 pending_dir_exists = (
                     tmp_path / "storage" / "nightly_jobs" / "pending"
                 ).exists()
+                tasks_dir_exists = (tmp_path / "storage" / "tasks").exists()
         finally:
             os.chdir(original_cwd)
             if original_flag is not None:
@@ -1257,11 +1264,22 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn("B-roll muted", rendered_text)
         self.assertIn("alternating_fullscreen", rendered_text)
         self.assertIn(
+            "Renderer MVP planeado: alternating_fullscreen",
+            rendered_text,
+        )
+        self.assertIn("Audio final: A-roll original", rendered_text)
+        self.assertIn("B-roll audio: muted", rendered_text)
+        self.assertIn(
+            "La activación de cola llegará en la siguiente fase de integración.",
+            rendered_text,
+        )
+        self.assertIn(
             "La cola A-roll/B-roll se habilitará en la fase renderer",
             rendered_text,
         )
         self.assertNotIn("<div", rendered_text)
         self.assertFalse(pending_dir_exists)
+        self.assertFalse(tasks_dir_exists)
         self.assertTrue(at.button(key="aroll_broll_enqueue_disabled").disabled)
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
 
