@@ -216,7 +216,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
         self.assertFalse(args.ignore_window)
         self.assertEqual(args.max_jobs, 10)
-        self.assertEqual(args.queue_dir, "/opt/moneyprinterturbo/storage/nightly_jobs")
+        self.assertEqual(args.queue_dir, runner.default_queue_dir().as_posix())
+        self.assertTrue(args.queue_dir.endswith("/storage/nightly_jobs"))
         self.assertFalse(
             runner.is_in_window(
                 runner.dt.datetime(2026, 1, 1, 12, 0),
@@ -241,6 +242,37 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertTrue(args.ignore_window)
         self.assertEqual(args.max_jobs, 1)
         self.assertEqual(args.queue_dir, CONTAINER_NIGHTLY_QUEUE_DIR)
+
+    def test_nightly_runner_default_queue_dir_uses_container_when_present(self):
+        runner = load_nightly_runner_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            container_queue = base / "MoneyPrinterTurbo" / "storage" / "nightly_jobs"
+            container_queue.mkdir(parents=True)
+
+            self.assertEqual(
+                runner.default_queue_dir(
+                    project_root=base / "repo",
+                    container_queue=container_queue,
+                ),
+                container_queue,
+            )
+
+    def test_nightly_runner_default_queue_dir_falls_back_to_project_root(self):
+        runner = load_nightly_runner_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "repo"
+            missing_container_queue = Path(tmp) / "missing" / "storage" / "nightly_jobs"
+
+            self.assertEqual(
+                runner.default_queue_dir(
+                    project_root=project_root,
+                    container_queue=missing_container_queue,
+                ),
+                project_root / "storage" / "nightly_jobs",
+            )
 
     def test_webui_page_uses_human_audio_summary_labels(self):
         page = Path("webui/pages/Kurukin_Render_Console.py").read_text(

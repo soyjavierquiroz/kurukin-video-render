@@ -59,7 +59,7 @@ python3 scripts/nightly_runner.py
 Defaults principales:
 
 ```text
---queue-dir /opt/moneyprinterturbo/storage/nightly_jobs
+--queue-dir /MoneyPrinterTurbo/storage/nightly_jobs si existe; si no, <project_root>/storage/nightly_jobs
 --api-base-url http://127.0.0.1:18080/api/v1
 --window-start 00:00
 --window-end 07:00
@@ -67,6 +67,17 @@ Defaults principales:
 --poll-seconds 20
 --task-timeout-seconds 14400
 --no-progress-timeout-seconds 1800
+```
+
+En contenedor, el default portable usa `/MoneyPrinterTurbo/storage/nightly_jobs`
+cuando esa ruta existe. En host o repo local, si esa ruta no existe, el default
+cae en `<project_root>/storage/nightly_jobs`.
+
+La UI controlada no depende del default: siempre pasa la cola explicita del
+contenedor al ejecutar manualmente un solo job:
+
+```bash
+python3 scripts/nightly_runner.py --max-jobs 1 --ignore-window --queue-dir /MoneyPrinterTurbo/storage/nightly_jobs
 ```
 
 `--task-timeout-seconds` es el timeout global maximo del task completo. Aunque
