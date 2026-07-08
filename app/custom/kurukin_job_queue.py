@@ -15,6 +15,7 @@ from typing import Any
 
 QUEUE_GROUPS = ("pending", "processing", "completed", "failed", "logs")
 DEFAULT_PENDING_DIR = Path("storage/nightly_jobs/pending")
+DEFAULT_COMPLETED_DIR = Path("storage/nightly_jobs/completed")
 DEFAULT_TASKS_DIR = Path("storage/tasks")
 MAX_TASK_SCAN_DEPTH = 4
 MAX_TASK_SCAN_FILES = 500
@@ -482,7 +483,179 @@ def _summarize_final_task(task_dir: Path) -> dict[str, Any]:
         )
         if videos is not None:
             summary["videos"] = videos
+    if "task_id" not in summary:
+        task_id = _nested_get(payload, "task", "task_id") or _nested_get(
+            payload,
+            "data",
+            "task_id",
+        )
+        if task_id is not None:
+            summary["task_id"] = task_id
+    if "job_id" not in summary:
+        job_id = _nested_get(payload, "task", "job_id") or _nested_get(
+            payload,
+            "data",
+            "job_id",
+        )
+        if job_id is not None:
+            summary["job_id"] = job_id
     return summary
+
+
+def _coerce_json_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _extract_task_id_from_submit_response(payload: dict[str, Any] | None) -> str:
+    if not payload:
+        return ""
+    value = payload.get("task_id") or _nested_get(payload, "data", "task_id")
+    return str(value or "").strip()
+
+
+def _extract_task_id_from_final_task(payload: dict[str, Any] | None) -> str:
+    if not payload:
+        return ""
+    value = (
+        payload.get("task_id")
+        or _nested_get(payload, "data", "task_id")
+        or _nested_get(payload, "task", "task_id")
+    )
+    return str(value or "").strip()
+
+
+def _extract_job_id_from_completed_payload(payload: dict[str, Any] | None) -> str:
+    if not payload:
+        return ""
+    value = payload.get("job_id") or _nested_get(payload, "runner", "job_id")
+    return str(value or "").strip()
+
+
+def _extract_video_refs_from_final_task(payload: dict[str, Any] | None) -> list[str]:
+    if not payload:
+        return []
+    refs: list[str] = []
+    for value in (
+        payload.get("videos"),
+        _nested_get(payload, "data", "videos"),
+        _nested_get(payload, "task", "videos"),
+        payload.get("combined_videos"),
+        _nested_get(payload, "data", "combined_videos"),
+        _nested_get(payload, "task", "combined_videos"),
+    ):
+        refs.extend(str(item) for item in _coerce_json_list(value) if item)
+    return refs
+
+
+def _task_id_from_video_ref(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parts = Path(text).parts
+    if parts[:1] == ("/",):
+        parts = parts[1:]
+    if len(parts) >= 3 and parts[0] in {"tasks", "storage"}:
+        if parts[0] == "storage" and len(parts) >= 4 and parts[1] == "tasks":
+            return parts[2]
+        if parts[0] == "tasks":
+            return parts[1]
+    if len(parts) == 2 and parts[1].lower().endswith(".mp4"):
+        return parts[0]
+    return ""
+
+
+def _completed_job_sort_key(job: Mapping[str, Any]) -> tuple[float, str]:
+    return (
+        -float(job.get("modified_at_timestamp") or 0),
+        str(job.get("completed_dir_relative") or ""),
+    )
+
+
+def list_completed_render_jobs(
+    completed_dir: str | Path | None = None,
+    *,
+    tasks_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Summarize completed nightly jobs and their detected task result signals.
+
+    The scan is read-only. JSON files are used only as hints, and any returned
+    MP4 metadata is resolved through ``list_rendered_videos`` under storage/tasks.
+    """
+
+    completed_root = (
+        Path(completed_dir) if completed_dir is not None else DEFAULT_COMPLETED_DIR
+    ).resolve(strict=False)
+    if not completed_root.exists() or not completed_root.is_dir():
+        return []
+
+    videos = list_rendered_videos(tasks_dir)
+    videos_by_task: dict[str, list[dict[str, Any]]] = {}
+    for video in videos:
+        videos_by_task.setdefault(str(video.get("task_id") or ""), []).append(video)
+
+    jobs: list[dict[str, Any]] = []
+    for path in sorted(completed_root.iterdir(), key=lambda item: item.name):
+        if not path.is_dir():
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(completed_root)
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+
+        job_payload = _read_json_file(resolved / "job.json")
+        submit_payload = _read_json_file(resolved / "submit-response.json")
+        final_task_payload = _read_json_file(resolved / "final-task.json")
+        stat = _safe_stat(resolved)
+        video_refs = _extract_video_refs_from_final_task(final_task_payload)
+
+        task_id = (
+            _extract_task_id_from_submit_response(submit_payload)
+            or _extract_task_id_from_final_task(final_task_payload)
+        )
+        if not task_id:
+            for ref in video_refs:
+                task_id = _task_id_from_video_ref(ref)
+                if task_id:
+                    break
+
+        final_task_summary = {}
+        if final_task_payload:
+            for key in ("state", "progress", "videos", "task_id", "job_id"):
+                value = final_task_payload.get(key)
+                if value is not None:
+                    final_task_summary[key] = value
+            data = final_task_payload.get("data")
+            if isinstance(data, dict):
+                for key in ("state", "progress", "videos", "task_id", "job_id"):
+                    if key not in final_task_summary and data.get(key) is not None:
+                        final_task_summary[key] = data.get(key)
+
+        detected_videos = list(videos_by_task.get(task_id, [])) if task_id else []
+        jobs.append(
+            {
+                "job_id": _extract_job_id_from_completed_payload(job_payload),
+                "task_id": task_id,
+                "completed_dir": _relative_path(resolved, completed_root),
+                "completed_dir_relative": _relative_path(resolved, completed_root),
+                "completed_at": _safe_modified_at_iso(resolved),
+                "modified_at": _safe_modified_at_iso(resolved),
+                "modified_at_iso": _safe_modified_at_iso(resolved),
+                "modified_at_timestamp": stat.st_mtime if stat else 0,
+                "state": final_task_summary.get("state"),
+                "progress": final_task_summary.get("progress"),
+                "final_task_summary": final_task_summary,
+                "result_video_refs": video_refs,
+                "final_video_paths": [
+                    video.get("relative_path")
+                    for video in detected_videos
+                    if video.get("kind") == "final"
+                ],
+                "videos": detected_videos,
+            }
+        )
+
+    return sorted(jobs, key=_completed_job_sort_key)
 
 
 def _summarize_error_json(task_dir: Path) -> str:
@@ -563,6 +736,125 @@ def list_rendered_videos(
             videos.append(video)
 
     return sorted(videos, key=_video_sort_key)
+
+
+def _best_video_for_task(
+    task_id: str,
+    *,
+    tasks_dir: str | Path | None = None,
+    preview_max_bytes: int = VIDEO_PREVIEW_MAX_BYTES,
+) -> dict[str, Any] | None:
+    task_id_text = str(task_id or "").strip()
+    if not task_id_text:
+        return None
+    videos = [
+        video
+        for video in list_rendered_videos(tasks_dir, preview_max_bytes=preview_max_bytes)
+        if str(video.get("task_id") or "") == task_id_text
+    ]
+    if not videos:
+        return None
+    return sorted(videos, key=_video_sort_key)[0]
+
+
+def find_result_for_job(
+    job_id: str,
+    *,
+    completed_dir: str | Path | None = None,
+    tasks_dir: str | Path | None = None,
+    preview_max_bytes: int = VIDEO_PREVIEW_MAX_BYTES,
+) -> dict[str, Any] | None:
+    """Return the best final video result associated with a completed job id."""
+
+    target_job_id = str(job_id or "").strip()
+    if not target_job_id:
+        return None
+
+    jobs = [
+        job
+        for job in list_completed_render_jobs(
+            completed_dir,
+            tasks_dir=tasks_dir,
+        )
+        if str(job.get("job_id") or "") == target_job_id
+    ]
+    for job in sorted(jobs, key=_completed_job_sort_key):
+        video = _best_video_for_task(
+            str(job.get("task_id") or ""),
+            tasks_dir=tasks_dir,
+            preview_max_bytes=preview_max_bytes,
+        )
+        if not video:
+            continue
+        result = dict(video)
+        result.update(
+            {
+                "job_id": job.get("job_id"),
+                "completed_job_id": job.get("job_id") or video.get("completed_job_id"),
+                "completed_dir": job.get("completed_dir"),
+                "completed_at": job.get("completed_at"),
+                "state": job.get("state"),
+                "progress": job.get("progress"),
+                "recommendation": "last_job",
+                "recommendation_title": "Tu video más reciente",
+            }
+        )
+        return result
+    return None
+
+
+def _latest_final_video(
+    *,
+    tasks_dir: str | Path | None = None,
+    preview_max_bytes: int = VIDEO_PREVIEW_MAX_BYTES,
+) -> dict[str, Any] | None:
+    final_videos = [
+        video
+        for video in list_rendered_videos(tasks_dir, preview_max_bytes=preview_max_bytes)
+        if video.get("kind") == "final"
+    ]
+    if not final_videos:
+        return None
+    return max(
+        final_videos,
+        key=lambda video: float(video.get("modified_at_timestamp") or 0),
+    )
+
+
+def get_recommended_result(
+    last_job_id: str | None = None,
+    *,
+    completed_dir: str | Path | None = None,
+    tasks_dir: str | Path | None = None,
+    preview_max_bytes: int = VIDEO_PREVIEW_MAX_BYTES,
+) -> dict[str, Any] | None:
+    """Return the user's most relevant render result, falling back to latest final."""
+
+    if last_job_id:
+        result = find_result_for_job(
+            str(last_job_id),
+            completed_dir=completed_dir,
+            tasks_dir=tasks_dir,
+            preview_max_bytes=preview_max_bytes,
+        )
+        if result:
+            return result
+
+    latest = _latest_final_video(
+        tasks_dir=tasks_dir,
+        preview_max_bytes=preview_max_bytes,
+    )
+    if not latest:
+        return None
+    result = dict(latest)
+    result.update(
+        {
+            "job_id": latest.get("completed_job_id"),
+            "recommendation": "latest_final",
+            "recommendation_title": "Último video generado",
+        }
+    )
+    return result
 
 
 def get_latest_rendered_video(

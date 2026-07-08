@@ -15,7 +15,10 @@ from app.custom.kurukin_job_queue import (
     build_pending_job_filename,
     build_safe_runner_command,
     enqueue_moneyprinter_payload,
+    find_result_for_job,
+    get_recommended_result,
     get_storage_summary,
+    list_completed_render_jobs,
     list_rendered_videos,
     list_nightly_queue,
     list_render_tasks,
@@ -25,6 +28,47 @@ from app.custom.kurukin_job_queue import (
 
 
 class TestKurukinJobQueue(unittest.TestCase):
+    def _write_completed_job(
+        self,
+        base: Path,
+        *,
+        job_id: str = "job-results-001",
+        task_id: str = "task-results-001",
+        final_bytes: bytes | None = b"final",
+        combined_bytes: bytes | None = None,
+        final_task_payload: dict | None = None,
+    ) -> tuple[Path, Path, Path]:
+        completed_dir = base / "storage" / "nightly_jobs" / "completed" / f"done-{job_id}"
+        tasks_dir = base / "storage" / "tasks"
+        task_dir = tasks_dir / task_id
+        completed_dir.mkdir(parents=True)
+        task_dir.mkdir(parents=True)
+        (completed_dir / "job.json").write_text(
+            json.dumps({"job_id": job_id}),
+            encoding="utf-8",
+        )
+        (completed_dir / "submit-response.json").write_text(
+            json.dumps({"data": {"task_id": task_id}, "status": 200}),
+            encoding="utf-8",
+        )
+        payload = final_task_payload or {
+            "data": {
+                "state": "completed",
+                "progress": 100,
+                "task_id": task_id,
+                "videos": [f"/tasks/{task_id}/final-1.mp4"],
+            }
+        }
+        (completed_dir / "final-task.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+        if final_bytes is not None:
+            (task_dir / "final-1.mp4").write_bytes(final_bytes)
+        if combined_bytes is not None:
+            (task_dir / "combined-1.mp4").write_bytes(combined_bytes)
+        return completed_dir, tasks_dir, task_dir
+
     def test_sanitize_job_id_normal(self):
         self.assertEqual(sanitize_job_id("render_001-abc"), "render_001-abc")
 
@@ -224,6 +268,161 @@ class TestKurukinJobQueue(unittest.TestCase):
             data = read_video_bytes_for_download(video, tasks_dir=tasks_dir)
 
         self.assertIsNone(data)
+
+    def test_list_completed_render_jobs_links_job_to_task_and_final_video(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(base)
+
+            jobs = list_completed_render_jobs(
+                completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["job_id"], "job-results-001")
+        self.assertEqual(jobs[0]["task_id"], "task-results-001")
+        self.assertEqual(jobs[0]["completed_dir"], completed_dir.name)
+        self.assertEqual(jobs[0]["state"], "completed")
+        self.assertEqual(jobs[0]["progress"], 100)
+        self.assertEqual(jobs[0]["final_video_paths"], ["task-results-001/final-1.mp4"])
+
+    def test_find_result_for_job_prefers_final_before_combined(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                final_bytes=b"final",
+                combined_bytes=b"combined",
+            )
+
+            result = find_result_for_job(
+                "job-results-001",
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["kind"], "final")
+        self.assertEqual(result["file_name"], "final-1.mp4")
+        self.assertEqual(result["completed_job_id"], "job-results-001")
+
+    def test_find_result_for_job_returns_none_without_mp4(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                final_bytes=None,
+                combined_bytes=None,
+            )
+
+            result = find_result_for_job(
+                "job-results-001",
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertIsNone(result)
+
+    def test_get_recommended_result_uses_last_job_match(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, task_dir = self._write_completed_job(
+                base,
+                job_id="job-new",
+                task_id="task-new",
+            )
+            older_task = tasks_dir / "task-older"
+            older_task.mkdir()
+            old_video = older_task / "final-1.mp4"
+            old_video.write_bytes(b"older")
+            os.utime(old_video, (300, 300))
+            os.utime(task_dir / "final-1.mp4", (100, 100))
+
+            result = get_recommended_result(
+                last_job_id="job-new",
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["task_id"], "task-new")
+        self.assertEqual(result["recommendation"], "last_job")
+
+    def test_get_recommended_result_falls_back_to_latest_final_video(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks_dir = Path(tmp_dir) / "storage" / "tasks"
+            old_task = tasks_dir / "task-old"
+            new_task = tasks_dir / "task-new"
+            old_task.mkdir(parents=True)
+            new_task.mkdir(parents=True)
+            old_video = old_task / "final-1.mp4"
+            new_video = new_task / "final-1.mp4"
+            old_video.write_bytes(b"old")
+            new_video.write_bytes(b"new")
+            os.utime(old_video, (100, 100))
+            os.utime(new_video, (200, 200))
+
+            result = get_recommended_result(
+                last_job_id="missing-job",
+                completed_dir=Path(tmp_dir) / "storage" / "nightly_jobs" / "completed",
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["task_id"], "task-new")
+        self.assertEqual(result["recommendation"], "latest_final")
+
+    def test_find_result_for_job_ignores_video_refs_outside_storage_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir = base / "storage" / "nightly_jobs" / "completed" / "done-job"
+            tasks_dir = base / "storage" / "tasks"
+            outside_video = base / "outside" / "final-1.mp4"
+            completed_dir.mkdir(parents=True)
+            tasks_dir.mkdir(parents=True)
+            outside_video.parent.mkdir()
+            outside_video.write_bytes(b"outside")
+            (completed_dir / "job.json").write_text(
+                json.dumps({"job_id": "job-outside"}),
+                encoding="utf-8",
+            )
+            (completed_dir / "final-task.json").write_text(
+                json.dumps({"data": {"videos": [outside_video.as_posix()]}}),
+                encoding="utf-8",
+            )
+
+            result = find_result_for_job(
+                "job-outside",
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertIsNone(result)
+
+    def test_completed_render_job_helpers_handle_invalid_json_without_crash(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(base)
+            (completed_dir / "final-task.json").write_text(
+                "{not-json",
+                encoding="utf-8",
+            )
+
+            jobs = list_completed_render_jobs(
+                completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+            result = find_result_for_job(
+                "job-results-001",
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["task_id"], "task-results-001")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["file_name"], "final-1.mp4")
 
     def test_get_storage_summary_returns_subdirs(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
