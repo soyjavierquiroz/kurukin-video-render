@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -15,8 +16,10 @@ from app.custom.kurukin_job_queue import (
     build_safe_runner_command,
     enqueue_moneyprinter_payload,
     get_storage_summary,
+    list_rendered_videos,
     list_nightly_queue,
     list_render_tasks,
+    read_video_bytes_for_download,
     sanitize_job_id,
 )
 
@@ -94,6 +97,133 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertEqual(tasks[0]["task_id"], "task-001")
         self.assertTrue(tasks[0]["has_final_video"])
         self.assertEqual(tasks[0]["final_video_size_bytes"], 5)
+
+    def test_list_rendered_videos_empty_when_tasks_dir_missing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks_dir = Path(tmp_dir) / "storage" / "tasks"
+
+            videos = list_rendered_videos(tasks_dir)
+
+        self.assertEqual(videos, [])
+        self.assertFalse(tasks_dir.exists())
+
+    def test_list_rendered_videos_detects_final_mp4(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task_dir = Path(tmp_dir) / "storage" / "tasks" / "task-001"
+            task_dir.mkdir(parents=True)
+            (task_dir / "final-1.mp4").write_bytes(b"video")
+
+            videos = list_rendered_videos(Path(tmp_dir) / "storage" / "tasks")
+
+        self.assertEqual(len(videos), 1)
+        self.assertEqual(videos[0]["task_id"], "task-001")
+        self.assertEqual(videos[0]["file_name"], "final-1.mp4")
+        self.assertEqual(videos[0]["relative_path"], "task-001/final-1.mp4")
+        self.assertEqual(videos[0]["kind"], "final")
+        self.assertEqual(videos[0]["size_bytes"], 5)
+        self.assertEqual(videos[0]["size_label"], "5 B")
+        self.assertTrue(videos[0]["is_previewable"])
+
+    def test_list_rendered_videos_detects_combined_but_prioritizes_final(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks_dir = Path(tmp_dir) / "storage" / "tasks"
+            final_dir = tasks_dir / "task-final"
+            combined_dir = tasks_dir / "task-combined"
+            final_dir.mkdir(parents=True)
+            combined_dir.mkdir(parents=True)
+            (final_dir / "final-1.mp4").write_bytes(b"final")
+            (combined_dir / "combined-1.mp4").write_bytes(b"combined")
+
+            videos = list_rendered_videos(tasks_dir)
+
+        self.assertEqual([video["kind"] for video in videos], ["final", "combined"])
+
+    def test_list_rendered_videos_sorts_same_kind_by_mtime_descending(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks_dir = Path(tmp_dir) / "storage" / "tasks"
+            old_dir = tasks_dir / "task-old"
+            new_dir = tasks_dir / "task-new"
+            old_dir.mkdir(parents=True)
+            new_dir.mkdir(parents=True)
+            old_video = old_dir / "final-1.mp4"
+            new_video = new_dir / "final-1.mp4"
+            old_video.write_bytes(b"old")
+            new_video.write_bytes(b"new")
+            os.utime(old_video, (100, 100))
+            os.utime(new_video, (200, 200))
+
+            videos = list_rendered_videos(tasks_dir)
+
+        self.assertEqual([video["task_id"] for video in videos], ["task-new", "task-old"])
+
+    def test_list_rendered_videos_calculates_size_label(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks_dir = Path(tmp_dir) / "storage" / "tasks"
+            task_dir = tasks_dir / "task-001"
+            task_dir.mkdir(parents=True)
+            (task_dir / "final-1.mp4").write_bytes(b"x" * 2048)
+
+            videos = list_rendered_videos(tasks_dir)
+
+        self.assertEqual(videos[0]["size_label"], "2.0 KB")
+
+    def test_list_rendered_videos_ignores_symlink_that_escapes_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            tasks_dir = root / "storage" / "tasks"
+            task_dir = tasks_dir / "task-001"
+            outside_dir = root / "outside"
+            task_dir.mkdir(parents=True)
+            outside_dir.mkdir()
+            outside_video = outside_dir / "final-1.mp4"
+            outside_video.write_bytes(b"outside")
+            try:
+                (task_dir / "final-1.mp4").symlink_to(outside_video)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink not available: {exc}")
+
+            videos = list_rendered_videos(tasks_dir)
+
+        self.assertEqual(videos, [])
+
+    def test_list_rendered_videos_ignores_non_mp4(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks_dir = Path(tmp_dir) / "storage" / "tasks"
+            task_dir = tasks_dir / "task-001"
+            task_dir.mkdir(parents=True)
+            (task_dir / "final-1.txt").write_text("not video", encoding="utf-8")
+
+            videos = list_rendered_videos(tasks_dir)
+
+        self.assertEqual(videos, [])
+
+    def test_read_video_bytes_for_download_reads_detected_video(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tasks_dir = Path(tmp_dir) / "storage" / "tasks"
+            task_dir = tasks_dir / "task-001"
+            task_dir.mkdir(parents=True)
+            (task_dir / "final-1.mp4").write_bytes(b"video bytes")
+            video = list_rendered_videos(tasks_dir)[0]
+
+            data = read_video_bytes_for_download(video, tasks_dir=tasks_dir)
+
+        self.assertEqual(data, b"video bytes")
+
+    def test_read_video_bytes_for_download_returns_none_when_path_escapes_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            tasks_dir = root / "storage" / "tasks"
+            outside_video = root / "outside.mp4"
+            tasks_dir.mkdir(parents=True)
+            outside_video.write_bytes(b"outside")
+            video = {
+                "absolute_path": outside_video.as_posix(),
+                "relative_path": "task-001/final-1.mp4",
+            }
+
+            data = read_video_bytes_for_download(video, tasks_dir=tasks_dir)
+
+        self.assertIsNone(data)
 
     def test_get_storage_summary_returns_subdirs(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

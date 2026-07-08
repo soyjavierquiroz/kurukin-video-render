@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import streamlit as st
 
@@ -25,12 +26,18 @@ from app.custom.kurukin_job_queue import (  # noqa: E402
     MANUAL_RUNNER_MAX_JOBS,
     RUNNER_CONFIRM_TEXT,
     RUNNER_QUEUE_CONFIRM_TEXT,
+    VIDEO_DOWNLOAD_MEMORY_MAX_BYTES,
+    VIDEO_PREVIEW_MAX_BYTES,
     build_safe_runner_command,
     enqueue_moneyprinter_payload,
     get_job_lifecycle_summary,
+    get_latest_rendered_video,
     get_runner_preflight_summary,
     is_ui_runner_enabled,
+    list_rendered_videos,
+    read_video_bytes_for_download,
     run_controlled_runner,
+    sanitize_job_id,
     validate_runner_execution_request,
 )
 from app.custom.kurukin_render_console import (  # noqa: E402
@@ -947,6 +954,152 @@ def _queue_storage_view():
         st.json(lifecycle)
 
 
+def _video_option_label(video):
+    kind_label = {"final": "Final", "combined": "Combinado"}.get(
+        video.get("kind"),
+        "Video",
+    )
+    return (
+        f"{kind_label} - {video.get('task_id')} - {video.get('file_name')} "
+        f"({_human_bytes(video.get('size_bytes'))})"
+    )
+
+
+def _safe_download_filename(video):
+    task_id = sanitize_job_id(video.get("task_id") or "task")
+    file_name = sanitize_job_id(Path(video.get("file_name") or "video").stem)
+    return f"kurukin-{task_id}-{file_name}.mp4"
+
+
+def _results_details(video):
+    st.caption(f"Ruta relativa: {video.get('relative_path')}")
+    st.caption(f"Tamaño: {video.get('size_label')}")
+    st.caption(f"Modificado: {_format_datetime(video.get('modified_at'))}")
+    st.caption(f"task_id: {video.get('task_id')}")
+    if video.get("completed_job_id"):
+        st.caption(f"job_id inferido: {video.get('completed_job_id')}")
+
+    final_task_summary = video.get("final_task_summary") or {}
+    if final_task_summary:
+        st.markdown("**final-task.json**")
+        st.json(
+            {
+                "state": final_task_summary.get("state"),
+                "progress": final_task_summary.get("progress"),
+                "videos": final_task_summary.get("videos"),
+            }
+        )
+    else:
+        st.info("No se detectó final-task.json asociado.")
+
+    if video.get("error_summary"):
+        st.warning(f"Error detectado: {video.get('error_summary')}")
+
+    with st.expander("Diagnóstico avanzado", expanded=False):
+        st.caption("Ruta absoluta interna validada bajo storage/tasks.")
+        st.json(
+            {
+                "absolute_path": video.get("absolute_path"),
+                "kind": video.get("kind"),
+                "is_previewable": video.get("is_previewable"),
+            }
+        )
+
+
+def _results_view():
+    st.title("Resultados generados")
+    st.write("Reproduce y descarga videos ya generados bajo storage/tasks.")
+    st.info("Esta pestaña solo lee resultados existentes. No ejecuta runner ni crea trabajos.")
+
+    videos = list_rendered_videos()
+    latest_video = get_latest_rendered_video()
+    lifecycle = get_job_lifecycle_summary()
+    counts = lifecycle.get("counts", {})
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Videos encontrados", len(videos))
+    metric_cols[1].metric("Jobs completados", counts.get("completed", 0))
+    metric_cols[2].metric("Jobs fallidos", counts.get("failed", 0))
+    metric_cols[3].metric(
+        "Último video generado",
+        latest_video.get("file_name") if latest_video else "-",
+    )
+
+    if not videos:
+        st.info(
+            "Todavía no hay videos generados. Crea un video, envíalo a cola "
+            "y ejecútalo desde la pestaña Ejecutar."
+        )
+        return
+
+    st.markdown("### Videos detectados")
+    st.dataframe(
+        [
+            {
+                "tipo": video.get("kind"),
+                "task_id": video.get("task_id"),
+                "archivo": video.get("file_name"),
+                "tamaño": video.get("size_label"),
+                "modificado": _format_datetime(video.get("modified_at")),
+                "ruta": video.get("relative_path"),
+            }
+            for video in videos
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    option_labels = [_video_option_label(video) for video in videos]
+    default_index = 0
+    if latest_video:
+        latest_relative_path = latest_video.get("relative_path")
+        for index, video in enumerate(videos):
+            if video.get("relative_path") == latest_relative_path:
+                default_index = index
+                break
+
+    selected_label = st.selectbox(
+        "Video para preview y descarga",
+        option_labels,
+        index=default_index,
+        key="results_selected_video",
+    )
+    selected_index = option_labels.index(selected_label)
+    selected_video = videos[selected_index]
+
+    st.markdown("### Preview")
+    if selected_video.get("is_previewable"):
+        st.video(selected_video.get("absolute_path"))
+        st.success("Preview disponible.")
+    else:
+        st.warning(
+            "El video supera el límite de preview automático de "
+            f"{_human_bytes(VIDEO_PREVIEW_MAX_BYTES)}."
+        )
+
+    st.markdown("### Descargar")
+    if selected_video.get("size_bytes", 0) > VIDEO_DOWNLOAD_MEMORY_MAX_BYTES:
+        st.warning(
+            "El video supera el límite de descarga directa de "
+            f"{_human_bytes(VIDEO_DOWNLOAD_MEMORY_MAX_BYTES)}."
+        )
+    else:
+        data = read_video_bytes_for_download(selected_video)
+        if data is None:
+            st.warning("No se pudo preparar la descarga del video seleccionado.")
+        else:
+            st.download_button(
+                "Descargar MP4",
+                data=data,
+                file_name=_safe_download_filename(selected_video),
+                mime="video/mp4",
+                key="results_download_mp4",
+            )
+
+    with st.expander("Detalles del resultado", expanded=False):
+        _results_details(selected_video)
+
+
 def _check_state_message(check):
     status = check.get("status") or "Revisar"
     text = f"{status}: {check.get('name')} - {check.get('detail')}"
@@ -1137,13 +1290,15 @@ def _diagnostics_expander():
 st.set_page_config(page_title="Crear video Kurukin", layout="wide")
 _apply_page_style()
 
-tab_new, tab_queue, tab_preflight, tab_execute = st.tabs(
-    ["Crear video", "Cola", "Preflight", "Ejecutar"]
+tab_new, tab_queue, tab_results, tab_preflight, tab_execute = st.tabs(
+    ["Crear video", "Cola", "Resultados", "Preflight", "Ejecutar"]
 )
 with tab_new:
     _new_render_view()
 with tab_queue:
     _queue_storage_view()
+with tab_results:
+    _results_view()
 with tab_preflight:
     _preflight_view()
 with tab_execute:

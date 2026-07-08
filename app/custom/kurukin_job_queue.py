@@ -22,6 +22,8 @@ MAX_LOG_READ_BYTES = 64 * 1024
 MAX_LOG_LINES = 80
 MAX_STORAGE_SCAN_DEPTH = 5
 MAX_STORAGE_SCAN_FILES = 2000
+VIDEO_PREVIEW_MAX_BYTES = 200 * 1024 * 1024
+VIDEO_DOWNLOAD_MEMORY_MAX_BYTES = 500 * 1024 * 1024
 UI_RUNNER_ENABLED_VALUES = {"1", "true", "TRUE", "yes", "YES"}
 SAFE_RUNNER_RELATIVE_PATH = "scripts/nightly_runner.py"
 SAFE_RUNNER_COMMAND = ("python3", SAFE_RUNNER_RELATIVE_PATH)
@@ -113,6 +115,19 @@ def _relative_path(path: Path, base_dir: Path | None = None) -> str:
         return path.relative_to(base_dir).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+def _human_size(size_bytes: int | float | None) -> str:
+    try:
+        value = float(size_bytes or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
 
 
 def safe_storage_path(*parts: str | Path) -> Path:
@@ -391,6 +406,212 @@ def detect_task_outputs(task_dir: str | Path) -> list[dict[str, Any]]:
             }
         )
     return outputs
+
+
+def _resolve_tasks_dir(tasks_dir: str | Path | None = None) -> Path:
+    return (Path(tasks_dir) if tasks_dir is not None else DEFAULT_TASKS_DIR).resolve(
+        strict=False
+    )
+
+
+def _safe_video_path(path: Path, tasks_root: Path) -> Path | None:
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(tasks_root)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if not resolved.is_file() or resolved.suffix.lower() != ".mp4":
+        return None
+    return resolved
+
+
+def _video_kind(path: Path) -> str:
+    name = path.name.lower()
+    if name.startswith("final-"):
+        return "final"
+    if name.startswith("combined-"):
+        return "combined"
+    return "other"
+
+
+def _video_sort_key(video: Mapping[str, Any]) -> tuple[int, float, str]:
+    kind_priority = {"final": 0, "combined": 1}.get(str(video.get("kind")), 2)
+    return (
+        kind_priority,
+        -float(video.get("modified_at_timestamp") or 0),
+        str(video.get("relative_path") or ""),
+    )
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    stat = _safe_stat(path)
+    if stat is None or stat.st_size > MAX_LOG_READ_BYTES:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _summarize_final_task(task_dir: Path) -> dict[str, Any]:
+    payload = _read_json_file(task_dir / "final-task.json")
+    if not payload:
+        return {}
+    summary: dict[str, Any] = {}
+    for key in ("state", "progress", "videos", "task_id", "job_id"):
+        if key in payload:
+            summary[key] = payload.get(key)
+    if "state" not in summary:
+        state = _nested_get(payload, "task", "state") or _nested_get(payload, "data", "state")
+        if state is not None:
+            summary["state"] = state
+    if "progress" not in summary:
+        progress = _nested_get(payload, "task", "progress") or _nested_get(
+            payload,
+            "data",
+            "progress",
+        )
+        if progress is not None:
+            summary["progress"] = progress
+    if "videos" not in summary:
+        videos = _nested_get(payload, "task", "videos") or _nested_get(
+            payload,
+            "data",
+            "videos",
+        )
+        if videos is not None:
+            summary["videos"] = videos
+    return summary
+
+
+def _summarize_error_json(task_dir: Path) -> str:
+    payload = _read_json_file(task_dir / "error.json")
+    if not payload:
+        return ""
+    for key in ("error", "message", "detail"):
+        value = payload.get(key)
+        if value:
+            return str(value)[:500]
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)[:500]
+
+
+def list_rendered_videos(
+    tasks_dir: str | Path | None = None,
+    *,
+    preview_max_bytes: int = VIDEO_PREVIEW_MAX_BYTES,
+) -> list[dict[str, Any]]:
+    """List final/combined MP4 render outputs under storage/tasks.
+
+    The scan is read-only and every returned file is resolved back under
+    ``tasks_dir`` so symlinks cannot expose files outside the render task tree.
+    """
+
+    tasks_root = _resolve_tasks_dir(tasks_dir)
+    if not tasks_root.exists() or not tasks_root.is_dir():
+        return []
+
+    videos: list[dict[str, Any]] = []
+    for task_dir in sorted(tasks_root.iterdir(), key=lambda item: item.name):
+        if not task_dir.is_dir():
+            continue
+        try:
+            task_resolved = task_dir.resolve(strict=True)
+            task_resolved.relative_to(tasks_root)
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        if not task_resolved.is_dir():
+            continue
+
+        for path in _iter_task_files(task_resolved):
+            kind = _video_kind(path)
+            if kind not in {"final", "combined"}:
+                continue
+            resolved = _safe_video_path(path, tasks_root)
+            if resolved is None:
+                continue
+            stat = _safe_stat(resolved)
+            if stat is None:
+                continue
+            relative_path = _relative_path(resolved, tasks_root)
+            task_id = relative_path.split("/", 1)[0] if "/" in relative_path else task_resolved.name
+            video = {
+                "task_id": task_id,
+                "file_name": resolved.name,
+                "name": resolved.name,
+                "relative_path": relative_path,
+                "absolute_path": resolved.as_posix(),
+                "size_bytes": stat.st_size,
+                "size_label": _human_size(stat.st_size),
+                "modified_at": datetime.fromtimestamp(
+                    stat.st_mtime,
+                    timezone.utc,
+                ).isoformat(),
+                "modified_at_iso": datetime.fromtimestamp(
+                    stat.st_mtime,
+                    timezone.utc,
+                ).isoformat(),
+                "modified_at_timestamp": stat.st_mtime,
+                "kind": kind,
+                "is_previewable": stat.st_size <= preview_max_bytes,
+                "final_task_summary": _summarize_final_task(task_resolved),
+                "error_summary": _summarize_error_json(task_resolved),
+            }
+            final_task_summary = video["final_task_summary"]
+            if isinstance(final_task_summary, dict) and final_task_summary.get("job_id"):
+                video["completed_job_id"] = final_task_summary.get("job_id")
+            videos.append(video)
+
+    return sorted(videos, key=_video_sort_key)
+
+
+def get_latest_rendered_video(
+    tasks_dir: str | Path | None = None,
+    *,
+    preview_max_bytes: int = VIDEO_PREVIEW_MAX_BYTES,
+) -> dict[str, Any] | None:
+    """Return the most recently modified rendered video, if any."""
+
+    videos = list_rendered_videos(tasks_dir, preview_max_bytes=preview_max_bytes)
+    if not videos:
+        return None
+    return max(videos, key=lambda video: float(video.get("modified_at_timestamp") or 0))
+
+
+def read_video_bytes_for_download(
+    video: Mapping[str, Any],
+    *,
+    tasks_dir: str | Path | None = None,
+    max_bytes: int = VIDEO_DOWNLOAD_MEMORY_MAX_BYTES,
+) -> bytes | None:
+    """Read bytes for a previously detected MP4 video.
+
+    The input must be a video object returned by ``list_rendered_videos``. The
+    path is resolved and validated again before reading.
+    """
+
+    if not isinstance(video, Mapping):
+        return None
+    tasks_root = _resolve_tasks_dir(tasks_dir)
+    raw_path = video.get("absolute_path")
+    if not raw_path:
+        relative_path = str(video.get("relative_path") or "")
+        if not relative_path:
+            return None
+        candidate = tasks_root / relative_path
+    else:
+        candidate = Path(str(raw_path))
+
+    resolved = _safe_video_path(candidate, tasks_root)
+    if resolved is None:
+        return None
+    stat = _safe_stat(resolved)
+    if stat is None or stat.st_size > max_bytes:
+        return None
+    try:
+        return resolved.read_bytes()
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def _read_small_text_tail(path: Path) -> str:

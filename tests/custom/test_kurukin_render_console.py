@@ -27,6 +27,7 @@ from app.custom.kurukin_job_queue import (
     get_storage_usage_summary,
     infer_task_status,
     is_ui_runner_enabled,
+    list_rendered_videos,
     list_pending_jobs,
     list_task_summaries,
     run_controlled_runner,
@@ -223,6 +224,33 @@ class TestKurukinRenderConsole(unittest.TestCase):
             self.assertNotIn(forbidden, page.lower())
         self.assertNotIn('key="api_base_url"', page)
         self.assertNotIn('key="runner_api_base_url"', page)
+
+    def test_webui_page_includes_results_tab_copy(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        required_copy = (
+            "Resultados",
+            "Resultados generados",
+            "Videos encontrados",
+            "Jobs completados",
+            "Jobs fallidos",
+            "Último video generado",
+            "Videos detectados",
+            "Video para preview y descarga",
+            "Preview",
+            "Descargar MP4",
+            "Detalles del resultado",
+            "Todavía no hay videos generados. Crea un video, envíalo a cola ",
+            "read_video_bytes_for_download",
+            "VIDEO_PREVIEW_MAX_BYTES",
+            "VIDEO_DOWNLOAD_MEMORY_MAX_BYTES",
+        )
+
+        for expected in required_copy:
+            self.assertIn(expected, page)
+        self.assertNotIn("st.text_input(\"Ruta", page)
 
     def test_nightly_runner_parser_keeps_window_by_default(self):
         runner = load_nightly_runner_module()
@@ -1117,8 +1145,10 @@ class TestKurukinRenderConsole(unittest.TestCase):
             for item in collection
         )
         page = page_path.read_text(encoding="utf-8")
-        for tab_label in ("Crear video", "Cola", "Preflight", "Ejecutar"):
+        for tab_label in ("Crear video", "Cola", "Resultados", "Preflight", "Ejecutar"):
             self.assertIn(tab_label, page)
+        self.assertIn("Resultados generados", rendered_text)
+        self.assertIn("Todavía no hay videos generados", rendered_text)
         self.assertIn("Ejecución controlada", rendered_text)
         self.assertIn("Procesar 1 trabajo ahora", rendered_text)
         self.assertIn(
@@ -1129,6 +1159,68 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn(CONTAINER_NIGHTLY_QUEUE_DIR, rendered_text)
         self.assertIn(CONTAINER_API_BASE_URL, rendered_text)
         self.assertIn("--api-base-url", rendered_text)
+        self.assertNotIn("<div", rendered_text)
+        self.assertTrue(at.button(key="controlled_runner_execute").disabled)
+
+    def test_app_test_results_tab_shows_temp_mp4_when_streamlit_available(self):
+        try:
+            from streamlit.testing.v1 import AppTest
+        except ModuleNotFoundError:
+            self.skipTest("streamlit is not installed in this Python environment")
+
+        original_flag = os.environ.pop("KURUKIN_ENABLE_UI_RUNNER", None)
+        original_cwd = Path.cwd()
+        page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                task_dir = tmp_path / "storage" / "tasks" / "task-results-001"
+                task_dir.mkdir(parents=True)
+                (task_dir / "final-1.mp4").write_bytes(
+                    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+                )
+                (task_dir / "final-task.json").write_text(
+                    json.dumps(
+                        {
+                            "state": "completed",
+                            "progress": 100,
+                            "videos": ["final-1.mp4"],
+                            "job_id": "job-results-001",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                os.chdir(tmp)
+                self.assertGreater(len(list_rendered_videos("storage/tasks")), 0)
+                at = AppTest.from_file(str(page_path))
+                at.run(timeout=30)
+        finally:
+            os.chdir(original_cwd)
+            if original_flag is not None:
+                os.environ["KURUKIN_ENABLE_UI_RUNNER"] = original_flag
+
+        self.assertEqual(len(at.exception), 0)
+        rendered_text = "\n".join(
+            str(getattr(item, "value", getattr(item, "label", item)))
+            for collection in (
+                at.title,
+                at.markdown,
+                at.info,
+                at.success,
+                at.warning,
+                at.caption,
+                at.json,
+                at.selectbox,
+                at.button,
+            )
+            for item in collection
+        )
+        self.assertIn("Resultados generados", rendered_text)
+        self.assertIn("task-results-001", rendered_text)
+        self.assertIn("final-1.mp4", rendered_text)
+        self.assertIn("Preview", rendered_text)
+        self.assertIn("Preview disponible", rendered_text)
+        self.assertIn("Descargar MP4", rendered_text)
         self.assertNotIn("<div", rendered_text)
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
 
