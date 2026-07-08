@@ -1232,10 +1232,26 @@ def _status_label(status):
     }.get(status, "Sin estado claro")
 
 
+def _aroll_broll_visibility_block(item):
+    if item.get("render_mode") != RENDER_MODE_AROLL_BROLL:
+        return
+    st.caption(f"Tipo: {item.get('render_mode_label') or 'Presentador + B-roll'}")
+    st.caption(f"Layout: {item.get('layout_preset') or 'alternating_fullscreen'}")
+    st.caption(f"Audio: {item.get('audio_summary') or 'A-roll original'}")
+    st.caption(item.get("broll_summary") or "B-roll muted")
+    task_id = item.get("task_id")
+    job_id = item.get("job_id") or item.get("completed_job_id")
+    if task_id:
+        st.caption(f"Task ID: {task_id}")
+    if job_id:
+        st.caption(f"Job ID: {job_id}")
+
+
 def _pending_job_block(job):
     title = job.get("title") or "-"
     job_id = job.get("job_id") or job.get("filename") or "Trabajo pendiente"
     with st.expander(f"{job_id} - {title}", expanded=False):
+        _aroll_broll_visibility_block(job)
         cols = st.columns(4)
         cols[0].metric("Calidad", job.get("quality") or "-")
         cols[1].metric("Fuente", job.get("asset_source") or "-")
@@ -1255,6 +1271,7 @@ def _pending_job_block(job):
 def _task_block(task):
     label = _status_label(task.get("status"))
     with st.expander(f"{task.get('task_id')} - {label}", expanded=False):
+        _aroll_broll_visibility_block(task)
         cols = st.columns(4)
         cols[0].metric("Estado", label)
         cols[1].metric("Videos", task.get("output_count", 0))
@@ -1270,6 +1287,7 @@ def _task_block(task):
                 [
                     {
                         "archivo": item.get("name"),
+                        "tipo": item.get("render_mode_label") or "Video normal",
                         "tamaño": _human_bytes(item.get("size_bytes")),
                         "modificado": _format_datetime(item.get("modified_at_iso")),
                         "ruta": item.get("relative_path"),
@@ -1293,6 +1311,21 @@ def _task_block(task):
                         st.code(item["preview"])
 
 
+def _completed_job_block(job):
+    label = job.get("render_mode_label") or "Video normal"
+    title = job.get("job_id") or job.get("task_id") or job.get("completed_dir")
+    with st.expander(f"{title} - {label}", expanded=False):
+        _aroll_broll_visibility_block(job)
+        cols = st.columns(4)
+        cols[0].metric("Estado", job.get("state") or "-")
+        cols[1].metric("Progreso", job.get("progress") or "-")
+        cols[2].metric("Videos", len(job.get("videos") or []))
+        cols[3].metric("Directorio", job.get("completed_dir") or "-")
+        st.caption(f"Completado: {_format_datetime(job.get('completed_at'))}")
+        if job.get("final_video_paths"):
+            st.caption("Outputs: " + ", ".join(job.get("final_video_paths") or []))
+
+
 def _outputs_table(outputs):
     if not outputs:
         st.info("Todavía no hay renders completados.")
@@ -1302,6 +1335,7 @@ def _outputs_table(outputs):
             {
                 "archivo": item.get("name"),
                 "task": item.get("task_id"),
+                "tipo": item.get("render_mode_label") or "Video normal",
                 "tamaño": _human_bytes(item.get("size_bytes")),
                 "modificado": _format_datetime(item.get("modified_at_iso")),
                 "ruta": item.get("path"),
@@ -1339,6 +1373,7 @@ def _queue_storage_view():
     lifecycle = get_job_lifecycle_summary()
     counts = lifecycle.get("counts", {})
     pending_jobs = lifecycle.get("pending_jobs", [])
+    completed_jobs = lifecycle.get("completed_jobs", [])
     tasks = lifecycle.get("tasks", [])
     outputs = lifecycle.get("outputs", [])
     failed_tasks = [task for task in tasks if task.get("status") == "failed"]
@@ -1359,6 +1394,13 @@ def _queue_storage_view():
             _pending_job_block(job)
     else:
         st.info("No hay trabajos pendientes. Cuando envíes un video a cola, aparecerá aquí.")
+
+    st.markdown("### Jobs completados")
+    if completed_jobs:
+        for job in completed_jobs:
+            _completed_job_block(job)
+    else:
+        st.info("No hay jobs completados en la cola nocturna.")
 
     st.markdown("### Trabajos/tasks detectados")
     if tasks:
@@ -1387,8 +1429,9 @@ def _video_option_label(video):
         video.get("kind"),
         "Video",
     )
+    mode_label = video.get("render_mode_label") or "Video normal"
     return (
-        f"{kind_label} - {video.get('task_id')} - {video.get('file_name')} "
+        f"{kind_label} - {mode_label} - {video.get('task_id')} - {video.get('file_name')} "
         f"({_human_bytes(video.get('size_bytes'))})"
     )
 
@@ -1400,6 +1443,7 @@ def _safe_download_filename(video):
 
 
 def _results_details(video):
+    _aroll_broll_visibility_block(video)
     st.caption(f"Ruta relativa: {video.get('relative_path')}")
     st.caption(f"Tamaño: {video.get('size_label')}")
     st.caption(f"Modificado: {_format_datetime(video.get('modified_at'))}")
@@ -1482,6 +1526,7 @@ def _highlighted_result_block(video):
     cols[3].metric("Tamaño", video.get("size_label") or _human_bytes(video.get("size_bytes")))
     cols[4].metric("Estado", "Generado correctamente")
     st.caption(f"Fecha: {_format_datetime(video.get('modified_at') or video.get('completed_at'))}")
+    _aroll_broll_visibility_block(video)
 
     _result_preview_download(video, key_prefix="recommended_result")
     with st.expander("Detalles del resultado destacado", expanded=False):
@@ -1524,7 +1569,8 @@ def _results_view():
     st.dataframe(
         [
             {
-                "tipo": video.get("kind"),
+                "tipo": video.get("render_mode_label") or "Video normal",
+                "archivo_tipo": video.get("kind"),
                 "task_id": video.get("task_id"),
                 "archivo": video.get("file_name"),
                 "tamaño": video.get("size_label"),

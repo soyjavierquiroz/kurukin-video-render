@@ -26,7 +26,7 @@ El primer layout real de renderer sera `alternating_fullscreen`.
 
 ## MVP por fases
 
-Fase actual: runner handler con tests/fakes.
+Fase actual: visibilidad read-only en Cola y Resultados despues del E2E runner PASS.
 
 - Helper puro en `app/custom/aroll_broll_mode.py`.
 - Validacion de rutas y defaults seguros.
@@ -36,12 +36,13 @@ Fase actual: runner handler con tests/fakes.
 - Renderer directo core para `alternating_fullscreen`.
 - Handler de runner protegido por flag, validado con fake renderer.
 - Tests unitarios y AppTest sin runner real ni ffmpeg real.
+- E2E runner PASS registrado para `aroll-broll-runner-smoke-003`.
 
-Siguiente fase: E2E controlado con runner smoke 003.
+Fase actual de polish:
 
-- Ejecutar un pending fixture pequeno con runner real solo bajo autorizacion.
-- Verificar output real y limpieza de cola.
-- Mantener ffmpeg real fuera de esta fase.
+- Listar jobs/resultados A-roll/B-roll sin ejecutar runner ni renderer.
+- Mostrar metadata humana en Cola y Resultados.
+- Mantener outputs existentes bajo `storage/tasks/<task_id>/final-1.mp4`.
 
 ## Renderer alternating_fullscreen
 
@@ -77,8 +78,7 @@ En reposo/default, Render Console no crea pending A-roll/B-roll.
 - Esta fase implementa handler con tests/fakes; no ejecuta runner real ni
   ffmpeg real.
 
-Siguiente fase: validar E2E con runner smoke 003 y un fixture pequeno y
-controlado, solo con autorizacion explicita.
+E2E runner PASS registrado: `aroll-broll-runner-smoke-003`.
 
 ## Runner handler
 
@@ -116,6 +116,18 @@ de direct render A-roll/B-roll.
 
 La siguiente fase requiere autorizacion explicita para ejecutar ffmpeg real con
 un fixture pequeno y controlado.
+
+## Results and queue visibility
+
+- Cola identifica `render_mode=aroll_broll` desde pending, completed metadata,
+  `final-task.json`, `submit-response.json` o fallback por `task_id`.
+- Resultados muestra `Presentador + B-roll` cuando el MP4 corresponde a un job
+  A-roll/B-roll.
+- La metadata visible incluye `Layout: alternating_fullscreen`,
+  `Audio: A-roll original`, `B-roll muted` y `Task ID`.
+- Outputs se siguen leyendo desde `storage/tasks/<task_id>/final-1.mp4`.
+- No se ejecuta renderer ni runner para listar resultados.
+- E2E runner PASS: `aroll-broll-runner-smoke-003`.
 
 ## Guardrails
 

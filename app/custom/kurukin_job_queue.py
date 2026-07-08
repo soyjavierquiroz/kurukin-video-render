@@ -25,7 +25,11 @@ MAX_STORAGE_SCAN_DEPTH = 5
 MAX_STORAGE_SCAN_FILES = 2000
 VIDEO_PREVIEW_MAX_BYTES = 200 * 1024 * 1024
 VIDEO_DOWNLOAD_MEMORY_MAX_BYTES = 500 * 1024 * 1024
+RENDER_MODE_NORMAL = "normal"
 RENDER_MODE_AROLL_BROLL = "aroll_broll"
+AROLL_BROLL_DEFAULT_LAYOUT = "alternating_fullscreen"
+AROLL_BROLL_AUDIO_SUMMARY = "A-roll original"
+AROLL_BROLL_BROLL_SUMMARY = "B-roll muted"
 UI_RUNNER_ENABLED_VALUES = {"1", "true", "TRUE", "yes", "YES"}
 FEATURE_FLAG_ENABLED_VALUES = {"1", "true", "yes", "on"}
 AROLL_BROLL_QUEUE_FLAG = "KURUKIN_ENABLE_AROLL_BROLL_QUEUE"
@@ -265,8 +269,138 @@ def _nested_get(value: dict[str, Any], *keys: str) -> Any:
     return current
 
 
+def _normalize_render_mode(value: Any) -> str:
+    if str(value or "").strip() == RENDER_MODE_AROLL_BROLL:
+        return RENDER_MODE_AROLL_BROLL
+    return RENDER_MODE_NORMAL
+
+
+def summarize_render_mode(render_mode: str) -> str:
+    """Return the product-facing label for a render mode."""
+
+    if _normalize_render_mode(render_mode) == RENDER_MODE_AROLL_BROLL:
+        return "Presentador + B-roll"
+    return "Video normal"
+
+
+def _payload_render_mode(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return RENDER_MODE_NORMAL
+    candidates = (
+        payload.get("render_mode"),
+        _nested_get(payload, "data", "render_mode"),
+        _nested_get(payload, "task", "render_mode"),
+        _nested_get(payload, "runner", "render_mode"),
+        _nested_get(payload, "aroll_broll", "render_mode"),
+    )
+    for value in candidates:
+        if _normalize_render_mode(value) == RENDER_MODE_AROLL_BROLL:
+            return RENDER_MODE_AROLL_BROLL
+    if isinstance(payload.get("aroll_broll"), dict):
+        return RENDER_MODE_AROLL_BROLL
+    return RENDER_MODE_NORMAL
+
+
+def _looks_like_aroll_broll_task_id(value: Any) -> bool:
+    return str(value or "").strip().startswith("aroll-broll")
+
+
+def _extract_layout_preset(*payloads: dict[str, Any] | None) -> str:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        candidates = (
+            _nested_get(payload, "aroll_broll", "layout", "preset"),
+            _nested_get(payload, "layout", "preset"),
+            _nested_get(payload, "data", "layout_preset"),
+            _nested_get(payload, "data", "aroll_broll", "layout", "preset"),
+            _nested_get(payload, "task", "layout_preset"),
+            payload.get("layout_preset"),
+        )
+        for value in candidates:
+            text = str(value or "").strip()
+            if text:
+                return text
+    return AROLL_BROLL_DEFAULT_LAYOUT
+
+
+def _render_mode_metadata(render_mode: str, *, layout_preset: str = "") -> dict[str, str]:
+    normalized = _normalize_render_mode(render_mode)
+    metadata = {
+        "render_mode": normalized,
+        "render_mode_label": summarize_render_mode(normalized),
+    }
+    if normalized == RENDER_MODE_AROLL_BROLL:
+        metadata.update(
+            {
+                "layout_preset": layout_preset or AROLL_BROLL_DEFAULT_LAYOUT,
+                "audio_summary": AROLL_BROLL_AUDIO_SUMMARY,
+                "broll_summary": AROLL_BROLL_BROLL_SUMMARY,
+            }
+        )
+    return metadata
+
+
+def _detect_render_mode_from_payloads(
+    *payloads: dict[str, Any] | None,
+    task_id: str = "",
+    job_id: str = "",
+    path_name: str = "",
+) -> str:
+    for payload in payloads:
+        if _payload_render_mode(payload) == RENDER_MODE_AROLL_BROLL:
+            return RENDER_MODE_AROLL_BROLL
+    if _looks_like_aroll_broll_task_id(task_id) or _looks_like_aroll_broll_task_id(job_id):
+        return RENDER_MODE_AROLL_BROLL
+    if _looks_like_aroll_broll_task_id(path_name):
+        return RENDER_MODE_AROLL_BROLL
+    return RENDER_MODE_NORMAL
+
+
+def detect_render_mode_for_job(job_or_completed_dir: Mapping[str, Any] | str | Path) -> str:
+    """Detect whether a pending/completed/task summary belongs to A-roll/B-roll."""
+
+    if isinstance(job_or_completed_dir, Mapping):
+        task_id = str(job_or_completed_dir.get("task_id") or "")
+        job_id = str(job_or_completed_dir.get("job_id") or "")
+        raw = job_or_completed_dir.get("raw")
+        final_task_summary = job_or_completed_dir.get("final_task_summary")
+        return _detect_render_mode_from_payloads(
+            raw if isinstance(raw, dict) else None,
+            final_task_summary if isinstance(final_task_summary, dict) else None,
+            dict(job_or_completed_dir),
+            task_id=task_id,
+            job_id=job_id,
+        )
+
+    path = Path(job_or_completed_dir)
+    payloads = [
+        _read_json_file(path / "job.json"),
+        _read_json_file(path / "submit-response.json"),
+        _read_json_file(path / "final-task.json"),
+        _read_json_file(path / "render-result.json"),
+        _read_json_file(path / "error.json"),
+    ]
+    task_id = (
+        _extract_task_id_from_submit_response(payloads[1])
+        or _extract_task_id_from_final_task(payloads[2])
+    )
+    job_id = _extract_job_id_from_completed_payload(payloads[0])
+    if not task_id:
+        for ref in _extract_video_refs_from_final_task(payloads[2]):
+            task_id = _task_id_from_video_ref(ref)
+            if task_id:
+                break
+    return _detect_render_mode_from_payloads(
+        *payloads,
+        task_id=task_id,
+        job_id=job_id,
+        path_name=path.name,
+    )
+
+
 def _pending_asset_source(payload: dict[str, Any]) -> str:
-    if payload.get("render_mode") == RENDER_MODE_AROLL_BROLL:
+    if _payload_render_mode(payload) == RENDER_MODE_AROLL_BROLL:
         return "A-roll/B-roll"
     if payload.get("asset_hub_renderer_manifest_path") or payload.get(
         "asset_hub_bundle_uid"
@@ -278,7 +412,7 @@ def _pending_asset_source(payload: dict[str, Any]) -> str:
 
 
 def _pending_subtitles(payload: dict[str, Any]) -> str:
-    if payload.get("render_mode") == RENDER_MODE_AROLL_BROLL:
+    if _payload_render_mode(payload) == RENDER_MODE_AROLL_BROLL:
         source = _nested_get(payload, "aroll_broll", "subtitles", "source")
         return {
             "aroll_audio": "Audio A-roll",
@@ -343,10 +477,18 @@ def summarize_pending_job(path: str | Path) -> dict[str, Any]:
         return summary
 
     runner_job_id = _nested_get(payload, "runner", "job_id")
+    task_id = str(payload.get("task_id") or _nested_get(payload, "runner", "task_id") or "")
+    render_mode = _detect_render_mode_from_payloads(
+        payload,
+        task_id=task_id,
+        job_id=str(runner_job_id or payload.get("job_id") or pending_path.stem),
+        path_name=pending_path.stem,
+    )
     summary.update(
         {
             "valid_json": True,
             "job_id": str(runner_job_id or payload.get("job_id") or pending_path.stem),
+            "task_id": task_id,
             "title": str(
                 payload.get("video_subject")
                 or payload.get("subject")
@@ -358,6 +500,12 @@ def summarize_pending_job(path: str | Path) -> dict[str, Any]:
             "subtitles": _pending_subtitles(payload),
             "raw": payload,
         }
+    )
+    summary.update(
+        _render_mode_metadata(
+            render_mode,
+            layout_preset=_extract_layout_preset(payload),
+        )
     )
     return summary
 
@@ -471,9 +619,13 @@ def _read_json_file(path: Path) -> dict[str, Any] | None:
 def _summarize_final_task(task_dir: Path) -> dict[str, Any]:
     payload = _read_json_file(task_dir / "final-task.json")
     if not payload:
-        return {}
+        return _render_mode_metadata(
+            RENDER_MODE_AROLL_BROLL
+            if _looks_like_aroll_broll_task_id(task_dir.name)
+            else RENDER_MODE_NORMAL
+        )
     summary: dict[str, Any] = {}
-    for key in ("state", "progress", "videos", "task_id", "job_id"):
+    for key in ("state", "progress", "videos", "task_id", "job_id", "render_mode", "layout_preset"):
         if key in payload:
             summary[key] = payload.get(key)
     if "state" not in summary:
@@ -512,6 +664,17 @@ def _summarize_final_task(task_dir: Path) -> dict[str, Any]:
         )
         if job_id is not None:
             summary["job_id"] = job_id
+    render_mode = _detect_render_mode_from_payloads(
+        payload,
+        task_id=str(summary.get("task_id") or task_dir.name),
+        job_id=str(summary.get("job_id") or ""),
+    )
+    summary.update(
+        _render_mode_metadata(
+            render_mode,
+            layout_preset=_extract_layout_preset(payload),
+        )
+    )
     return summary
 
 
@@ -584,6 +747,75 @@ def _completed_job_sort_key(job: Mapping[str, Any]) -> tuple[float, str]:
     )
 
 
+def _completed_job_metadata_by_task(
+    completed_dir: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    completed_root = (
+        Path(completed_dir) if completed_dir is not None else DEFAULT_COMPLETED_DIR
+    ).resolve(strict=False)
+    if not completed_root.exists() or not completed_root.is_dir():
+        return {}
+
+    by_task: dict[str, dict[str, Any]] = {}
+    for path in sorted(completed_root.iterdir(), key=lambda item: item.name):
+        if not path.is_dir():
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(completed_root)
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        job_payload = _read_json_file(resolved / "job.json")
+        submit_payload = _read_json_file(resolved / "submit-response.json")
+        final_task_payload = _read_json_file(resolved / "final-task.json")
+        render_result_payload = _read_json_file(resolved / "render-result.json")
+        error_payload = _read_json_file(resolved / "error.json")
+        video_refs = _extract_video_refs_from_final_task(final_task_payload)
+        task_id = (
+            _extract_task_id_from_submit_response(submit_payload)
+            or _extract_task_id_from_final_task(final_task_payload)
+        )
+        if not task_id:
+            for ref in video_refs:
+                task_id = _task_id_from_video_ref(ref)
+                if task_id:
+                    break
+        if not task_id:
+            continue
+        job_id = _extract_job_id_from_completed_payload(job_payload)
+        render_mode = _detect_render_mode_from_payloads(
+            job_payload,
+            submit_payload,
+            final_task_payload,
+            render_result_payload,
+            error_payload,
+            task_id=task_id,
+            job_id=job_id,
+            path_name=resolved.name,
+        )
+        metadata: dict[str, Any] = {
+            "job_id": job_id,
+            "completed_job_id": job_id,
+            "completed_dir": _relative_path(resolved, completed_root),
+            "completed_dir_relative": _relative_path(resolved, completed_root),
+            "completed_at": _safe_modified_at_iso(resolved),
+        }
+        metadata.update(
+            _render_mode_metadata(
+                render_mode,
+                layout_preset=_extract_layout_preset(
+                    job_payload,
+                    submit_payload,
+                    final_task_payload,
+                    render_result_payload,
+                    error_payload,
+                ),
+            )
+        )
+        by_task[task_id] = metadata
+    return by_task
+
+
 def list_completed_render_jobs(
     completed_dir: str | Path | None = None,
     *,
@@ -601,7 +833,7 @@ def list_completed_render_jobs(
     if not completed_root.exists() or not completed_root.is_dir():
         return []
 
-    videos = list_rendered_videos(tasks_dir)
+    videos = list_rendered_videos(tasks_dir, completed_dir=completed_root)
     videos_by_task: dict[str, list[dict[str, Any]]] = {}
     for video in videos:
         videos_by_task.setdefault(str(video.get("task_id") or ""), []).append(video)
@@ -634,15 +866,33 @@ def list_completed_render_jobs(
 
         final_task_summary = {}
         if final_task_payload:
-            for key in ("state", "progress", "videos", "task_id", "job_id"):
+            for key in ("state", "progress", "videos", "task_id", "job_id", "render_mode", "layout_preset"):
                 value = final_task_payload.get(key)
                 if value is not None:
                     final_task_summary[key] = value
             data = final_task_payload.get("data")
             if isinstance(data, dict):
-                for key in ("state", "progress", "videos", "task_id", "job_id"):
+                for key in ("state", "progress", "videos", "task_id", "job_id", "render_mode", "layout_preset"):
                     if key not in final_task_summary and data.get(key) is not None:
                         final_task_summary[key] = data.get(key)
+
+        render_mode = _detect_render_mode_from_payloads(
+            job_payload,
+            submit_payload,
+            final_task_payload,
+            task_id=task_id,
+            job_id=_extract_job_id_from_completed_payload(job_payload),
+            path_name=resolved.name,
+        )
+        mode_metadata = _render_mode_metadata(
+            render_mode,
+            layout_preset=_extract_layout_preset(
+                job_payload,
+                submit_payload,
+                final_task_payload,
+            ),
+        )
+        final_task_summary.update(mode_metadata)
 
         detected_videos = list(videos_by_task.get(task_id, [])) if task_id else []
         jobs.append(
@@ -665,6 +915,7 @@ def list_completed_render_jobs(
                     if video.get("kind") == "final"
                 ],
                 "videos": detected_videos,
+                **mode_metadata,
             }
         )
 
@@ -686,6 +937,7 @@ def list_rendered_videos(
     tasks_dir: str | Path | None = None,
     *,
     preview_max_bytes: int = VIDEO_PREVIEW_MAX_BYTES,
+    completed_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """List final/combined MP4 render outputs under storage/tasks.
 
@@ -697,6 +949,11 @@ def list_rendered_videos(
     if not tasks_root.exists() or not tasks_root.is_dir():
         return []
 
+    completed_metadata = (
+        _completed_job_metadata_by_task(completed_dir)
+        if completed_dir is not None or tasks_dir is None
+        else {}
+    )
     videos: list[dict[str, Any]] = []
     for task_dir in sorted(tasks_root.iterdir(), key=lambda item: item.name):
         if not task_dir.is_dir():
@@ -740,12 +997,23 @@ def list_rendered_videos(
                 "modified_at_timestamp": stat.st_mtime,
                 "kind": kind,
                 "is_previewable": stat.st_size <= preview_max_bytes,
+                "previewable": stat.st_size <= preview_max_bytes,
                 "final_task_summary": _summarize_final_task(task_resolved),
                 "error_summary": _summarize_error_json(task_resolved),
             }
             final_task_summary = video["final_task_summary"]
             if isinstance(final_task_summary, dict) and final_task_summary.get("job_id"):
                 video["completed_job_id"] = final_task_summary.get("job_id")
+            render_mode = detect_render_mode_for_job(video)
+            video.update(
+                _render_mode_metadata(
+                    render_mode,
+                    layout_preset=str(final_task_summary.get("layout_preset") or ""),
+                )
+            )
+            metadata = completed_metadata.get(task_id)
+            if metadata:
+                video.update({key: value for key, value in metadata.items() if value})
             videos.append(video)
 
     return sorted(videos, key=_video_sort_key)
@@ -808,6 +1076,12 @@ def find_result_for_job(
                 "completed_at": job.get("completed_at"),
                 "state": job.get("state"),
                 "progress": job.get("progress"),
+                "render_mode": job.get("render_mode") or video.get("render_mode"),
+                "render_mode_label": job.get("render_mode_label")
+                or video.get("render_mode_label"),
+                "layout_preset": job.get("layout_preset") or video.get("layout_preset"),
+                "audio_summary": job.get("audio_summary") or video.get("audio_summary"),
+                "broll_summary": job.get("broll_summary") or video.get("broll_summary"),
                 "recommendation": "last_job",
                 "recommendation_title": "Tu video más reciente",
             }
@@ -1017,11 +1291,25 @@ def list_task_summaries(tasks_dir: str | Path | None = None) -> list[dict[str, A
             continue
         outputs = detect_task_outputs(task_dir)
         errors = _detect_error_signals(task_dir)
+        final_task_summary = _summarize_final_task(task_dir)
+        render_mode = detect_render_mode_for_job(
+            {
+                "task_id": task_dir.name,
+                "job_id": final_task_summary.get("job_id") or task_dir.name,
+                "final_task_summary": final_task_summary,
+            }
+        )
+        mode_metadata = _render_mode_metadata(
+            render_mode,
+            layout_preset=str(final_task_summary.get("layout_preset") or ""),
+        )
+        for output in outputs:
+            output.update(mode_metadata)
         status = "completed" if outputs else "failed" if errors else infer_task_status(task_dir)
         tasks.append(
             {
                 "task_id": task_dir.name,
-                "job_id": task_dir.name,
+                "job_id": final_task_summary.get("job_id") or task_dir.name,
                 "path": task_dir.as_posix(),
                 "status": status,
                 "outputs": outputs,
@@ -1032,6 +1320,8 @@ def list_task_summaries(tasks_dir: str | Path | None = None) -> list[dict[str, A
                 "error_count": len(errors),
                 "size_bytes": _task_size(task_dir),
                 "modified_at_iso": _safe_modified_at_iso(task_dir),
+                "final_task_summary": final_task_summary,
+                **mode_metadata,
             }
         )
     return tasks
@@ -1041,23 +1331,26 @@ def get_job_lifecycle_summary(
     *,
     pending_dir: str | Path | None = None,
     tasks_dir: str | Path | None = None,
+    completed_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Return a read-only dashboard summary for queue and render artifacts."""
 
     pending_jobs = list_pending_jobs(pending_dir)
     tasks = list_task_summaries(tasks_dir)
+    completed_jobs = list_completed_render_jobs(completed_dir, tasks_dir=tasks_dir)
     outputs = [output for task in tasks for output in task.get("outputs", [])]
     completed = [task for task in tasks if task.get("status") == "completed"]
     failed = [task for task in tasks if task.get("status") == "failed"]
     processing = [task for task in tasks if task.get("status") == "processing"]
     return {
         "pending_jobs": pending_jobs,
+        "completed_jobs": completed_jobs,
         "tasks": tasks,
         "outputs": outputs,
         "counts": {
             "pending": len(pending_jobs),
             "processing": len(processing),
-            "completed": len(completed),
+            "completed": len(completed_jobs) if completed_jobs else len(completed),
             "failed": len(failed),
             "videos": len(outputs),
         },
