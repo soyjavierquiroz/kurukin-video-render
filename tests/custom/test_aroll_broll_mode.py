@@ -152,6 +152,11 @@ class TestArollBrollMode(unittest.TestCase):
 
         self.assertEqual(summary["audio"], "Audio original del presentador")
 
+    def test_summarize_marks_renderer_prepared(self):
+        summary = summarize_aroll_broll_config(build_default_aroll_broll_config())
+
+        self.assertEqual(summary["renderer"], "Renderer preparado: alternating_fullscreen")
+
 
 if __name__ == "__main__":
     unittest.main()
