@@ -75,6 +75,19 @@ QUALITY_LABELS = {
     "Premium 2K": "premium_2k",
 }
 QUALITY_LABEL_BY_VALUE = {value: key for key, value in QUALITY_LABELS.items()}
+END_TO_END_FLOW_STEPS = (
+    "Crear video",
+    "Validar",
+    "Enviar a cola",
+    "Ejecutar runner controlado",
+    "API Docker",
+    "Render",
+    "MP4",
+    "Resultados",
+    "Tu video más reciente",
+    "Preview",
+    "Descargar MP4",
+)
 MOTION_PROFILES = [
     "none",
     "slow_zoom_in",
@@ -232,6 +245,11 @@ def _hero_block():
         "Esta pantalla no renderiza inmediatamente. Solo prepara y envía trabajos "
         "a la cola."
     )
+
+
+def _end_to_end_flow_block():
+    st.markdown("### Flujo completo")
+    st.caption(" -> ".join(END_TO_END_FLOW_STEPS))
 
 
 def _first_video_guide():
@@ -789,6 +807,7 @@ def render_validate_enqueue_step(manifest_summary):
 def _new_render_view():
     _initialize_form_state()
     _hero_block()
+    _end_to_end_flow_block()
     _first_video_guide()
     _progress_steps()
 
@@ -907,6 +926,10 @@ def _queue_storage_view():
     st.title("Cola y resultados")
     st.write("Revisa trabajos pendientes, resultados generados y errores sin entrar por terminal.")
     st.info("Esta pantalla solo consulta estado. No ejecuta renders ni modifica archivos.")
+    st.caption(
+        "Después de Enviar a cola, ejecuta el runner controlado para que use la API Docker, "
+        "haga el render y deje el MP4 en Resultados."
+    )
     st.button("Actualizar estado", key="refresh_queue")
 
     lifecycle = get_job_lifecycle_summary()
@@ -1206,6 +1229,7 @@ def _controlled_runner_view():
     st.info(
         "Este modo salta la ventana nocturna solo para una ejecución manual controlada."
         f"\n\nCola controlada: {CONTAINER_NIGHTLY_QUEUE_DIR}"
+        f"\n\nAPI Docker: {CONTAINER_API_BASE_URL}"
     )
     st.error(
         "Esta acción sí ejecutará el runner y puede consumir CPU, tiempo y storage. "
