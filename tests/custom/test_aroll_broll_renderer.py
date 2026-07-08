@@ -222,6 +222,16 @@ class TestArollBrollRenderer(unittest.TestCase):
         self.assertTrue(result["dry_run"])
         self.assertIsNone(result["returncode"])
 
+    def test_run_aroll_broll_render_dry_run_does_not_create_output_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+            output_parent = plan.output_path.parent
+
+            result = run_aroll_broll_render(plan, dry_run=True)
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(output_parent.exists())
+
     def test_run_aroll_broll_render_with_fake_runner_uses_command_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             calls = []
@@ -236,6 +246,48 @@ class TestArollBrollRenderer(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIsInstance(calls[0][0], list)
         self.assertEqual(result["stdout"], "ok")
+
+    def test_run_aroll_broll_render_execute_creates_output_parent_before_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+            output_parent = plan.output_path.parent
+
+            def runner(command, cwd, timeout):
+                self.assertTrue(output_parent.exists())
+                return {"returncode": 0, "stdout": "ok", "stderr": ""}
+
+            result = run_aroll_broll_render(plan, runner=runner)
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(output_parent.exists())
+
+    def test_run_aroll_broll_render_execute_success_returns_ok_true(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+
+            def runner(command, cwd, timeout):
+                return {"returncode": 0, "stdout": "done", "stderr": ""}
+
+            result = run_aroll_broll_render(plan, runner=runner)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(result["returncode"], 0)
+
+    def test_run_aroll_broll_render_execute_failure_returns_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+
+            def runner(command, cwd, timeout):
+                return {"returncode": 1, "stdout": "partial", "stderr": "boom"}
+
+            result = run_aroll_broll_render(plan, runner=runner)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["stdout"], "partial")
+        self.assertEqual(result["stderr"], "boom")
 
     def test_output_path_stays_under_task_final_mp4(self):
         with tempfile.TemporaryDirectory() as tmp:

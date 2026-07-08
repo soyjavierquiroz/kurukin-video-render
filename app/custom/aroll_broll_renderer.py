@@ -588,6 +588,8 @@ def run_aroll_broll_render(
             "dry_run": True,
         }
 
+    Path(plan.output_path).parent.mkdir(parents=True, exist_ok=True)
+
     if runner is None:
         completed = subprocess.run(
             command,

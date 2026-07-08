@@ -115,6 +115,9 @@ def run_smoke(
         "b_roll_count": len(plan.b_roll_assets),
         "output_path": result["output_path"],
         "command": result["command"],
+        "returncode": result.get("returncode"),
+        "stdout": result.get("stdout", ""),
+        "stderr": result.get("stderr", ""),
         "warnings": result["warnings"],
     }
 

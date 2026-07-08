@@ -87,6 +87,10 @@ de direct render A-roll/B-roll.
 - En dry-run no crea task dir, pending job ni archivo MP4.
 - `--execute` requiere `KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER=1`; sin ese
   flag aborta con `Direct A-roll/B-roll render execution is disabled`.
+- En execute crea el directorio padre del output antes de invocar ffmpeg.
+- Los failures imprimen `returncode`, `stdout` y `stderr` en el JSON para
+  diagnostico.
+- Una prueba real fallida no debe repetirse sin nueva autorizacion explicita.
 
 La siguiente fase requiere autorizacion explicita para ejecutar ffmpeg real con
 un fixture pequeno y controlado.
