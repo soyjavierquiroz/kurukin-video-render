@@ -2,15 +2,18 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import app.custom.aroll_broll_mode as aroll_broll_mode
 from app.custom.aroll_broll_mode import (
     AROLL_AUDIO_ORIGINAL,
     BROLL_AUDIO_MUTED,
     LAYOUT_ALTERNATING_FULLSCREEN,
     RENDER_MODE_AROLL_BROLL,
     build_aroll_broll_preview_timeline,
+    build_aroll_broll_queue_payload,
     build_default_aroll_broll_config,
     summarize_aroll_broll_config,
     validate_aroll_broll_config,
@@ -156,6 +159,54 @@ class TestArollBrollMode(unittest.TestCase):
         summary = summarize_aroll_broll_config(build_default_aroll_broll_config())
 
         self.assertEqual(summary["renderer"], "Renderer preparado: alternating_fullscreen")
+
+    def test_build_queue_payload_marks_aroll_broll_as_guarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "storage" / "local_videos" / "presenter.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            asset_root = root / "data" / "job-assets"
+            manifest = (
+                asset_root
+                / "jab_test_bundle"
+                / "manifests"
+                / "renderer-manifest.json"
+            )
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('{"assets": []}', encoding="utf-8")
+            config = build_default_aroll_broll_config()
+            config["a_roll"]["path"] = "storage/local_videos/presenter.mp4"
+            config["b_roll"]["bundle_uid"] = "jab_test_bundle"
+
+            with mock.patch.object(
+                aroll_broll_mode,
+                "DEFAULT_ASSET_HUB_JOB_ASSETS_DIR",
+                asset_root,
+            ):
+                payload = build_aroll_broll_queue_payload(
+                    config,
+                    job_id="aroll-broll-001",
+                    project_root=root,
+                    render_quality="draft_720p",
+                    title="Presenter edit",
+                )
+
+        self.assertEqual(payload["render_mode"], RENDER_MODE_AROLL_BROLL)
+        self.assertEqual(payload["aroll_broll"]["render_mode"], RENDER_MODE_AROLL_BROLL)
+        self.assertEqual(payload["video_subject"], "Presenter edit")
+        self.assertFalse(payload["runner"]["renderer_enabled"])
+        self.assertEqual(payload["runner"]["execution_guard"], "renderer_not_enabled")
+
+    def test_build_queue_payload_rejects_incomplete_strict_config(self):
+        config = build_default_aroll_broll_config()
+
+        with self.assertRaises(ValueError):
+            build_aroll_broll_queue_payload(
+                config,
+                job_id="aroll-broll-001",
+                strict=True,
+            )
 
 
 if __name__ == "__main__":

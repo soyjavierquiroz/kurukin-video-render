@@ -55,9 +55,24 @@ activar todavia la cola desde la UI.
 - El crop/fit usa center crop seguro para normalizar cada segmento.
 - El comando ffmpeg se construye como lista segura, sin `shell=True`.
 - La fase actual implementa renderer core, ffprobe/ffmpeg helpers y dry-run.
-- La cola sigue deshabilitada para A-roll/B-roll en Render Console.
+- La cola solo crea pending protegido para A-roll/B-roll; el runner no lo ejecuta.
 
-Siguiente fase: integrar queue/runner y validar E2E con un fixture pequeno y
+## Queue integration protegida
+
+La cola A-roll/B-roll esta protegida por `KURUKIN_ENABLE_AROLL_BROLL_QUEUE`.
+En reposo/default, Render Console no crea pending A-roll/B-roll.
+
+- En pruebas controladas, con `KURUKIN_ENABLE_AROLL_BROLL_QUEUE=1`, puede crear
+  un pending protegido.
+- El pending job incluye `render_mode: "aroll_broll"`.
+- El pending job incluye `aroll_broll` con la config validada.
+- Render Console solo encola despues de validacion estricta y flag explicito.
+- La ejecucion esta protegida por `KURUKIN_ENABLE_AROLL_BROLL_RENDERER`.
+- Con renderer flag off, el runner rechaza antes de llamar `/api/v1/videos`.
+- Esta fase no ejecuta renderer real ni crea task.
+- La proteccion existe hasta conectar el handler real.
+
+Siguiente fase: conectar handler real y validar E2E con un fixture pequeno y
 controlado.
 
 ## Guardrails
@@ -68,4 +83,6 @@ controlado.
 - No acepta paths arbitrarios.
 - A-roll local debe vivir bajo `storage/local_videos` o `storage/local_assets`.
 - Manifests de Asset Hub deben vivir bajo `/data/job-assets/<bundle_uid>/manifests/renderer-manifest.json`.
-- La fase actual no ejecuta renderer real, no crea pending job y no crea task.
+- En reposo/default no crea pending; solo puede crearlo con flag explicito de
+  cola para pruebas controladas.
+- La fase actual no ejecuta renderer real ni crea task.

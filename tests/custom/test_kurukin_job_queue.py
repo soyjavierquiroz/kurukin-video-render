@@ -18,12 +18,15 @@ from app.custom.kurukin_job_queue import (
     find_result_for_job,
     get_recommended_result,
     get_storage_summary,
+    is_aroll_broll_queue_enabled,
+    is_aroll_broll_renderer_enabled,
     list_completed_render_jobs,
     list_rendered_videos,
     list_nightly_queue,
     list_render_tasks,
     read_video_bytes_for_download,
     sanitize_job_id,
+    summarize_pending_job,
 )
 
 
@@ -115,6 +118,46 @@ class TestKurukinJobQueue(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             with self.assertRaises(KurukinJobQueueError):
                 enqueue_moneyprinter_payload({}, queue_dir=Path(tmp_dir) / "pending")
+
+    def test_aroll_broll_queue_flag_defaults_to_false(self):
+        self.assertFalse(is_aroll_broll_queue_enabled({}))
+
+    def test_aroll_broll_renderer_flag_defaults_to_false(self):
+        self.assertFalse(is_aroll_broll_renderer_enabled({}))
+
+    def test_aroll_broll_queue_flag_accepts_enabled_values(self):
+        for value in ("1", "true", "TRUE", "yes", "on"):
+            with self.subTest(value=value):
+                self.assertTrue(
+                    is_aroll_broll_queue_enabled(
+                        {"KURUKIN_ENABLE_AROLL_BROLL_QUEUE": value}
+                    )
+                )
+
+    def test_summarize_pending_job_labels_aroll_broll_payload(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pending_path = Path(tmp_dir) / "20260708-120000-aroll-broll.json"
+            pending_path.write_text(
+                json.dumps(
+                    {
+                        "job_id": "aroll-broll-001",
+                        "video_subject": "Presenter edit",
+                        "render_mode": "aroll_broll",
+                        "video_resolution": "draft_720p",
+                        "aroll_broll": {
+                            "subtitles": {"source": "custom_srt"},
+                        },
+                        "runner": {"job_id": "aroll-broll-001"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = summarize_pending_job(pending_path)
+
+        self.assertTrue(summary["valid_json"])
+        self.assertEqual(summary["asset_source"], "A-roll/B-roll")
+        self.assertEqual(summary["subtitles"], "SRT propio")
 
     def test_list_nightly_queue_counts_groups(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

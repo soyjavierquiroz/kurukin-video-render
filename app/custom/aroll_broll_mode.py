@@ -8,6 +8,7 @@ from typing import Any
 
 
 RENDER_MODE_AROLL_BROLL = "aroll_broll"
+AROLL_BROLL_QUEUE_GUARD = "renderer_not_enabled"
 
 LAYOUT_ALTERNATING_FULLSCREEN = "alternating_fullscreen"
 LAYOUT_VERTICAL_SPLIT_A_TOP = "vertical_split_a_top"
@@ -338,6 +339,8 @@ def validate_aroll_broll_config(
                 errors=errors,
                 warnings=warnings,
             )
+        elif strict:
+            errors.append("b_roll.manifest_path is required for Asset Hub B-roll")
 
     return {
         "ok": not errors,
@@ -452,4 +455,61 @@ def summarize_aroll_broll_config(config: dict[str, Any]) -> dict[str, str]:
         ),
         "crop": str(normalized.get("a_roll", {}).get("crop") or SPEAKER_CROP_CENTER),
         "renderer": "Renderer preparado: alternating_fullscreen",
+    }
+
+
+def build_aroll_broll_queue_payload(
+    config: dict[str, Any],
+    *,
+    job_id: str,
+    project_root: str | Path | None = None,
+    render_quality: str = "draft_720p",
+    title: str = "",
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Build a queued-only A-roll/B-roll pending payload.
+
+    The resulting job is intentionally not a MoneyPrinterTurbo API payload. It
+    carries a render_mode guard so the runner can reject it before submitting
+    anything to the backend until the A-roll/B-roll renderer is wired end to end.
+    """
+
+    clean_job_id = _clean_text(job_id)
+    if not clean_job_id:
+        raise ValueError("job_id is required for A-roll/B-roll queue payload")
+
+    validation = validate_aroll_broll_config(
+        config,
+        project_root=project_root,
+        strict=strict,
+    )
+    if not validation["ok"]:
+        details = "; ".join(validation["errors"])
+        raise ValueError(f"A-roll/B-roll config is not valid: {details}")
+
+    normalized = validation["normalized"]
+    subtitles_source = normalized.get("subtitles", {}).get("source")
+    video_title = _clean_text(title) or "A-roll/B-roll"
+    quality = _clean_text(render_quality) or "draft_720p"
+
+    return {
+        "job_id": clean_job_id,
+        "description": "A-roll/B-roll queued job; renderer execution disabled",
+        "render_mode": RENDER_MODE_AROLL_BROLL,
+        "aroll_broll": deepcopy(normalized),
+        "video_subject": video_title,
+        "video_aspect": "9:16",
+        "video_resolution": quality,
+        "video_source": RENDER_MODE_AROLL_BROLL,
+        "subtitle_enabled": subtitles_source != SUBTITLES_SOURCE_NONE,
+        "runner": {
+            "job_id": clean_job_id,
+            "render_mode": RENDER_MODE_AROLL_BROLL,
+            "execution_guard": AROLL_BROLL_QUEUE_GUARD,
+            "renderer_enabled": False,
+            "message": (
+                "A-roll/B-roll queue payload is prepared, but runner execution "
+                "is disabled until the renderer integration phase."
+            ),
+        },
     }

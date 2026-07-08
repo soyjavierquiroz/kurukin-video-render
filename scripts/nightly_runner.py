@@ -20,9 +20,15 @@ from urllib import error, request
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.custom.kurukin_job_queue import is_aroll_broll_renderer_enabled
+
 CONTAINER_QUEUE_DIR = Path("/MoneyPrinterTurbo/storage/nightly_jobs")
 DEFAULT_API_BASE_URL = "http://127.0.0.1:18080/api/v1"
 METADATA_KEYS = {"job_id", "notes", "description", "runner"}
+RENDER_MODE_AROLL_BROLL = "aroll_broll"
 COMPLETE_STATE = 1
 FAILED_STATE = -1
 PROCESSING_STATE = 4
@@ -198,6 +204,17 @@ def move_run_dir(run_dir: Path, destination_root: Path) -> Path:
 def validate_job(job: Any) -> dict[str, Any]:
     if not isinstance(job, dict):
         raise RunnerError("job must be a JSON object")
+
+    render_mode = job.get("render_mode")
+    if render_mode == RENDER_MODE_AROLL_BROLL:
+        if not is_aroll_broll_renderer_enabled():
+            raise RunnerError("A-roll/B-roll renderer execution is disabled")
+        raise RunnerError(
+            "A-roll/B-roll renderer execution is enabled, but no runner handler "
+            "is wired for this phase"
+        )
+    if render_mode not in (None, ""):
+        raise RunnerError(f"unsupported render_mode: {render_mode}")
 
     subject = job.get("video_subject")
     if not isinstance(subject, str) or not subject.strip():
