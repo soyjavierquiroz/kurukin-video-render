@@ -384,6 +384,74 @@ class TestArollBrollMode(unittest.TestCase):
             ["local_library", "uploaded"],
         )
 
+    def test_config_preserves_asset_materialization_metadata(self):
+        config = build_default_aroll_broll_config()
+        config["asset_materialization"] = {
+            "source_provider": "pexels",
+            "query": "city walking",
+            "b_roll_asset_count": 3,
+            "ignored": "value",
+        }
+
+        result = validate_aroll_broll_config(config, strict=False)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(
+            result["normalized"]["asset_materialization"],
+            {
+                "source_provider": "pexels",
+                "query": "city walking",
+                "b_roll_asset_count": 3,
+                "asset_policy": {
+                    "mode": "open_sources",
+                    "label": "Open sources",
+                    "console_label": "Asset policy: Open sources",
+                    "short_label": "Fuentes: abiertas",
+                    "allowed_sources": [
+                        "asset_hub",
+                        "pexels",
+                        "local_library",
+                        "uploaded",
+                    ],
+                    "exclusive_source": None,
+                    "brand_asset_bundle_uid": None,
+                    "require_manifest": False,
+                    "exclusive": False,
+                },
+            },
+        )
+
+    def test_queue_payload_includes_asset_materialization_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "storage" / "local_videos" / "presenter.mp4"
+            asset = root / "storage" / "local_assets" / "cutaway.mp4"
+            video.parent.mkdir(parents=True)
+            asset.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            asset.write_bytes(b"asset")
+            config = build_default_aroll_broll_config()
+            config["a_roll"]["path"] = "storage/local_videos/presenter.mp4"
+            config["b_roll"]["source"] = BROLL_SOURCE_LOCAL_ASSETS
+            config["b_roll"]["assets"] = ["storage/local_assets/cutaway.mp4"]
+            config["asset_materialization"] = {
+                "source_provider": "pexels",
+                "query": "city walking",
+                "b_roll_asset_count": 1,
+            }
+
+            payload = build_aroll_broll_queue_payload(
+                config,
+                job_id="aroll-broll-materialized",
+                project_root=root,
+            )
+
+        self.assertEqual(payload["asset_materialization"]["source_provider"], "pexels")
+        self.assertEqual(
+            payload["aroll_broll"]["asset_materialization"]["query"],
+            "city walking",
+        )
+
     def test_build_queue_payload_marks_aroll_broll_as_guarded(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
