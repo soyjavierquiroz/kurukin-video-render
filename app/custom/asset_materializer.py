@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from app.custom.asset_source_policy import (
     ASSET_SOURCE_ASSET_HUB,
@@ -278,13 +278,17 @@ def _downloader_payload(
     return downloader(downloader_request)
 
 
-def _extract_downloader_assets(value: Any) -> tuple[list[str], str, dict[str, Any]]:
+def _extract_downloader_assets(
+    value: Any,
+    *,
+    default_provider: str = "",
+) -> tuple[list[str], str, dict[str, Any]]:
     if isinstance(value, list):
-        return _clean_path_list(value), ASSET_SOURCE_PEXELS, {}
+        return _clean_path_list(value), default_provider, {}
     if not isinstance(value, dict):
-        return [], ASSET_SOURCE_PEXELS, {}
+        return [], "", {}
     assets = _clean_path_list(value.get("assets") or value.get("b_roll_assets"))
-    source_provider = _clean_text(value.get("source_provider")) or ASSET_SOURCE_PEXELS
+    source_provider = _clean_text(value.get("source_provider")) or default_provider
     metadata = deepcopy(value.get("metadata")) if isinstance(value.get("metadata"), dict) else {}
     return assets, source_provider, metadata
 
@@ -307,6 +311,7 @@ def _materialize_open_sources(
     request: dict[str, Any],
     *,
     downloader: Callable[..., Any] | None,
+    source_adapters: Mapping[str, Callable[..., Any]] | None,
 ) -> dict[str, Any]:
     desired_count = request["desired_count"]
     assets = _select_local_candidates(request)[:desired_count]
@@ -318,45 +323,105 @@ def _materialize_open_sources(
         )
 
     policy = request["asset_policy"]
-    external_allowed = is_source_allowed(policy, ASSET_SOURCE_PEXELS) or is_source_allowed(
-        policy,
-        ASSET_SOURCE_ASSET_HUB,
-    )
-    if not external_allowed and not assets:
-        return _error_result(request, ["No allowed sources available"])
-    if not external_allowed:
-        return _error_result(
-            request,
-            ["Local-only policy requires enough local candidates"],
-            assets=assets,
-        )
-    if downloader is None:
+    adapter_sources = list(policy.get("allowed_sources", []))
+    external_sources = [
+        source
+        for source in adapter_sources
+        if source not in (ASSET_SOURCE_LOCAL_LIBRARY, ASSET_SOURCE_UPLOADED)
+    ]
+    external_allowed = bool(external_sources)
+    configured_adapters = {
+        _clean_text(source): adapter
+        for source, adapter in (source_adapters or {}).items()
+        if callable(adapter)
+    }
+    allowed_adapters = [
+        (source, configured_adapters[source])
+        for source in adapter_sources
+        if source in configured_adapters
+    ]
+    legacy_downloader = downloader if external_allowed else None
+    if not allowed_adapters and legacy_downloader is None:
+        if not external_allowed:
+            return _error_result(
+                request,
+                ["Local-only policy requires enough local candidates"],
+                assets=assets,
+            )
         return _error_result(
             request,
             ["External downloader is not configured"],
             assets=assets,
         )
 
-    downloaded, download_provider, download_metadata = _extract_downloader_assets(
-        _downloader_payload(downloader, request, desired_count - len(assets))
-    )
-    downloaded = downloaded[: desired_count - len(assets)]
-    all_assets = _dedupe([*assets, *downloaded])[:desired_count]
-    asset_errors = _validate_asset_paths(all_assets)
-    if asset_errors:
-        return _error_result(request, asset_errors, assets=all_assets)
-    if len(all_assets) < desired_count:
+    providers = [ASSET_SOURCE_LOCAL_LIBRARY] if assets else []
+    combined_metadata: dict[str, Any] = {}
+    adapter_metadata: list[dict[str, Any]] = []
+
+    def consume_adapter(
+        adapter: Callable[..., Any],
+        *,
+        default_provider: str = "",
+    ) -> dict[str, Any] | None:
+        nonlocal assets
+        downloaded, provider, metadata = _extract_downloader_assets(
+            _downloader_payload(adapter, request, desired_count - len(assets)),
+            default_provider=default_provider,
+        )
+        if downloaded and not provider:
+            return _error_result(
+                request,
+                ["External downloader must identify source_provider"],
+                assets=assets,
+            )
+        if provider and not is_source_allowed(policy, provider):
+            return _error_result(
+                request,
+                [f"Source provider is not allowed: {provider}"],
+                assets=assets,
+            )
+        assets = _dedupe([*assets, *downloaded])[:desired_count]
+        asset_errors = _validate_asset_paths(assets)
+        if asset_errors:
+            return _error_result(request, asset_errors, assets=assets)
+        if downloaded and provider and provider not in providers:
+            providers.append(provider)
+        if metadata:
+            combined_metadata.update(metadata)
+            adapter_metadata.append(
+                {
+                    "source_provider": provider,
+                    "metadata": metadata,
+                }
+            )
+        return None
+
+    for source, adapter in allowed_adapters:
+        error = consume_adapter(adapter, default_provider=source)
+        if error:
+            return error
+        if len(assets) >= desired_count:
+            break
+
+    if len(assets) < desired_count and legacy_downloader is not None:
+        error = consume_adapter(legacy_downloader)
+        if error:
+            return error
+
+    if len(assets) < desired_count:
         return _error_result(
             request,
             ["External downloader did not return enough local assets"],
-            assets=all_assets,
+            assets=assets,
         )
-    provider = download_provider if not assets else "mixed"
+    if adapter_metadata:
+        combined_metadata["source_adapter_metadata"] = adapter_metadata
+    provider = providers[0] if len(providers) == 1 else "mixed"
     return _ok_result(
         request,
         source_provider=provider,
-        assets=all_assets,
-        extra_metadata=download_metadata,
+        assets=assets,
+        extra_metadata=combined_metadata,
     )
 
 
@@ -425,6 +490,7 @@ def materialize_assets_for_aroll_broll(
     request: dict[str, Any],
     project_root: Path,
     downloader: Callable[..., Any] | None = None,
+    source_adapters: Mapping[str, Callable[..., Any]] | None = None,
     manifest_reader: Callable[..., Any] | None = None,
     local_library_resolver: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
@@ -445,7 +511,10 @@ def materialize_assets_for_aroll_broll(
     if errors:
         return _error_result(normalized, errors)
 
-    if local_library_resolver is not None:
+    if (
+        local_library_resolver is not None
+        and is_source_allowed(policy, ASSET_SOURCE_LOCAL_LIBRARY)
+    ):
         resolved = local_library_resolver(deepcopy(normalized))
         normalized["local_candidates"] = _dedupe(
             [
@@ -459,7 +528,11 @@ def materialize_assets_for_aroll_broll(
 
     mode = policy.get("mode")
     if mode == ASSET_SOURCE_MODE_OPEN_SOURCES:
-        return _materialize_open_sources(normalized, downloader=downloader)
+        return _materialize_open_sources(
+            normalized,
+            downloader=downloader,
+            source_adapters=source_adapters,
+        )
     if mode == ASSET_SOURCE_MODE_LOCAL_ONLY:
         return _materialize_local_only(normalized)
     if mode == ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS:

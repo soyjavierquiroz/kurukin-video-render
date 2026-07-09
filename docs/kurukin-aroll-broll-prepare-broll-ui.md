@@ -26,9 +26,14 @@ para `b_roll.assets`.
 `open_sources`:
 
 - usa candidatos locales primero.
-- en UI inicial no pasa downloader real.
-- si faltan candidatos, muestra error claro.
-- Pexels real queda para integracion futura con downloader controlado.
+- en UI inicial no pasa downloader real con flags apagados.
+- si faltan candidatos y el flag esta apagado, muestra:
+  `No hay suficientes assets locales. Pexels no está activo en esta consola.`
+- Pexels queda disponible solo con integracion controlada y
+  `KURUKIN_ENABLE_PEXELS_SOURCE=1`.
+- El flag registra Pexels como adapter opcional; no reemplaza candidatos
+  locales ni otros adapters permitidos por la policy.
+- cuando se habilite en una prueba controlada, debe usarse prepare-only.
 
 `exclusive_brand_assets`:
 
@@ -48,3 +53,11 @@ para `b_roll.assets`.
 - no pending.
 - no task.
 - enqueue/render siguen en pasos separados y protegidos por flags.
+
+## Copy visible
+
+La consola muestra:
+
+`Pexels source: disponible solo con integración controlada/flag; no se usa por defecto.`
+
+No se muestra API key ni se prueba Pexels real desde la UI con el flag apagado.

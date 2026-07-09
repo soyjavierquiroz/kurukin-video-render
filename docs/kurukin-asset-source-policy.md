@@ -17,6 +17,7 @@ Marca exclusiva:
 - puede usar Asset Hub, Pexels, local library, uploaded.
 - no obliga exclusividad.
 - renderer sigue consumiendo assets locales.
+- Pexels requiere adapter/downloader controlado; no se activa por defecto.
 
 `exclusive_brand_assets`:
 
@@ -50,13 +51,26 @@ Renderer:
 
 ## Materializer minimo
 
-- `open_sources` usa candidatos locales primero y solo completa con downloader
-  inyectado si la policy lo permite.
+- `open_sources` usa candidatos locales primero y luego adapters inyectados
+  permitidos, en el orden de `allowed_sources`.
+- Los resultados de multiples adapters se combinan y deduplican; Pexels no
+  desplaza a `local_library`, `uploaded`, Asset Hub/manifest ni fuentes futuras.
+- Si el downloader se identifica como `pexels`, la policy debe permitir
+  `pexels`.
 - `local_only` usa solo candidatos locales y falla si no alcanzan.
 - `exclusive_brand_assets` usa manifest local de marca y no usa downloader.
 - El resultado final expone `b_roll_assets`, `b_roll_asset_count`,
   `source_provider` y metadata read-only para Cola/Resultados.
 - No hay Pexels real ni Asset Hub API en tests.
+
+## Pexels source adapter
+
+El adapter Pexels vive en `app/custom/pexels_source.py` y conserva metadata de
+atribucion (`photographer`, `photographer_url`, `pexels_url`, dimensiones y
+path local) cuando esta disponible. La UI lo mantiene detras de
+`KURUKIN_ENABLE_PEXELS_SOURCE=1`.
+
+Ver: `docs/kurukin-pexels-source-adapter.md`.
 
 ## Relación con smoke-005
 

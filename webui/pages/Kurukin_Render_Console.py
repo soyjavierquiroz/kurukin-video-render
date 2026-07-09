@@ -69,12 +69,14 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     ASSET_SOURCE_ASSET_HUB,
     ASSET_SOURCE_LOCAL,
     ASSET_SOURCE_STOCK,
+    PEXELS_SOURCE_FLAG,
     build_aroll_broll_payload_from_console,
     build_operator_summary,
     build_render_console_spec,
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
     get_manifest_summary_for_ui,
+    is_pexels_source_enabled,
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
@@ -86,6 +88,7 @@ from app.custom.asset_source_policy import (  # noqa: E402
     ASSET_SOURCE_MODE_LOCAL_ONLY,
     ASSET_SOURCE_MODE_OPEN_SOURCES,
 )
+from app.custom.pexels_source import create_pexels_downloader  # noqa: E402
 
 
 DEFAULT_BUNDLE_UID = "jab_b28367fb22d44a40bae507c175f464c4"
@@ -1041,6 +1044,13 @@ def _aroll_broll_queue_flag_label():
     return f"{AROLL_BROLL_QUEUE_FLAG}={value}"
 
 
+def _pexels_source_flag_label():
+    value = os.environ.get(PEXELS_SOURCE_FLAG)
+    if value is None:
+        return f"{PEXELS_SOURCE_FLAG}=<unset>"
+    return f"{PEXELS_SOURCE_FLAG}={value}"
+
+
 def _current_prepare_broll_policy():
     mode = st.session_state.get(
         "aroll_broll_prepare_policy",
@@ -1083,6 +1093,11 @@ def _prepare_broll_assets_block():
     st.caption(
         "Materializa una lista local de assets; no encola, no renderiza y no ejecuta runner."
     )
+    st.info(
+        "Pexels source: disponible solo con integración controlada/flag; no se usa por defecto."
+    )
+    st.caption("Flag Pexels: KURUKIN_ENABLE_PEXELS_SOURCE")
+    st.caption(_pexels_source_flag_label())
     cols = st.columns([1, 1, 1])
     with cols[0]:
         policy_label = st.selectbox(
@@ -1146,6 +1161,15 @@ def _prepare_broll_assets_block():
     )
 
     if st.button("Preparar B-roll", key="aroll_broll_prepare_assets"):
+        pexels_downloader = None
+        if is_pexels_source_enabled() and (
+            st.session_state.get("aroll_broll_prepare_policy")
+            == ASSET_SOURCE_MODE_OPEN_SOURCES
+        ):
+
+            def pexels_downloader(request_data):
+                return create_pexels_downloader()(request_data)
+
         result = prepare_broll_assets_from_console(
             project_root=Path(ROOT_DIR),
             asset_policy=_current_prepare_broll_policy(),
@@ -1157,6 +1181,8 @@ def _prepare_broll_assets_block():
                 "aroll_broll_prepare_local_candidates",
                 "",
             ),
+            pexels_downloader=pexels_downloader,
+            environ=dict(os.environ),
         )
         st.session_state["aroll_broll_prepared_assets"] = result
         if result.get("ok"):

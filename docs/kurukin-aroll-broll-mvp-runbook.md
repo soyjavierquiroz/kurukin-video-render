@@ -3,12 +3,14 @@
 ## Estado
 
 - Stable branch: custom/mvp
-- Latest checkpoint: mvp-aroll-broll-ui-e2e-pass-2026-07-08
+- Latest stable checkpoint: mvp-aroll-broll-prepare-broll-ui-2026-07-09
+- Current feature pending merge: a-roll/b-roll Pexels source adapter
 - MVP técnico: completo
 - E2E runner: completo
 - UI E2E: completo
-- Demo desde Render Console: validado con smoke-004
-- E2E runner PASS: aroll-broll-runner-smoke-003
+- Multi B-roll E2E: completo
+- Prepare B-roll UI: completo
+- Pexels source adapter: pending merge
 - Render mode: render_mode=aroll_broll
 - Layout MVP: alternating_fullscreen
 
@@ -58,6 +60,12 @@ KURUKIN_ENABLE_UI_RUNNER
 
 - default unset/off
 - no fue usado para E2E A-roll/B-roll
+
+KURUKIN_ENABLE_PEXELS_SOURCE
+
+- default unset/off
+- permite preparar Pexels solo con integracion controlada
+- no renderiza, no encola y no ejecuta runner por si mismo
 
 ## Artefactos PASS
 
@@ -114,7 +122,9 @@ Runner E2E PASS:
 - Preparar B-roll no encola render, no ejecuta runner y no ejecuta ffmpeg.
 - `local_only` es el modo seguro inicial: usa solo candidatos locales.
 - `open_sources` no llama Pexels real desde UI; solo podria completar con un
-  downloader controlado en una integracion futura.
+  downloader controlado cuando `KURUKIN_ENABLE_PEXELS_SOURCE=1`.
+- Con el flag apagado, si faltan locales, la consola muestra:
+  `No hay suficientes assets locales. Pexels no está activo en esta consola.`
 - El enqueue/render sigue siendo un paso separado y protegido por flags.
 - Metadata visible:
   - Layout: alternating_fullscreen
@@ -151,14 +161,31 @@ Runner E2E PASS:
 
 - Introducido como helper puro en `app/custom/asset_materializer.py`.
 - Convierte `asset_policy` + request en `b_roll_assets` locales.
-- `open_sources` usa candidatos locales primero y completa solo con downloader
-  inyectado.
+- `open_sources` usa candidatos locales primero y completa con adapters
+  genericos inyectados, filtrados y ordenados por `allowed_sources`.
+- Los paths de multiples fuentes se combinan/deduplican antes de construir
+  `b_roll.assets`; Pexels no es fuente unica ni default.
 - `local_only` solo usa candidatos locales.
 - `exclusive_brand_assets` usa manifest local de marca y bloquea fuentes
   abiertas.
 - Tests usan fakes; no hay Pexels real, descargas reales ni Asset Hub API.
 - No se conecta a runner/render en esta fase.
 - Ver: `docs/kurukin-asset-materializer.md`.
+
+## Pexels source adapter
+
+- Introducido como helper puro en `app/custom/pexels_source.py`.
+- Usa endpoint `/v1/videos/search` y header `Authorization` directo sin
+  `Bearer`.
+- Selecciona MP4, prefiere portrait y deduplica por video/link.
+- Guarda metadata de atribucion cuando esta disponible.
+- Solo escribe bajo `storage/local_videos` o `storage/local_assets`.
+- Pexels es solo un adapter de `open_sources`.
+- No reemplaza `local_library`, `uploaded`, Asset Hub/manifest ni otros
+  adapters futuros.
+- El materializer combina/deduplica fuentes permitidas por `allowed_sources`.
+- Renderer y runner siguen sin proveedores externos.
+- Ver: `docs/kurukin-pexels-source-adapter.md`.
 
 ## Prepare B-roll UI
 
@@ -178,6 +205,7 @@ Runner E2E PASS:
 - MPT no llama Asset Hub API para A-roll/B-roll
 - renderer no llama Pexels ni proveedores externos
 - materializer solo usa proveedores inyectados/fakes en tests
+- Pexels source default apagado y sin llamadas reales en esta fase
 - no /api/v1/videos para render_mode=aroll_broll
 - no DB
 - no rclone
