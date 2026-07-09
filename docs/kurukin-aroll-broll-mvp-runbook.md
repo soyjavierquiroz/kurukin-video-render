@@ -3,12 +3,14 @@
 ## Estado
 
 - Stable branch: custom/mvp
-- Latest checkpoint: mvp-aroll-broll-ui-e2e-pass-2026-07-08
+- Latest stable checkpoint: mvp-aroll-broll-prepare-broll-ui-2026-07-09
+- Current feature pending merge: a-roll/b-roll Pexels source adapter
 - MVP técnico: completo
 - E2E runner: completo
 - UI E2E: completo
-- Demo desde Render Console: validado con smoke-004
-- E2E runner PASS: aroll-broll-runner-smoke-003
+- Multi B-roll E2E: completo
+- Prepare B-roll UI: completo
+- Pexels source adapter: pending merge
 - Render mode: render_mode=aroll_broll
 - Layout MVP: alternating_fullscreen
 
@@ -178,6 +180,10 @@ Runner E2E PASS:
 - Selecciona MP4, prefiere portrait y deduplica por video/link.
 - Guarda metadata de atribucion cuando esta disponible.
 - Solo escribe bajo `storage/local_videos` o `storage/local_assets`.
+- Pexels es solo un adapter de `open_sources`.
+- No reemplaza `local_library`, `uploaded`, Asset Hub/manifest ni otros
+  adapters futuros.
+- El materializer combina/deduplica fuentes permitidas por `allowed_sources`.
 - Renderer y runner siguen sin proveedores externos.
 - Ver: `docs/kurukin-pexels-source-adapter.md`.
 
