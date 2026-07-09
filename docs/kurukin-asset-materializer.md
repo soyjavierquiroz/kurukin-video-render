@@ -3,7 +3,12 @@
 ## Objetivo
 
 El materializer convierte una `asset_policy` y una request de sourcing en paths
-locales para `b_roll.assets`.
+locales para `b_roll.assets` en flujos prepare-only controlados.
+
+Estado arquitectonico: no es la ruta primaria para sourcing/render final.
+Kurukin debe preferir el motor nativo MoneyPrinterTurbo mediante
+`app/custom/mpt_engine_bridge.py`. Este helper se conserva para UX de
+preparacion, pruebas controladas y gaps documentados.
 
 Esta fase es helper/schema/docs/tests. No ejecuta renderer, runner, ffmpeg,
 Pexels real ni Asset Hub API.
@@ -90,6 +95,16 @@ Render Console:
   `b_roll.assets`.
 - no crea pending, no crea task, no ejecuta runner, no ejecuta ffmpeg.
 
+Bridge MPT:
+
+- `app/custom/mpt_engine_bridge.py` transforma intents Kurukin en specs nativos
+  MPT.
+- Para stock externo, la preferencia es `video_source` nativo MPT
+  (`pexels`, `pixabay`, `coverr`) cuando se autorice render real.
+- Para materiales ya locales, el bridge usa `video_source="local"` y
+  `video_materials`.
+- El materializer no debe convertirse en un motor paralelo de descarga/render.
+
 Renderer:
 
 - no decide fuentes.
@@ -105,12 +120,16 @@ llaman APIs, no crean pending, no crean task y no requieren storage real.
 ## Pexels adapter controlado
 
 `app/custom/pexels_source.py` prepara un downloader compatible con el
-materializer. Usa `https://api.pexels.com/v1/videos/search`, header
+materializer, pero queda como fallback experimental/no primario. Usa
+`https://api.pexels.com/v1/videos/search`, header
 `Authorization` directo sin `Bearer`, selecciona MP4 verticales cuando puede y
 guarda metadata de atribucion. Solo descarga cuando se llama explicitamente a la
 funcion de descarga/downloader con un `opener` real o fake.
 
 Ver: `docs/kurukin-pexels-source-adapter.md`.
+
+No crear adapters propios para Pixabay/Coverr hasta completar la ruta preferida
+con proveedores nativos MPT.
 
 ## Render Console: Preparar B-roll
 
