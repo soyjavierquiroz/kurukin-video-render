@@ -2,9 +2,11 @@
 
 Fecha: 2026-07-09
 
-Branch: feature/aroll-broll-pexels-prepare-smoke-006
+Branch: feature/aroll-broll-pexels-prepare-smoke-006-pass
 
-Base: dafed02b387b4609d3cb7fbad4257375cb0b54b9
+Base branch: custom/mvp
+
+Base commit at branch cut: fcc8461156b587942aace9a15dce32020ef16a6c
 
 Task id: aroll-broll-pexels-prepare-smoke-006
 
@@ -17,72 +19,98 @@ Validar prepare-only real con Pexels:
 - no render
 - no runner
 - no pending
+- no task
 - no ffmpeg
+- no ffprobe
+
+## Query
+
+`modern coffee shop b roll`
+
+## Output dir esperado
+
+`storage/local_videos/_aroll_broll_pexels_prepare_smoke_006/`
 
 ## Resultado
 
-FAIL/BLOCKER antes de contactar Pexels.
+FAIL despues de contactar Pexels real una sola vez.
 
-La inspeccion segura de presencia mediante `get_pexels_api_key()` devolvio:
+La verificacion booleana previa dentro del contenedor webui devolvio:
 
 ```text
-pexels_key_available: false
+{
+  "pexels_key_available": true,
+  "pixabay_key_available": true,
+  "coverr_key_available": true
+}
 ```
 
-La API key de Pexels no estaba disponible en el entorno del contenedor webui.
-No se imprimio, busco, modifico ni guardo ninguna credencial.
+La unica ejecucion real autorizada de prepare-only fallo en la etapa de busqueda
+de videos Pexels con:
+
+```text
+urllib.error.HTTPError: HTTP Error 403: Forbidden
+```
+
+No se repitio la llamada real despues de ese fallo.
 
 ## Ejecucion real
 
-- Pexels real no fue contactado.
-- La preparacion real no fue ejecutada.
-- No hubo reintento ni alternativa por scraping.
-- No hubo respuesta de Pexels.
-- No hubo descarga parcial.
-- No existen assets parciales.
-- El output dir
-  `storage/local_videos/_aroll_broll_pexels_prepare_smoke_006/` no fue creado.
+- Pexels real fue contactado exactamente una vez.
+- Pixabay y Coverr no fueron usados.
+- El fallo ocurrio antes de materializar assets locales.
+- No hubo resultado JSON exitoso (`ok=true` no se obtuvo).
+- No hubo descarga parcial util.
+- El output dir esperado no fue creado.
+- No existen assets parciales bajo
+  `storage/local_videos/_aroll_broll_pexels_prepare_smoke_006/`.
 
 ## Guardrails
 
-- API key no impresa ni commiteada.
+- API keys no impresas ni commiteadas.
+- El log de ejecucion no contiene `Authorization`, `Bearer`, `api_key`,
+  `ffmpeg`, `ffprobe`, `scripts/nightly_runner.py`, `local_job_wrapper`,
+  `POST http`, `POST https` ni `/api/v1/videos`.
 - No pending.
 - No task.
 - No runner.
-- No `scripts/nightly_runner.py`.
-- No `scripts/local_job_wrapper.py`.
-- No ffmpeg, ffprobe ni render.
+- No render.
 - No MPT API.
-- No `/api/v1/videos`.
 - No Asset Hub API.
 - No DB, rclone ni credenciales.
 - No `config.toml`.
 - No `resource/fonts`.
-- `storage/` sigue ignored y no se stagea.
+- `.env` sigue ignored y no stageado.
+- `storage/` sigue ignored y no stageado.
 
 ## Runtime read-only
 
 - HTTP Render Console: 200
-- AppTest `exception_count=0`
-- "Preparar B-roll" visible
-- copy/guardrail de Pexels visible
-- enqueue deshabilitado con queue flag off
-- runner deshabilitado con UI flag off
-- flags unset al final, incluido `KURUKIN_ENABLE_PEXELS_SOURCE`
+- Flags finales:
+  - `KURUKIN_ENABLE_UI_RUNNER=<unset>`
+  - `KURUKIN_ENABLE_AROLL_BROLL_QUEUE=<unset>`
+  - `KURUKIN_ENABLE_AROLL_BROLL_RENDERER=<unset>`
+  - `KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER=<unset>`
+  - `KURUKIN_ENABLE_PEXELS_SOURCE=<unset>`
 - pending vacio
 - no task smoke-006
-- sin HTML crudo
+- sin output dir smoke-006
+- Validacion HTML read-only limitada:
+  `curl` devuelve el shell de Streamlit; no hubo un AppTest interactivo formal
+  en esta corrida.
 
 ## Checks
 
 - `py_compile`: OK
-- `unittest`: OK, 285 tests, 6 skipped
+- `unittest`: OK, 289 tests, 6 skipped
 - `git diff --check`: OK
 - `docker compose config`: OK
 
 ## Proximos pasos
 
-1. Configurar `PEXELS_API_KEY` mediante el mecanismo controlado del entorno,
-   sin modificar `config.toml` ni commitear credenciales.
-2. Confirmar solo su presencia booleana en el contenedor webui.
-3. Solicitar una nueva autorizacion explicita antes de ejecutar Pexels real.
+1. Revisar por que Pexels responde `403 Forbidden` aun con presencia booleana
+   de la key en el contenedor.
+2. Confirmar fuera de git si la key tiene permisos vigentes para
+   `https://api.pexels.com/v1/videos/search`.
+3. Solicitar una nueva autorizacion explicita antes de cualquier nuevo contacto
+   real con Pexels.
