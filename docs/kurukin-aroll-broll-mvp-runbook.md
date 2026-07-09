@@ -3,14 +3,15 @@
 ## Estado
 
 - Stable branch: custom/mvp
-- Latest stable checkpoint: mvp-aroll-broll-prepare-broll-ui-2026-07-09
-- Current feature pending merge: a-roll/b-roll Pexels source adapter
+- Latest stable checkpoint: mvp-source-provider-env-wiring-2026-07-09
+- Current feature pending merge: local env gitignore
 - MVP técnico: completo
 - E2E runner: completo
 - UI E2E: completo
 - Multi B-roll E2E: completo
 - Prepare B-roll UI: completo
-- Pexels source adapter: pending merge
+- Pexels source adapter: merged
+- Source provider env wiring: merged
 - Render mode: render_mode=aroll_broll
 - Layout MVP: alternating_fullscreen
 
@@ -216,6 +217,8 @@ Runner E2E PASS:
 - no borrar outputs
 - runner real solo con autorización explícita
 - ffmpeg real solo con autorización explícita
+- antes de crear `.env`, confirmar `git check-ignore -v .env`
+- `.env.example` debe contener solo placeholders vacios
 
 ## Troubleshooting
 

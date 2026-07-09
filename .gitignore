@@ -1,6 +1,10 @@
 .DS_Store
 /config.toml
 /storage/
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
 /.idea/
 /app/services/__pycache__
 /app/__pycache__/
@@ -37,3 +41,8 @@ streamlit.log
 .codegraph
 /docs/superpowers
 .understand-anything
+
+# Local environment / secrets
+*.local.env
+*.secrets
+*.secrets.*
