@@ -73,6 +73,20 @@ activar todavia la cola desde la UI.
 - Todavia no hay seleccion semantica ni matching por transcript.
 - MoneyPrinterTurbo no llama Asset Hub API para esta funcion.
 
+## Asset source policy
+
+La policy minima vive en `asset_policy` y solo declara fuentes permitidas para
+la etapa de sourcing/materializacion. El renderer no decide fuentes.
+
+- Default: `open_sources`, con Asset Hub, Pexels, local library y uploaded como
+  fuentes disponibles/autorizadas.
+- Marca exclusiva: `exclusive_brand_assets`, requiere `brand_asset_bundle_uid` y
+  bloquea Pexels/fuentes abiertas. Solo permite Asset Hub o manifest local de
+  la marca.
+- Local: `local_only`, solo local library/uploaded; no Pexels ni Asset Hub API.
+- El renderer sigue consumiendo assets locales ya materializados en
+  `b_roll.assets` o un manifest local bajo `/data/job-assets`.
+
 ## Queue integration protegida
 
 La cola A-roll/B-roll esta protegida por `KURUKIN_ENABLE_AROLL_BROLL_QUEUE`.
@@ -138,7 +152,8 @@ un fixture pequeno y controlado.
 - Resultados muestra `Presentador + B-roll` cuando el MP4 corresponde a un job
   A-roll/B-roll.
 - La metadata visible incluye `Layout: alternating_fullscreen`,
-  `Audio: A-roll original`, `B-roll muted` y `Task ID`.
+  `Audio: A-roll original`, `B-roll muted`, `Task ID` y, cuando existe,
+  `Fuentes: abiertas`, `Fuentes: marca exclusiva` o `Fuentes: locales`.
 - Outputs se siguen leyendo desde `storage/tasks/<task_id>/final-1.mp4`.
 - No se ejecuta renderer ni runner para listar resultados.
 - E2E runner PASS: `aroll-broll-runner-smoke-003`.
@@ -146,6 +161,7 @@ un fixture pequeno y controlado.
 ## Guardrails
 
 - MoneyPrinterTurbo no llama Asset Hub API para este modo.
+- El renderer no llama Pexels ni proveedores externos.
 - No usa rclone.
 - No toca DB.
 - No acepta paths arbitrarios.

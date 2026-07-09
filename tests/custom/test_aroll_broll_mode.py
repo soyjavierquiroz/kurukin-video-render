@@ -7,6 +7,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import app.custom.aroll_broll_mode as aroll_broll_mode
+from app.custom.asset_source_policy import (
+    ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS,
+    ASSET_SOURCE_MODE_LOCAL_ONLY,
+    ASSET_SOURCE_MODE_OPEN_SOURCES,
+)
 from app.custom.aroll_broll_mode import (
     AROLL_AUDIO_ORIGINAL,
     BROLL_AUDIO_MUTED,
@@ -304,6 +309,81 @@ class TestArollBrollMode(unittest.TestCase):
 
         self.assertEqual(summary["renderer"], "Renderer preparado: alternating_fullscreen")
 
+    def test_config_without_asset_policy_still_defaults_to_open_sources(self):
+        config = build_default_aroll_broll_config()
+        config.pop("asset_policy")
+
+        result = validate_aroll_broll_config(config, strict=False)
+
+        self.assertEqual(
+            result["normalized"]["asset_policy"]["mode"],
+            ASSET_SOURCE_MODE_OPEN_SOURCES,
+        )
+        self.assertEqual(
+            summarize_aroll_broll_config(result["normalized"])["asset_policy"],
+            "Asset policy: Open sources",
+        )
+
+    def test_config_with_open_sources_asset_policy_is_included(self):
+        config = build_default_aroll_broll_config()
+        config["asset_policy"] = {"mode": ASSET_SOURCE_MODE_OPEN_SOURCES}
+
+        result = validate_aroll_broll_config(config, strict=False)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(
+            result["normalized"]["asset_policy"]["mode"],
+            ASSET_SOURCE_MODE_OPEN_SOURCES,
+        )
+
+    def test_config_with_exclusive_brand_asset_policy_is_included(self):
+        config = build_default_aroll_broll_config()
+        config["asset_policy"] = {
+            "mode": ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS,
+            "brand_asset_bundle_uid": "jab_test",
+        }
+
+        result = validate_aroll_broll_config(config, strict=False)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(
+            result["normalized"]["asset_policy"]["mode"],
+            ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS,
+        )
+        self.assertEqual(
+            result["normalized"]["asset_policy"]["allowed_sources"],
+            ["asset_hub"],
+        )
+        self.assertTrue(result["normalized"]["asset_policy"]["require_manifest"])
+
+    def test_config_with_exclusive_brand_asset_policy_without_bundle_uid_fails(self):
+        config = build_default_aroll_broll_config()
+        config["asset_policy"] = {"mode": ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS}
+
+        result = validate_aroll_broll_config(config, strict=False)
+
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "asset_policy.brand_asset_bundle_uid is required for exclusive_brand_assets",
+            result["errors"],
+        )
+
+    def test_config_with_local_only_asset_policy_is_included(self):
+        config = build_default_aroll_broll_config()
+        config["asset_policy"] = {"mode": ASSET_SOURCE_MODE_LOCAL_ONLY}
+
+        result = validate_aroll_broll_config(config, strict=False)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(
+            result["normalized"]["asset_policy"]["mode"],
+            ASSET_SOURCE_MODE_LOCAL_ONLY,
+        )
+        self.assertEqual(
+            result["normalized"]["asset_policy"]["allowed_sources"],
+            ["local_library", "uploaded"],
+        )
+
     def test_build_queue_payload_marks_aroll_broll_as_guarded(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -341,6 +421,11 @@ class TestArollBrollMode(unittest.TestCase):
         self.assertEqual(payload["video_subject"], "Presenter edit")
         self.assertFalse(payload["runner"]["renderer_enabled"])
         self.assertEqual(payload["runner"]["execution_guard"], "renderer_not_enabled")
+        self.assertEqual(payload["asset_policy"]["mode"], ASSET_SOURCE_MODE_OPEN_SOURCES)
+        self.assertEqual(
+            payload["aroll_broll"]["asset_policy"]["mode"],
+            ASSET_SOURCE_MODE_OPEN_SOURCES,
+        )
 
     def test_build_queue_payload_rejects_incomplete_strict_config(self):
         config = build_default_aroll_broll_config()

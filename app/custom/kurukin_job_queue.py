@@ -12,6 +12,8 @@ import subprocess
 import time
 from typing import Any
 
+from app.custom.asset_source_policy import summarize_asset_source_policy
+
 
 QUEUE_GROUPS = ("pending", "processing", "completed", "failed", "logs")
 DEFAULT_PENDING_DIR = Path("storage/nightly_jobs/pending")
@@ -351,11 +353,31 @@ def _extract_broll_asset_count(*payloads: dict[str, Any] | None) -> int | None:
     return None
 
 
+def _extract_asset_policy_summary(
+    *payloads: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        candidates = (
+            payload.get("asset_policy"),
+            _nested_get(payload, "aroll_broll", "asset_policy"),
+            _nested_get(payload, "data", "asset_policy"),
+            _nested_get(payload, "data", "aroll_broll", "asset_policy"),
+            _nested_get(payload, "task", "asset_policy"),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                return summarize_asset_source_policy(candidate)
+    return None
+
+
 def _render_mode_metadata(
     render_mode: str,
     *,
     layout_preset: str = "",
     b_roll_asset_count: int | None = None,
+    asset_policy_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized = _normalize_render_mode(render_mode)
     metadata = {
@@ -372,6 +394,12 @@ def _render_mode_metadata(
         )
         if b_roll_asset_count is not None and b_roll_asset_count > 0:
             metadata["b_roll_asset_count"] = b_roll_asset_count
+        if asset_policy_summary:
+            metadata["asset_policy"] = asset_policy_summary
+            metadata["asset_policy_label"] = asset_policy_summary.get("label")
+            metadata["asset_policy_short_label"] = asset_policy_summary.get(
+                "short_label"
+            )
     return metadata
 
 
@@ -540,6 +568,7 @@ def summarize_pending_job(path: str | Path) -> dict[str, Any]:
             render_mode,
             layout_preset=_extract_layout_preset(payload),
             b_roll_asset_count=_extract_broll_asset_count(payload),
+            asset_policy_summary=_extract_asset_policy_summary(payload),
         )
     )
     return summary
@@ -709,6 +738,7 @@ def _summarize_final_task(task_dir: Path) -> dict[str, Any]:
             render_mode,
             layout_preset=_extract_layout_preset(payload),
             b_roll_asset_count=_extract_broll_asset_count(payload),
+            asset_policy_summary=_extract_asset_policy_summary(payload),
         )
     )
     return summary
@@ -853,6 +883,13 @@ def _completed_job_metadata_by_task(
                     render_result_payload,
                     error_payload,
                 ),
+                asset_policy_summary=_extract_asset_policy_summary(
+                    job_payload,
+                    submit_payload,
+                    final_task_payload,
+                    render_result_payload,
+                    error_payload,
+                ),
             )
         )
         by_task[task_id] = metadata
@@ -935,6 +972,11 @@ def list_completed_render_jobs(
                 final_task_payload,
             ),
             b_roll_asset_count=_extract_broll_asset_count(
+                job_payload,
+                submit_payload,
+                final_task_payload,
+            ),
+            asset_policy_summary=_extract_asset_policy_summary(
                 job_payload,
                 submit_payload,
                 final_task_payload,
@@ -1060,6 +1102,9 @@ def list_rendered_videos(
                     b_roll_asset_count=_extract_broll_asset_count(
                         final_task_summary
                     ),
+                    asset_policy_summary=_extract_asset_policy_summary(
+                        final_task_summary
+                    ),
                 )
             )
             metadata = completed_metadata.get(task_id)
@@ -1133,10 +1178,22 @@ def find_result_for_job(
                 "layout_preset": job.get("layout_preset") or video.get("layout_preset"),
                 "audio_summary": job.get("audio_summary") or video.get("audio_summary"),
                 "broll_summary": job.get("broll_summary") or video.get("broll_summary"),
+                "asset_policy": job.get("asset_policy") or video.get("asset_policy"),
+                "asset_policy_label": job.get("asset_policy_label")
+                or video.get("asset_policy_label"),
+                "asset_policy_short_label": job.get("asset_policy_short_label")
+                or video.get("asset_policy_short_label"),
                 "recommendation": "last_job",
                 "recommendation_title": "Tu video más reciente",
             }
         )
+        for optional_key in (
+            "asset_policy",
+            "asset_policy_label",
+            "asset_policy_short_label",
+        ):
+            if result.get(optional_key) is None:
+                result.pop(optional_key, None)
         return result
     return None
 
@@ -1354,6 +1411,7 @@ def list_task_summaries(tasks_dir: str | Path | None = None) -> list[dict[str, A
             render_mode,
             layout_preset=str(final_task_summary.get("layout_preset") or ""),
             b_roll_asset_count=_extract_broll_asset_count(final_task_summary),
+            asset_policy_summary=_extract_asset_policy_summary(final_task_summary),
         )
         for output in outputs:
             output.update(mode_metadata)
