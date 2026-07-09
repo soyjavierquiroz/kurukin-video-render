@@ -24,8 +24,15 @@ services:
       - ./storage:/MoneyPrinterTurbo/storage
       - kurukin-asset-hub_job_assets:/data/job-assets:ro
     environment:
-      - PYTHONDONTWRITEBYTECODE=1
-      - PYTHONPYCACHEPREFIX=/tmp/python-pycache
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPYCACHEPREFIX: /tmp/python-pycache
+      PEXELS_API_KEY: ${PEXELS_API_KEY:-}
+      PEXELS_KEY: ${PEXELS_KEY:-}
+      PIXABAY_API_KEY: ${PIXABAY_API_KEY:-}
+      PIXABAY_KEY: ${PIXABAY_KEY:-}
+      COVERR_API_KEY: ${COVERR_API_KEY:-}
+      COVERR_KEY: ${COVERR_KEY:-}
+      KURUKIN_ENABLE_PEXELS_SOURCE: ${KURUKIN_ENABLE_PEXELS_SOURCE:-}
     restart: unless-stopped
 
   api:
