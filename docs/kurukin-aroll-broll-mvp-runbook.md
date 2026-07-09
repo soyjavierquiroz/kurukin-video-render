@@ -3,20 +3,25 @@
 ## Estado
 
 - Stable branch: custom/mvp
-- Latest stable checkpoint: mvp-source-provider-env-wiring-2026-07-09
-- Current feature pending merge: local env gitignore
+- Latest stable checkpoint: mvp-local-env-secrets-gitignore-2026-07-09
+- Current feature pending merge: kurukin-use-mpt-engine-audit
 - MVP técnico: completo
 - E2E runner: completo
 - UI E2E: completo
 - Multi B-roll E2E: completo
 - Prepare B-roll UI: completo
-- Pexels source adapter: merged
+- Pexels source adapter: merged, fallback experimental/no primario
 - Source provider env wiring: merged
+- Local env secrets gitignore: merged
+- MPT engine audit/bridge: pending merge
 - Render mode: render_mode=aroll_broll
 - Layout MVP: alternating_fullscreen
 - Architecture update: Kurukin debe usar MoneyPrinterTurbo como motor base y
   compilar A-roll/B-roll a specs MPT antes de considerar renderer/adapters
   paralelos.
+
+No continuar con pruebas reales de adapters custom Pexels/Pixabay/Coverr. La
+ruta primaria es `mpt_engine_bridge` -> task/spec MPT -> motor nativo MPT.
 
 ## Regla principal
 
