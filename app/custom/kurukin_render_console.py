@@ -6,10 +6,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from app.custom.aroll_broll_mode import build_aroll_broll_queue_payload
+from app.custom.asset_materializer import (
+    MAX_MATERIALIZED_ASSETS,
+    materialize_assets_for_aroll_broll,
+)
 from app.custom.asset_hub_manifest import (
     load_asset_hub_renderer_manifest,
     summarize_asset_hub_manifest,
     validate_asset_hub_renderer_manifest,
+)
+from app.custom.asset_source_policy import (
+    normalize_asset_source_policy,
+    summarize_asset_source_policy,
 )
 from app.custom.kurukin_job_adapter import (
     ALLOWED_AUDIO_EXTENSIONS,
@@ -172,6 +180,100 @@ def normalize_aroll_broll_local_asset_paths(value: str | list[Any]) -> list[str]
         if safe not in normalized:
             normalized.append(safe)
     return normalized
+
+
+def _clamp_prepare_broll_count(value: Any) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 1
+    return max(1, min(MAX_MATERIALIZED_ASSETS, count))
+
+
+def _prepare_broll_error_message(errors: list[str]) -> str:
+    if "External downloader is not configured" in errors:
+        return "No hay suficientes assets locales y no hay downloader configurado."
+    if errors:
+        return errors[0]
+    return "No se pudieron preparar assets B-roll."
+
+
+def prepare_broll_assets_from_console(
+    *,
+    project_root: Path,
+    asset_policy: dict | None,
+    query: str | None,
+    desired_count: int,
+    local_candidates: str | list[str] | None,
+    output_dir: str | None = None,
+    downloader=None,
+    manifest_reader=None,
+    local_library_resolver=None,
+) -> dict[str, Any]:
+    """Prepare local B-roll assets for UI state without enqueueing or rendering."""
+
+    normalized_policy = normalize_asset_source_policy(asset_policy)
+    policy_summary = summarize_asset_source_policy(normalized_policy)
+    try:
+        candidates = normalize_aroll_broll_local_asset_paths(local_candidates or "")
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": _safe_error_message(exc),
+            "asset_policy": normalized_policy,
+            "asset_policy_label": policy_summary["console_label"],
+        }
+
+    materializer_request: dict[str, Any] = {
+        "asset_policy": normalized_policy,
+        "query": _clean_text(query),
+        "desired_count": _clamp_prepare_broll_count(desired_count),
+        "local_candidates": candidates,
+    }
+    if output_dir:
+        materializer_request["output_dir"] = _clean_text(output_dir)
+    if isinstance(asset_policy, dict):
+        manifest_path = _clean_text(asset_policy.get("manifest_path"))
+        if manifest_path:
+            materializer_request["manifest_path"] = manifest_path
+        brand_uid = _clean_text(asset_policy.get("brand_asset_bundle_uid"))
+        if brand_uid:
+            materializer_request["brand_asset_bundle_uid"] = brand_uid
+
+    result = materialize_assets_for_aroll_broll(
+        materializer_request,
+        project_root=project_root,
+        downloader=downloader,
+        manifest_reader=manifest_reader,
+        local_library_resolver=local_library_resolver,
+    )
+    if not result.get("ok"):
+        errors = [str(error) for error in result.get("errors") or []]
+        return {
+            "ok": False,
+            "error": _prepare_broll_error_message(errors),
+            "asset_policy": result.get("source_policy") or normalized_policy,
+            "asset_policy_label": policy_summary["console_label"],
+            "query": materializer_request["query"],
+            "b_roll_assets": list(result.get("b_roll_assets") or []),
+            "b_roll_asset_count": int(result.get("b_roll_asset_count") or 0),
+            "source_provider": result.get("source_provider") or "",
+        }
+
+    assets = list(result.get("b_roll_assets") or [])
+    response_policy = result.get("source_policy") or normalized_policy
+    response_summary = summarize_asset_source_policy(response_policy)
+    return {
+        "ok": True,
+        "b_roll_assets": assets,
+        "b_roll_asset_count": len(assets),
+        "source_provider": result.get("source_provider") or "",
+        "asset_policy": response_policy,
+        "asset_policy_label": response_summary["console_label"],
+        "query": materializer_request["query"],
+        "message": "B-roll assets preparados",
+        "metadata": result.get("metadata") or {},
+    }
 
 
 def build_aroll_broll_payload_from_console(

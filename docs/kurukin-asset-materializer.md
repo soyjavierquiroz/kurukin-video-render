@@ -71,6 +71,17 @@ Materializer:
   `storage/local_images`.
 - entrega paths locales para `b_roll.assets`.
 
+Render Console:
+
+- expone "Preparar B-roll" como accion read-only/controlada.
+- usa `local_only` como modo seguro inicial con candidatos locales.
+- `open_sources` usa candidatos locales primero y solo podria completar con un
+  downloader inyectado por integracion futura.
+- no pasa downloader real en la UI inicial.
+- guarda assets preparados en session state para alimentar el campo
+  `b_roll.assets`.
+- no crea pending, no crea task, no ejecuta runner, no ejecuta ffmpeg.
+
 Renderer:
 
 - no decide fuentes.
@@ -82,3 +93,15 @@ Renderer:
 
 Los tests usan downloader/manifest_reader fakes. No descargan Pexels real, no
 llaman APIs, no crean pending, no crean task y no requieren storage real.
+
+## Render Console: Preparar B-roll
+
+El flujo "Preparar B-roll" convierte policy + query + candidatos locales en una
+lista local sugerida para `b_roll.assets`.
+
+- muestra contador, `source_provider`, policy label, query y paths preparados.
+- puede prellenar el campo B-roll local del enqueue UI.
+- el enqueue/render sigue siendo un paso separado y protegido por flags.
+- Pexels real queda para una integracion futura con downloader controlado.
+- Asset Hub API no se llama; marca exclusiva usa manifest local o reader
+  inyectado.

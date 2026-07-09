@@ -103,6 +103,23 @@ El materializer minimo vive en `app/custom/asset_materializer.py`.
   `Fuente: local`, `Fuente: manifest`, `Query: ...` y `B-roll assets: N`
   cuando viene en el job.
 
+## Prepare B-roll UI
+
+Render Console incluye "Preparar B-roll" como paso controlado anterior a
+validar/encolar.
+
+- `local_only` es el modo seguro inicial y usa solo candidatos locales.
+- `open_sources` usa candidatos locales primero; en la UI inicial no pasa
+  downloader real, por lo que no descarga Pexels.
+- `exclusive_brand_assets` requiere manifest local o bundle UID resoluble a
+  manifest local; no llama Asset Hub API.
+- El resultado queda en session state con assets preparados, contador,
+  `source_provider`, policy label y query.
+- Si el resultado es OK, la lista puede alimentar `b_roll.assets` en el campo
+  local del enqueue UI.
+- Preparar B-roll no crea pending, no crea task, no ejecuta runner y no ejecuta
+  ffmpeg.
+
 ## Queue integration protegida
 
 La cola A-roll/B-roll esta protegida por `KURUKIN_ENABLE_AROLL_BROLL_QUEUE`.

@@ -52,6 +52,25 @@ class TestAssetMaterializer(unittest.TestCase):
         )
         self.assertEqual(calls, [])
 
+    def test_materializer_does_not_create_output_dir_with_enough_local_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "storage" / "local_videos" / "materialized"
+            result = materialize_assets_for_aroll_broll(
+                {
+                    "desired_count": 2,
+                    "output_dir": "storage/local_videos/materialized",
+                    "local_candidates": [
+                        "storage/local_videos/one.mp4",
+                        "storage/local_assets/two.mp4",
+                    ],
+                },
+                project_root=root,
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(output_dir.exists())
+
     def test_open_sources_uses_fake_downloader_to_complete_assets(self):
         seen_requests = []
 
@@ -83,6 +102,29 @@ class TestAssetMaterializer(unittest.TestCase):
         self.assertEqual(result["metadata"]["query"], "city walking")
         self.assertTrue(result["metadata"]["fake"])
         self.assertEqual(seen_requests[0]["needed_count"], 2)
+
+    def test_downloader_fake_can_return_assets_and_metadata(self):
+        def fake_downloader(_request):
+            return {
+                "source_provider": "pexels",
+                "b_roll_assets": ["storage/local_assets/downloaded.mp4"],
+                "metadata": {"request_id": "fake-001"},
+            }
+
+        result = materialize_assets_for_aroll_broll(
+            {
+                "query": "city",
+                "desired_count": 1,
+                "local_candidates": [],
+            },
+            project_root=Path.cwd(),
+            downloader=fake_downloader,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source_provider"], "pexels")
+        self.assertEqual(result["b_roll_assets"], ["storage/local_assets/downloaded.mp4"])
+        self.assertEqual(result["metadata"]["request_id"], "fake-001")
 
     def test_open_sources_requires_injected_downloader_for_external_assets(self):
         result = materialize_assets_for_aroll_broll(
@@ -216,6 +258,25 @@ class TestAssetMaterializer(unittest.TestCase):
             ],
         )
         self.assertEqual(downloader_calls, [])
+
+    def test_exclusive_manifest_reader_fake_returns_assets(self):
+        result = materialize_assets_for_aroll_broll(
+            {
+                "asset_policy": {
+                    "mode": "exclusive_brand_assets",
+                    "brand_asset_bundle_uid": "jab_test",
+                },
+                "desired_count": 1,
+            },
+            project_root=Path.cwd(),
+            manifest_reader=lambda _path: {
+                "assets": [{"path": "storage/local_assets/brand.mp4"}]
+            },
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source_provider"], "asset_hub")
+        self.assertEqual(result["b_roll_assets"], ["storage/local_assets/brand.mp4"])
 
     def test_exclusive_brand_assets_blocks_non_local_manifest_assets(self):
         result = materialize_assets_for_aroll_broll(
