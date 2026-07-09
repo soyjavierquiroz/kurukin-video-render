@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -16,6 +17,7 @@ from app.custom.asset_hub_manifest import (
     validate_asset_hub_renderer_manifest,
 )
 from app.custom.asset_source_policy import (
+    ASSET_SOURCE_PEXELS as POLICY_SOURCE_PEXELS,
     normalize_asset_source_policy,
     summarize_asset_source_policy,
 )
@@ -39,6 +41,7 @@ from app.custom.kurukin_job_queue import (
 
 
 DEFAULT_VOICE_NAME = "es-MX-DaliaNeural-Female"
+PEXELS_SOURCE_FLAG = "KURUKIN_ENABLE_PEXELS_SOURCE"
 SOURCE_MODE_ASSET_HUB = "asset_hub_bundle"
 SOURCE_MODE_LOCAL = "local_assets"
 SOURCE_MODE_STOCK = "stock_external"
@@ -190,8 +193,21 @@ def _clamp_prepare_broll_count(value: Any) -> int:
     return max(1, min(MAX_MATERIALIZED_ASSETS, count))
 
 
-def _prepare_broll_error_message(errors: list[str]) -> str:
+def is_pexels_source_enabled(environ: dict[str, str] | None = None) -> bool:
+    """Return whether controlled Pexels sourcing is explicitly enabled."""
+
+    source = environ if environ is not None else os.environ
+    return source.get(PEXELS_SOURCE_FLAG) == "1"
+
+
+def _prepare_broll_error_message(
+    errors: list[str],
+    *,
+    pexels_enabled: bool = False,
+) -> str:
     if "External downloader is not configured" in errors:
+        if not pexels_enabled:
+            return "No hay suficientes assets locales. Pexels no está activo en esta consola."
         return "No hay suficientes assets locales y no hay downloader configurado."
     if errors:
         return errors[0]
@@ -207,12 +223,19 @@ def prepare_broll_assets_from_console(
     local_candidates: str | list[str] | None,
     output_dir: str | None = None,
     downloader=None,
+    source_adapters=None,
+    pexels_downloader=None,
+    environ: dict[str, str] | None = None,
     manifest_reader=None,
     local_library_resolver=None,
 ) -> dict[str, Any]:
     """Prepare local B-roll assets for UI state without enqueueing or rendering."""
 
     normalized_policy = normalize_asset_source_policy(asset_policy)
+    pexels_enabled = is_pexels_source_enabled(environ)
+    effective_adapters = dict(source_adapters or {})
+    if pexels_enabled and pexels_downloader is not None:
+        effective_adapters.setdefault(POLICY_SOURCE_PEXELS, pexels_downloader)
     policy_summary = summarize_asset_source_policy(normalized_policy)
     try:
         candidates = normalize_aroll_broll_local_asset_paths(local_candidates or "")
@@ -240,18 +263,34 @@ def prepare_broll_assets_from_console(
         if brand_uid:
             materializer_request["brand_asset_bundle_uid"] = brand_uid
 
-    result = materialize_assets_for_aroll_broll(
-        materializer_request,
-        project_root=project_root,
-        downloader=downloader,
-        manifest_reader=manifest_reader,
-        local_library_resolver=local_library_resolver,
-    )
+    try:
+        result = materialize_assets_for_aroll_broll(
+            materializer_request,
+            project_root=project_root,
+            downloader=downloader,
+            source_adapters=effective_adapters,
+            manifest_reader=manifest_reader,
+            local_library_resolver=local_library_resolver,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": _safe_error_message(exc),
+            "asset_policy": normalized_policy,
+            "asset_policy_label": policy_summary["console_label"],
+            "query": materializer_request["query"],
+            "b_roll_assets": [],
+            "b_roll_asset_count": 0,
+            "source_provider": "",
+        }
     if not result.get("ok"):
         errors = [str(error) for error in result.get("errors") or []]
         return {
             "ok": False,
-            "error": _prepare_broll_error_message(errors),
+            "error": _prepare_broll_error_message(
+                errors,
+                pexels_enabled=pexels_enabled,
+            ),
             "asset_policy": result.get("source_policy") or normalized_policy,
             "asset_policy_label": policy_summary["console_label"],
             "query": materializer_request["query"],

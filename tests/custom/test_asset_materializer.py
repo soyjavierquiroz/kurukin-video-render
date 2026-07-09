@@ -103,6 +103,179 @@ class TestAssetMaterializer(unittest.TestCase):
         self.assertTrue(result["metadata"]["fake"])
         self.assertEqual(seen_requests[0]["needed_count"], 2)
 
+    def test_open_sources_accepts_fake_pexels_downloader_metadata(self):
+        def fake_pexels_downloader(_request):
+            return {
+                "source_provider": "pexels",
+                "assets": ["storage/local_videos/pexels-city.mp4"],
+                "metadata": {
+                    "pexels_assets": [
+                        {
+                            "source_provider": "pexels",
+                            "pexels_video_id": "101",
+                            "photographer": "Ana Video",
+                            "photographer_url": "https://www.pexels.com/@ana/",
+                            "pexels_url": "https://www.pexels.com/video/city-101/",
+                            "width": 720,
+                            "height": 1280,
+                            "path": "storage/local_videos/pexels-city.mp4",
+                        }
+                    ]
+                },
+            }
+
+        result = materialize_assets_for_aroll_broll(
+            {
+                "asset_policy": {
+                    "mode": "open_sources",
+                    "allowed_sources": ["pexels", "local_library"],
+                },
+                "query": "city",
+                "desired_count": 1,
+            },
+            project_root=Path.cwd(),
+            downloader=fake_pexels_downloader,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source_provider"], "pexels")
+        self.assertEqual(
+            result["metadata"]["pexels_assets"][0]["photographer"],
+            "Ana Video",
+        )
+
+    def test_open_sources_combines_allowed_adapters_and_deduplicates(self):
+        calls = []
+
+        def fake_asset_hub(request):
+            calls.append(("asset_hub", request["needed_count"]))
+            return {
+                "assets": [
+                    "storage/local_assets/shared.mp4",
+                    "storage/local_assets/hub.mp4",
+                ],
+                "metadata": {"hub_manifest": "fake"},
+            }
+
+        def fake_pexels(request):
+            calls.append(("pexels", request["needed_count"]))
+            return {
+                "assets": [
+                    "storage/local_assets/hub.mp4",
+                    "storage/local_videos/pexels.mp4",
+                ],
+                "metadata": {"pexels_assets": [{"pexels_video_id": "42"}]},
+            }
+
+        result = materialize_assets_for_aroll_broll(
+            {
+                "asset_policy": {
+                    "mode": "open_sources",
+                    "allowed_sources": [
+                        "local_library",
+                        "asset_hub",
+                        "pexels",
+                    ],
+                },
+                "desired_count": 3,
+                "local_candidates": ["storage/local_assets/shared.mp4"],
+            },
+            project_root=Path.cwd(),
+            source_adapters={
+                "pexels": fake_pexels,
+                "asset_hub": fake_asset_hub,
+            },
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(calls, [("asset_hub", 2), ("pexels", 1)])
+        self.assertEqual(
+            result["b_roll_assets"],
+            [
+                "storage/local_assets/shared.mp4",
+                "storage/local_assets/hub.mp4",
+                "storage/local_videos/pexels.mp4",
+            ],
+        )
+        self.assertEqual(result["source_provider"], "mixed")
+
+    def test_open_sources_calls_only_adapters_allowed_by_policy(self):
+        calls = []
+
+        result = materialize_assets_for_aroll_broll(
+            {
+                "asset_policy": {
+                    "mode": "open_sources",
+                    "allowed_sources": ["pexels"],
+                },
+                "desired_count": 1,
+            },
+            project_root=Path.cwd(),
+            source_adapters={
+                "asset_hub": lambda _request: calls.append("asset_hub"),
+                "pexels": lambda _request: {
+                    "assets": ["storage/local_videos/pexels.mp4"]
+                },
+            },
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source_provider"], "pexels")
+        self.assertEqual(calls, [])
+
+    def test_open_sources_can_use_uploaded_adapter_after_local_candidates(self):
+        calls = []
+
+        def fake_uploaded(request):
+            calls.append(request["needed_count"])
+            return {"assets": ["storage/local_assets/uploaded.mp4"]}
+
+        result = materialize_assets_for_aroll_broll(
+            {
+                "asset_policy": {
+                    "mode": "open_sources",
+                    "allowed_sources": ["local_library", "uploaded"],
+                },
+                "desired_count": 2,
+                "local_candidates": ["storage/local_videos/local.mp4"],
+            },
+            project_root=Path.cwd(),
+            source_adapters={"uploaded": fake_uploaded},
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(calls, [1])
+        self.assertEqual(result["source_provider"], "mixed")
+        self.assertEqual(
+            result["b_roll_assets"],
+            [
+                "storage/local_videos/local.mp4",
+                "storage/local_assets/uploaded.mp4",
+            ],
+        )
+
+    def test_open_sources_rejects_disallowed_pexels_downloader(self):
+        result = materialize_assets_for_aroll_broll(
+            {
+                "asset_policy": {
+                    "mode": "open_sources",
+                    "allowed_sources": ["asset_hub"],
+                },
+                "desired_count": 1,
+            },
+            project_root=Path.cwd(),
+            downloader=lambda _request: {
+                "source_provider": "pexels",
+                "assets": ["storage/local_videos/pexels-city.mp4"],
+            },
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "Source provider is not allowed: pexels",
+            result["errors"],
+        )
+
     def test_downloader_fake_can_return_assets_and_metadata(self):
         def fake_downloader(_request):
             return {
@@ -125,6 +298,20 @@ class TestAssetMaterializer(unittest.TestCase):
         self.assertEqual(result["source_provider"], "pexels")
         self.assertEqual(result["b_roll_assets"], ["storage/local_assets/downloaded.mp4"])
         self.assertEqual(result["metadata"]["request_id"], "fake-001")
+
+    def test_external_downloader_must_identify_its_source_provider(self):
+        result = materialize_assets_for_aroll_broll(
+            {"desired_count": 1, "query": "city"},
+            project_root=Path.cwd(),
+            downloader=lambda _request: ["storage/local_assets/downloaded.mp4"],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "External downloader must identify source_provider",
+            result["errors"],
+        )
+        self.assertNotEqual(result["source_provider"], "pexels")
 
     def test_open_sources_requires_injected_downloader_for_external_assets(self):
         result = materialize_assets_for_aroll_broll(
@@ -163,6 +350,8 @@ class TestAssetMaterializer(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_local_only_uses_only_local_candidates(self):
+        downloader_calls = []
+
         result = materialize_assets_for_aroll_broll(
             {
                 "asset_policy": {"mode": "local_only"},
@@ -173,12 +362,16 @@ class TestAssetMaterializer(unittest.TestCase):
                 ],
             },
             project_root=Path.cwd(),
-            downloader=lambda _request: ["storage/local_videos/external.mp4"],
+            downloader=lambda _request: downloader_calls.append("called"),
+            source_adapters={
+                "pexels": lambda _request: downloader_calls.append("pexels")
+            },
         )
 
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["source_provider"], "local_library")
         self.assertEqual(result["b_roll_asset_count"], 2)
+        self.assertEqual(downloader_calls, [])
 
     def test_local_only_requires_enough_candidates(self):
         result = materialize_assets_for_aroll_broll(
@@ -245,6 +438,9 @@ class TestAssetMaterializer(unittest.TestCase):
             },
             project_root=Path.cwd(),
             downloader=fake_downloader,
+            source_adapters={
+                "pexels": lambda _request: downloader_calls.append("pexels")
+            },
             manifest_reader=fake_manifest_reader,
         )
 

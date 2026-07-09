@@ -44,6 +44,7 @@ from app.custom.kurukin_render_console import (
     ASSET_SOURCE_LOCAL,
     ASSET_SOURCE_ASSET_HUB,
     ASSET_SOURCE_STOCK,
+    PEXELS_SOURCE_FLAG,
     SOURCE_MODE_ASSET_HUB,
     SOURCE_MODE_LOCAL,
     SOURCE_MODE_STOCK,
@@ -54,6 +55,7 @@ from app.custom.kurukin_render_console import (
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
     get_manifest_summary_for_ui,
+    is_pexels_source_enabled,
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
@@ -270,7 +272,32 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(
             result["error"],
-            "No hay suficientes assets locales y no hay downloader configurado.",
+            "No hay suficientes assets locales. Pexels no está activo en esta consola.",
+        )
+
+    def test_prepare_broll_assets_flag_off_does_not_attempt_pexels(self):
+        calls = []
+
+        def fake_pexels_downloader(_request):
+            calls.append("called")
+            return {"assets": ["storage/local_videos/pexels.mp4"]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_OPEN_SOURCES},
+                query="city",
+                desired_count=1,
+                local_candidates="",
+                pexels_downloader=fake_pexels_downloader,
+                environ={PEXELS_SOURCE_FLAG: "0"},
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            result["error"],
+            "No hay suficientes assets locales. Pexels no está activo en esta consola.",
         )
 
     def test_prepare_broll_assets_open_sources_fake_downloader_completes_assets(self):
@@ -299,6 +326,62 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(result["b_roll_asset_count"], 2)
         self.assertEqual(seen_requests[0]["needed_count"], 1)
         self.assertTrue(result["metadata"]["fake"])
+
+    def test_prepare_broll_assets_flag_on_uses_injected_pexels_downloader(self):
+        seen_requests = []
+
+        def fake_pexels_downloader(request):
+            seen_requests.append(request)
+            return {
+                "source_provider": "pexels",
+                "assets": ["storage/local_videos/pexels-city.mp4"],
+                "metadata": {"source_provider": "pexels"},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_OPEN_SOURCES},
+                query="city",
+                desired_count=1,
+                local_candidates="",
+                pexels_downloader=fake_pexels_downloader,
+                environ={PEXELS_SOURCE_FLAG: "1"},
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source_provider"], "pexels")
+        self.assertEqual(result["b_roll_assets"], ["storage/local_videos/pexels-city.mp4"])
+        self.assertEqual(seen_requests[0]["needed_count"], 1)
+
+    def test_prepare_broll_assets_combines_generic_source_adapters(self):
+        calls = []
+
+        def fake_asset_hub(_request):
+            calls.append("asset_hub")
+            return {"assets": ["storage/local_assets/hub.mp4"]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={
+                    "mode": ASSET_SOURCE_MODE_OPEN_SOURCES,
+                    "allowed_sources": ["local_library", "asset_hub"],
+                },
+                query="city",
+                desired_count=2,
+                local_candidates="storage/local_videos/local.mp4",
+                source_adapters={"asset_hub": fake_asset_hub},
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source_provider"], "mixed")
+        self.assertEqual(calls, ["asset_hub"])
+
+    def test_pexels_source_flag_helper_defaults_off(self):
+        self.assertFalse(is_pexels_source_enabled({}))
+        self.assertFalse(is_pexels_source_enabled({PEXELS_SOURCE_FLAG: "0"}))
+        self.assertTrue(is_pexels_source_enabled({PEXELS_SOURCE_FLAG: "1"}))
 
     def test_prepare_broll_assets_exclusive_brand_without_manifest_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -531,6 +614,9 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "El runner no lo renderiza todavía",
             "aroll_broll_enqueue",
             "aroll_broll_enqueue_disabled",
+            "Pexels source: disponible solo con integración controlada/flag; no se usa por defecto.",
+            "KURUKIN_ENABLE_PEXELS_SOURCE",
+            "create_pexels_downloader",
         )
 
         for expected in required_copy:
@@ -1623,6 +1709,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             self.skipTest("streamlit is not installed in this Python environment")
 
         original_flag = os.environ.pop("KURUKIN_ENABLE_UI_RUNNER", None)
+        original_pexels_flag = os.environ.pop("KURUKIN_ENABLE_PEXELS_SOURCE", None)
         original_cwd = Path.cwd()
         page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
         try:
@@ -1650,6 +1737,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             os.chdir(original_cwd)
             if original_flag is not None:
                 os.environ["KURUKIN_ENABLE_UI_RUNNER"] = original_flag
+            if original_pexels_flag is not None:
+                os.environ["KURUKIN_ENABLE_PEXELS_SOURCE"] = original_pexels_flag
 
         self.assertEqual(len(at.exception), 0)
         rendered_text = "\n".join(
@@ -1694,6 +1783,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "KURUKIN_ENABLE_AROLL_BROLL_QUEUE=<unset>",
             rendered_text,
         )
+        self.assertIn("KURUKIN_ENABLE_PEXELS_SOURCE=<unset>", rendered_text)
         self.assertIn(
             "La cola A-roll/B-roll se activa después de una validación estricta",
             rendered_text,
@@ -1720,6 +1810,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER",
             None,
         )
+        original_pexels_flag = os.environ.pop("KURUKIN_ENABLE_PEXELS_SOURCE", None)
         original_cwd = Path.cwd()
         page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
         try:
@@ -1756,6 +1847,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 os.environ["KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER"] = (
                     original_direct_flag
                 )
+            if original_pexels_flag is not None:
+                os.environ["KURUKIN_ENABLE_PEXELS_SOURCE"] = original_pexels_flag
 
         self.assertEqual(len(at.exception), 0)
         rendered_text = "\n".join(
@@ -1778,6 +1871,11 @@ class TestKurukinRenderConsole(unittest.TestCase):
         )
         page = page_path.read_text(encoding="utf-8")
         self.assertIn("Preparar B-roll", rendered_text)
+        self.assertIn(
+            "Pexels source: disponible solo con integración controlada/flag; no se usa por defecto.",
+            rendered_text,
+        )
+        self.assertIn("KURUKIN_ENABLE_PEXELS_SOURCE=<unset>", rendered_text)
         self.assertIn("Local candidates", page)
         self.assertIn("Desired count", page)
         self.assertIn("B-roll assets preparados", rendered_text)

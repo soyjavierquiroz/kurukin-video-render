@@ -43,8 +43,15 @@ Pexels real ni Asset Hub API.
 `open_sources`:
 
 - usa `local_candidates` primero.
-- si faltan assets, puede completar con `downloader` inyectado.
+- si faltan assets, puede completar con un registro generico
+  `source_adapters`; conserva `downloader` como interfaz inyectada compatible.
+- recorre solo adapters presentes en `asset_policy.allowed_sources`, en el
+  orden declarado, y combina/deduplica sus paths locales.
 - no llama Pexels directo si no hay `downloader`.
+- puede aceptar `source_provider=pexels` y metadata de atribucion cuando el
+  downloader controlado lo devuelve.
+- todo adapter externo debe identificar `source_provider`; el materializer no
+  asume Pexels ni otra fuente por defecto.
 - respeta `allowed_sources`.
 
 `local_only`:
@@ -77,7 +84,8 @@ Render Console:
 - usa `local_only` como modo seguro inicial con candidatos locales.
 - `open_sources` usa candidatos locales primero y solo podria completar con un
   downloader inyectado por integracion futura.
-- no pasa downloader real en la UI inicial.
+- no pasa downloader real en la UI inicial con flags apagados.
+- Pexels source queda detras de `KURUKIN_ENABLE_PEXELS_SOURCE=1`.
 - guarda assets preparados en session state para alimentar el campo
   `b_roll.assets`.
 - no crea pending, no crea task, no ejecuta runner, no ejecuta ffmpeg.
@@ -93,6 +101,16 @@ Renderer:
 
 Los tests usan downloader/manifest_reader fakes. No descargan Pexels real, no
 llaman APIs, no crean pending, no crean task y no requieren storage real.
+
+## Pexels adapter controlado
+
+`app/custom/pexels_source.py` prepara un downloader compatible con el
+materializer. Usa `https://api.pexels.com/v1/videos/search`, header
+`Authorization` directo sin `Bearer`, selecciona MP4 verticales cuando puede y
+guarda metadata de atribucion. Solo descarga cuando se llama explicitamente a la
+funcion de descarga/downloader con un `opener` real o fake.
+
+Ver: `docs/kurukin-pexels-source-adapter.md`.
 
 ## Render Console: Preparar B-roll
 
