@@ -10,7 +10,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
-from app.custom.asset_source_policy import ASSET_SOURCE_MODE_LOCAL_ONLY
+from app.custom.asset_source_policy import (
+    ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS,
+    ASSET_SOURCE_MODE_LOCAL_ONLY,
+    ASSET_SOURCE_MODE_OPEN_SOURCES,
+)
 from app.custom.kurukin_job_queue import (
     CONTAINER_API_BASE_URL,
     CONTAINER_NIGHTLY_QUEUE_DIR,
@@ -52,6 +56,7 @@ from app.custom.kurukin_render_console import (
     get_manifest_summary_for_ui,
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
+    prepare_broll_assets_from_console,
     safe_relative_path,
     validate_and_build_payload_from_console_spec,
 )
@@ -151,6 +156,183 @@ class TestKurukinRenderConsole(unittest.TestCase):
             normalize_aroll_broll_local_asset_paths(
                 "storage/local_videos/../secret.mp4"
             )
+
+    def test_prepare_broll_assets_local_only_with_three_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_LOCAL_ONLY},
+                query="city walk",
+                desired_count=3,
+                local_candidates=[
+                    "storage/local_videos/one.mp4",
+                    "storage/local_assets/two.mp4",
+                    "storage/local_images/three.png",
+                ],
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["b_roll_asset_count"], 3)
+        self.assertEqual(result["source_provider"], "local_library")
+        self.assertEqual(result["query"], "city walk")
+        self.assertEqual(result["asset_policy"]["mode"], ASSET_SOURCE_MODE_LOCAL_ONLY)
+        self.assertEqual(result["asset_policy_label"], "Asset policy: Local only")
+
+    def test_prepare_broll_assets_multiline_candidates_parse_and_dedupe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_LOCAL_ONLY},
+                query=None,
+                desired_count=2,
+                local_candidates=(
+                    "storage/local_videos/one.mp4\n"
+                    "storage/local_videos/one.mp4\n"
+                    "storage/local_assets/two.mp4"
+                ),
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            result["b_roll_assets"],
+            ["storage/local_videos/one.mp4", "storage/local_assets/two.mp4"],
+        )
+
+    def test_prepare_broll_assets_desired_count_clamps_to_eight(self):
+        candidates = [
+            f"storage/local_videos/candidate-{index}.mp4"
+            for index in range(1, 10)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_LOCAL_ONLY},
+                query="",
+                desired_count=99,
+                local_candidates=candidates,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["b_roll_asset_count"], 8)
+
+    def test_prepare_broll_assets_local_only_fails_with_too_few_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_LOCAL_ONLY},
+                query="city",
+                desired_count=2,
+                local_candidates="storage/local_videos/one.mp4",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["error"],
+            "Local-only policy requires enough local candidates",
+        )
+        self.assertEqual(result["b_roll_asset_count"], 1)
+
+    def test_prepare_broll_assets_open_sources_uses_enough_candidates(self):
+        calls = []
+
+        def fake_downloader(_request):
+            calls.append("called")
+            return ["storage/local_videos/downloaded.mp4"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_OPEN_SOURCES},
+                query="city",
+                desired_count=2,
+                local_candidates=(
+                    "storage/local_videos/one.mp4\n"
+                    "storage/local_assets/two.mp4"
+                ),
+                downloader=fake_downloader,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source_provider"], "local_library")
+        self.assertEqual(calls, [])
+
+    def test_prepare_broll_assets_open_sources_without_downloader_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_OPEN_SOURCES},
+                query="city",
+                desired_count=2,
+                local_candidates="storage/local_videos/one.mp4",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["error"],
+            "No hay suficientes assets locales y no hay downloader configurado.",
+        )
+
+    def test_prepare_broll_assets_open_sources_fake_downloader_completes_assets(self):
+        seen_requests = []
+
+        def fake_downloader(request):
+            seen_requests.append(request)
+            return {
+                "source_provider": "pexels",
+                "assets": ["storage/local_videos/downloaded.mp4"],
+                "metadata": {"fake": True},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={"mode": ASSET_SOURCE_MODE_OPEN_SOURCES},
+                query="city",
+                desired_count=2,
+                local_candidates="storage/local_assets/local.mp4",
+                downloader=fake_downloader,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["source_provider"], "mixed")
+        self.assertEqual(result["b_roll_asset_count"], 2)
+        self.assertEqual(seen_requests[0]["needed_count"], 1)
+        self.assertTrue(result["metadata"]["fake"])
+
+    def test_prepare_broll_assets_exclusive_brand_without_manifest_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = prepare_broll_assets_from_console(
+                project_root=Path(tmp),
+                asset_policy={
+                    "mode": ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS,
+                    "brand_asset_bundle_uid": "jab_test",
+                },
+                query="brand",
+                desired_count=1,
+                local_candidates="",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["error"],
+            "Exclusive brand assets require a local manifest",
+        )
+
+    def test_prepare_broll_assets_helper_does_not_create_pending_or_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = prepare_broll_assets_from_console(
+                project_root=root,
+                asset_policy={"mode": ASSET_SOURCE_MODE_LOCAL_ONLY},
+                query="city",
+                desired_count=1,
+                local_candidates="storage/local_videos/one.mp4",
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertFalse((root / "storage" / "nightly_jobs" / "pending").exists())
+            self.assertFalse((root / "storage" / "tasks").exists())
 
     def test_build_aroll_broll_payload_from_console_sets_task_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1516,6 +1698,93 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "La cola A-roll/B-roll se activa después de una validación estricta",
             rendered_text,
         )
+        self.assertNotIn("<div", rendered_text)
+        self.assertFalse(pending_dir_exists)
+        self.assertFalse(tasks_dir_exists)
+        self.assertTrue(at.button(key="aroll_broll_enqueue_disabled").disabled)
+        self.assertTrue(at.button(key="controlled_runner_execute").disabled)
+
+    def test_app_test_prepare_broll_assets_visible_with_flags_off_when_streamlit_available(self):
+        try:
+            from streamlit.testing.v1 import AppTest
+        except ModuleNotFoundError:
+            self.skipTest("streamlit is not installed in this Python environment")
+
+        original_runner_flag = os.environ.pop("KURUKIN_ENABLE_UI_RUNNER", None)
+        original_queue_flag = os.environ.pop("KURUKIN_ENABLE_AROLL_BROLL_QUEUE", None)
+        original_renderer_flag = os.environ.pop(
+            "KURUKIN_ENABLE_AROLL_BROLL_RENDERER",
+            None,
+        )
+        original_direct_flag = os.environ.pop(
+            "KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER",
+            None,
+        )
+        original_cwd = Path.cwd()
+        page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                os.chdir(tmp)
+                at = AppTest.from_file(str(page_path))
+                at.run(timeout=30)
+                at.selectbox(key="video_type_label").set_value("Presentador + B-roll")
+                at.run(timeout=30)
+                at.text_area(key="aroll_broll_prepare_local_candidates").set_value(
+                    "storage/local_videos/one.mp4\n"
+                    "storage/local_assets/two.mp4\n"
+                    "storage/local_images/three.png"
+                )
+                at.run(timeout=30)
+                at.button(key="aroll_broll_prepare_assets").click()
+                at.run(timeout=30)
+                pending_dir_exists = (
+                    tmp_path / "storage" / "nightly_jobs" / "pending"
+                ).exists()
+                tasks_dir_exists = (tmp_path / "storage" / "tasks").exists()
+        finally:
+            os.chdir(original_cwd)
+            if original_runner_flag is not None:
+                os.environ["KURUKIN_ENABLE_UI_RUNNER"] = original_runner_flag
+            if original_queue_flag is not None:
+                os.environ["KURUKIN_ENABLE_AROLL_BROLL_QUEUE"] = original_queue_flag
+            if original_renderer_flag is not None:
+                os.environ["KURUKIN_ENABLE_AROLL_BROLL_RENDERER"] = (
+                    original_renderer_flag
+                )
+            if original_direct_flag is not None:
+                os.environ["KURUKIN_ENABLE_AROLL_BROLL_DIRECT_RENDER"] = (
+                    original_direct_flag
+                )
+
+        self.assertEqual(len(at.exception), 0)
+        rendered_text = "\n".join(
+            str(getattr(item, "value", getattr(item, "label", item)))
+            for collection in (
+                at.title,
+                at.markdown,
+                at.info,
+                at.success,
+                at.warning,
+                at.caption,
+                at.json,
+                at.selectbox,
+                at.radio,
+                at.button,
+                at.text_area,
+                at.number_input,
+            )
+            for item in collection
+        )
+        page = page_path.read_text(encoding="utf-8")
+        self.assertIn("Preparar B-roll", rendered_text)
+        self.assertIn("Local candidates", page)
+        self.assertIn("Desired count", page)
+        self.assertIn("B-roll assets preparados", rendered_text)
+        self.assertIn("B-roll assets", rendered_text)
+        self.assertIn("storage/local_videos/one.mp4", rendered_text)
+        self.assertIn("storage/local_assets/two.mp4", rendered_text)
+        self.assertIn("storage/local_images/three.png", rendered_text)
         self.assertNotIn("<div", rendered_text)
         self.assertFalse(pending_dir_exists)
         self.assertFalse(tasks_dir_exists)

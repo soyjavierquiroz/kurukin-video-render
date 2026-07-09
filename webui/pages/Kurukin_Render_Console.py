@@ -77,8 +77,14 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     get_manifest_summary_for_ui,
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
+    prepare_broll_assets_from_console,
     safe_relative_path,
     validate_and_build_payload_from_console_spec,
+)
+from app.custom.asset_source_policy import (  # noqa: E402
+    ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS,
+    ASSET_SOURCE_MODE_LOCAL_ONLY,
+    ASSET_SOURCE_MODE_OPEN_SOURCES,
 )
 
 
@@ -110,6 +116,11 @@ QUALITY_LABEL_BY_VALUE = {value: key for key, value in QUALITY_LABELS.items()}
 AROLL_BROLL_SOURCE_LABELS = {
     "Asset Hub Bundle": BROLL_SOURCE_ASSET_HUB_MANIFEST,
     "Assets locales": BROLL_SOURCE_LOCAL_ASSETS,
+}
+AROLL_BROLL_PREPARE_POLICY_LABELS = {
+    "Solo locales": ASSET_SOURCE_MODE_LOCAL_ONLY,
+    "Fuentes abiertas": ASSET_SOURCE_MODE_OPEN_SOURCES,
+    "Marca exclusiva": ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS,
 }
 AROLL_BROLL_SUBTITLE_LABELS = {
     "none": SUBTITLES_SOURCE_NONE,
@@ -413,6 +424,16 @@ def _initialize_form_state():
     st.session_state.setdefault("aroll_broll_quality", "draft_720p")
     st.session_state.setdefault("aroll_broll_duration_seconds", 0.0)
     st.session_state.setdefault("aroll_broll_count", 3)
+    st.session_state.setdefault(
+        "aroll_broll_prepare_policy",
+        ASSET_SOURCE_MODE_LOCAL_ONLY,
+    )
+    st.session_state.setdefault("aroll_broll_prepare_query", "")
+    st.session_state.setdefault("aroll_broll_prepare_desired_count", 3)
+    st.session_state.setdefault("aroll_broll_prepare_local_candidates", "")
+    st.session_state.setdefault("aroll_broll_prepare_bundle_uid", "")
+    st.session_state.setdefault("aroll_broll_prepare_manifest_path", "")
+    st.session_state.setdefault("aroll_broll_prepared_assets", {})
 
 
 def _current_manifest_path():
@@ -889,6 +910,8 @@ def render_validate_enqueue_step(manifest_summary):
 
 def _current_aroll_broll_config():
     config = build_default_aroll_broll_config()
+    prepared = st.session_state.get("aroll_broll_prepared_assets") or {}
+    prepared_assets = prepared.get("b_roll_assets") if prepared.get("ok") else []
     config["a_roll"]["path"] = st.session_state.get("aroll_broll_a_path", "")
     config["a_roll"]["crop"] = st.session_state.get(
         "aroll_broll_crop",
@@ -898,7 +921,12 @@ def _current_aroll_broll_config():
         "aroll_broll_source",
         BROLL_SOURCE_ASSET_HUB_MANIFEST,
     )
-    if config["b_roll"]["source"] == BROLL_SOURCE_LOCAL_ASSETS:
+    if prepared_assets:
+        config["b_roll"]["source"] = BROLL_SOURCE_LOCAL_ASSETS
+        config["b_roll"]["assets"] = normalize_aroll_broll_local_asset_paths(
+            prepared_assets
+        )
+    elif config["b_roll"]["source"] == BROLL_SOURCE_LOCAL_ASSETS:
         config["b_roll"]["assets"] = normalize_aroll_broll_local_asset_paths(
             st.session_state.get("aroll_broll_local_assets", "")
         )
@@ -1013,6 +1041,136 @@ def _aroll_broll_queue_flag_label():
     return f"{AROLL_BROLL_QUEUE_FLAG}={value}"
 
 
+def _current_prepare_broll_policy():
+    mode = st.session_state.get(
+        "aroll_broll_prepare_policy",
+        ASSET_SOURCE_MODE_LOCAL_ONLY,
+    )
+    policy = {"mode": mode}
+    if mode == ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS:
+        policy["brand_asset_bundle_uid"] = st.session_state.get(
+            "aroll_broll_prepare_bundle_uid",
+            "",
+        )
+        policy["manifest_path"] = st.session_state.get(
+            "aroll_broll_prepare_manifest_path",
+            "",
+        )
+    return policy
+
+
+def _prepared_broll_result_block(result):
+    if not result:
+        return
+    if result.get("ok"):
+        st.success(result.get("message") or "B-roll assets preparados")
+    else:
+        st.error(result.get("error") or "No se pudieron preparar assets B-roll.")
+    cols = st.columns(3)
+    cols[0].metric("B-roll assets", int(result.get("b_roll_asset_count") or 0))
+    cols[1].metric("Fuente", result.get("source_provider") or "-")
+    cols[2].metric("Policy", result.get("asset_policy_label") or "-")
+    if result.get("query"):
+        st.caption(f"Query: {result['query']}")
+    assets = result.get("b_roll_assets") or []
+    if assets:
+        st.caption("Paths locales preparados")
+        st.code("\n".join(assets), language="text")
+
+
+def _prepare_broll_assets_block():
+    st.markdown("### Preparar B-roll")
+    st.caption(
+        "Materializa una lista local de assets; no encola, no renderiza y no ejecuta runner."
+    )
+    cols = st.columns([1, 1, 1])
+    with cols[0]:
+        policy_label = st.selectbox(
+            "Asset policy",
+            list(AROLL_BROLL_PREPARE_POLICY_LABELS),
+            index=_index_for_value(
+                AROLL_BROLL_PREPARE_POLICY_LABELS,
+                st.session_state.get(
+                    "aroll_broll_prepare_policy",
+                    ASSET_SOURCE_MODE_LOCAL_ONLY,
+                ),
+                ASSET_SOURCE_MODE_LOCAL_ONLY,
+            ),
+            key="aroll_broll_prepare_policy_label",
+        )
+        st.session_state["aroll_broll_prepare_policy"] = (
+            AROLL_BROLL_PREPARE_POLICY_LABELS[policy_label]
+        )
+    with cols[1]:
+        st.text_input(
+            "Query / tema visual",
+            key="aroll_broll_prepare_query",
+            placeholder="ciudad, producto, lifestyle...",
+        )
+    with cols[2]:
+        st.number_input(
+            "Desired count",
+            min_value=1,
+            max_value=8,
+            step=1,
+            key="aroll_broll_prepare_desired_count",
+        )
+
+    if (
+        st.session_state.get("aroll_broll_prepare_policy")
+        == ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS
+    ):
+        brand_cols = st.columns([1, 1])
+        with brand_cols[0]:
+            st.text_input(
+                "Brand bundle UID",
+                key="aroll_broll_prepare_bundle_uid",
+                placeholder="jab_...",
+            )
+        with brand_cols[1]:
+            st.text_input(
+                "Manifest path local",
+                key="aroll_broll_prepare_manifest_path",
+                placeholder="/data/job-assets/<uid>/manifests/renderer-manifest.json",
+            )
+
+    st.text_area(
+        "Local candidates",
+        key="aroll_broll_prepare_local_candidates",
+        placeholder=(
+            "storage/local_videos/cutaway.mp4\n"
+            "storage/local_assets/visual.mp4"
+        ),
+        help="Un path por línea bajo storage/local_videos, storage/local_assets o storage/local_images.",
+        height=84,
+    )
+
+    if st.button("Preparar B-roll", key="aroll_broll_prepare_assets"):
+        result = prepare_broll_assets_from_console(
+            project_root=Path(ROOT_DIR),
+            asset_policy=_current_prepare_broll_policy(),
+            query=st.session_state.get("aroll_broll_prepare_query", ""),
+            desired_count=int(
+                st.session_state.get("aroll_broll_prepare_desired_count", 1)
+            ),
+            local_candidates=st.session_state.get(
+                "aroll_broll_prepare_local_candidates",
+                "",
+            ),
+        )
+        st.session_state["aroll_broll_prepared_assets"] = result
+        if result.get("ok"):
+            st.session_state["aroll_broll_source"] = BROLL_SOURCE_LOCAL_ASSETS
+            st.session_state["aroll_broll_local_assets"] = "\n".join(
+                result.get("b_roll_assets") or []
+            )
+            st.session_state.pop("aroll_broll_validation", None)
+
+    _prepared_broll_result_block(
+        st.session_state.get("aroll_broll_prepared_assets") or {}
+    )
+
+
 def _aroll_broll_view():
     st.markdown("### Modo Presentador + B-roll")
     queue_enabled = is_aroll_broll_queue_enabled()
@@ -1037,6 +1195,8 @@ def _aroll_broll_view():
         "La cola puede preparar un pending job protegido; el runner lo rechaza "
         "hasta habilitar la integración E2E."
     )
+
+    _prepare_broll_assets_block()
 
     left, right = st.columns([1, 1])
     with left:
@@ -1065,9 +1225,19 @@ def _aroll_broll_view():
             key="aroll_broll_source_label",
         )
         st.session_state["aroll_broll_source"] = AROLL_BROLL_SOURCE_LABELS[source_label]
-        if st.session_state["aroll_broll_source"] == BROLL_SOURCE_ASSET_HUB_MANIFEST:
+        prepared_assets = (
+            st.session_state.get("aroll_broll_prepared_assets") or {}
+        ).get("b_roll_assets")
+        if (
+            st.session_state["aroll_broll_source"] == BROLL_SOURCE_ASSET_HUB_MANIFEST
+            and not prepared_assets
+        ):
             st.text_input("Bundle UID", key="aroll_broll_bundle_uid")
         else:
+            if prepared_assets:
+                st.caption(
+                    "Usando assets preparados como B-roll local para el siguiente paso."
+                )
             st.info(
                 "Usa uno o varios paths B-roll locales (1..8), una ruta por línea."
             )

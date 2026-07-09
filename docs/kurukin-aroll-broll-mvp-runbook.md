@@ -110,6 +110,12 @@ Runner E2E PASS:
 
 - Cola muestra “Presentador + B-roll”
 - Resultados muestra “Presentador + B-roll”
+- "Preparar B-roll" materializa/lista assets locales para `b_roll.assets`.
+- Preparar B-roll no encola render, no ejecuta runner y no ejecuta ffmpeg.
+- `local_only` es el modo seguro inicial: usa solo candidatos locales.
+- `open_sources` no llama Pexels real desde UI; solo podria completar con un
+  downloader controlado en una integracion futura.
+- El enqueue/render sigue siendo un paso separado y protegido por flags.
 - Metadata visible:
   - Layout: alternating_fullscreen
   - Audio: A-roll original
@@ -153,6 +159,19 @@ Runner E2E PASS:
 - Tests usan fakes; no hay Pexels real, descargas reales ni Asset Hub API.
 - No se conecta a runner/render en esta fase.
 - Ver: `docs/kurukin-asset-materializer.md`.
+
+## Prepare B-roll UI
+
+- Render Console agrega "Preparar B-roll" dentro de Presentador + B-roll.
+- La accion guarda en session state los assets preparados, contador,
+  `source_provider`, policy label y query.
+- Si el resultado es OK, esos paths alimentan el campo B-roll local del enqueue
+  UI, pero no crean pending automaticamente.
+- Con flags apagados, `local_only` puede correr porque solo valida/materializa
+  paths locales.
+- Marca exclusiva requiere manifest local o bundle resoluble a manifest local;
+  no llama Asset Hub API.
+- Ver: `docs/kurukin-aroll-broll-prepare-broll-ui.md`.
 
 ## Guardrails
 
