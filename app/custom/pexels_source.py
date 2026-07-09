@@ -1,4 +1,8 @@
-"""Controlled Pexels source adapter for local B-roll materialization."""
+"""Controlled Pexels source adapter for local B-roll materialization.
+
+Prefer native MoneyPrinterTurbo media providers when available. This module is
+kept as an experimental fallback for controlled prepare-only flows.
+"""
 
 from __future__ import annotations
 

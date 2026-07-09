@@ -14,6 +14,9 @@
 - Source provider env wiring: merged
 - Render mode: render_mode=aroll_broll
 - Layout MVP: alternating_fullscreen
+- Architecture update: Kurukin debe usar MoneyPrinterTurbo como motor base y
+  compilar A-roll/B-roll a specs MPT antes de considerar renderer/adapters
+  paralelos.
 
 ## Regla principal
 
@@ -25,7 +28,7 @@ El A-roll manda:
 - output = vertical 9:16
 - subtitles = none/custom/desde A-roll en fases futuras
 
-## Flujo técnico validado
+## Flujo técnico validado legado
 
 Crear/validar config
 -> pending protegido
@@ -38,6 +41,18 @@ Crear/validar config
 -> final-task.json
 -> Resultados
 -> Preview/download
+
+Este flujo sigue siendo evidencia util de MVP, pero deja de ser la ruta
+arquitectonica primaria. La ruta primaria para la siguiente fase es:
+
+Intencion Kurukin
+-> `app/custom/mpt_engine_bridge.py`
+-> spec compatible con `VideoParams`
+-> proveedores/materiales/render nativos de MPT
+-> `storage/tasks/<task_id>/final-1.mp4`
+
+El renderer directo A-roll/B-roll queda como extension/gap controlado, no como
+motor paralelo por defecto.
 
 ## Flags
 
@@ -176,6 +191,9 @@ Runner E2E PASS:
 ## Pexels source adapter
 
 - Introducido como helper puro en `app/custom/pexels_source.py`.
+- Estado nuevo: fallback experimental/no primario.
+- Ruta preferida: usar integraciones nativas MPT (`app.services.material`) a
+  traves de un spec generado por `mpt_engine_bridge`.
 - Usa endpoint `/v1/videos/search` y header `Authorization` directo sin
   `Bearer`.
 - Selecciona MP4, prefiere portrait y deduplica por video/link.
@@ -187,6 +205,9 @@ Runner E2E PASS:
 - El materializer combina/deduplica fuentes permitidas por `allowed_sources`.
 - Renderer y runner siguen sin proveedores externos.
 - Ver: `docs/kurukin-pexels-source-adapter.md`.
+
+No crear adapters propios para Pixabay/Coverr mientras el bridge MPT sea la ruta
+de alineamiento principal.
 
 ## Prepare B-roll UI
 
@@ -248,8 +269,9 @@ Runner E2E PASS:
 
 Sin sobreingeniería:
 
-1. Demo controlado con contenido real corto.
-2. B-roll múltiple local.
-3. Mejor metadata/preview.
-4. Subtítulos desde A-roll.
-5. Segundo layout: broll_fullscreen_speaker_bubble.
+1. Usar `mpt_engine_bridge` para compilar jobs Kurukin a specs MPT.
+2. Probar submit real solo con autorizacion explicita.
+3. Resolver gap de audio A-roll si solo existe video A-roll.
+4. Resolver gap de timeline A-roll/B-roll como extension minima del motor MPT.
+5. Mantener adapters/renderers custom como fallback documentado, no como ruta
+   primaria.

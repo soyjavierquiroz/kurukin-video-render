@@ -1,0 +1,93 @@
+# Kurukin uses MoneyPrinterTurbo engine
+
+Fecha: 2026-07-09
+
+## Principios
+
+- MoneyPrinterTurbo es el motor base.
+- Kurukin no reimplementa sourcing ni render.
+- Kurukin orquesta intents, metadata, brand policy y UX.
+- Sourcing externo usa proveedores nativos MPT cuando existen.
+- Render usa pipeline nativo MPT.
+- Custom renderer/adapter solo existe para gaps minimos, documentados y
+  reversibles.
+
+## Boundary
+
+Kurukin debe producir una especificacion compatible con MPT:
+
+- concepto del video;
+- guion o transcript;
+- terminos de busqueda;
+- policy de marca/assets;
+- seleccion de fuente;
+- materiales locales cuando ya existen;
+- audio/subtitulos cuando ya existen;
+- metadata Kurukin para UI/observabilidad.
+
+Kurukin no debe:
+
+- llamar Pexels/Pixabay/Coverr si MPT puede hacerlo;
+- descargar assets por su cuenta salvo prepare-only controlado;
+- crear otro task/result model;
+- llamar ffmpeg para renders finales fuera del motor;
+- saltarse `/storage/tasks/<task_id>/final-1.mp4` como contrato de resultado;
+- tocar secrets/config para resolver una integracion.
+
+## A-roll/B-roll
+
+A-roll/B-roll es una intencion de edicion/producto:
+
+- A-roll es el input principal.
+- El audio A-roll manda.
+- B-roll son materiales de apoyo.
+- B-roll no aporta audio por defecto.
+- Subtitulos vienen de policy: ninguno, SRT propio o transcripcion autorizada.
+
+La intencion debe compilarse a task/spec de MPT:
+
+- A-roll audio separado -> `custom_audio_file`.
+- B-roll local -> `video_source="local"` + `video_materials`.
+- B-roll stock -> `video_source` nativo MPT + `video_terms`.
+- Marca exclusiva -> manifest local via `asset_hub_renderer_manifest_path`.
+- SRT propio -> `custom_subtitle_file`.
+
+Si MPT no soporta una operacion:
+
+- documentar el gap;
+- extender el motor en el punto minimo;
+- preservar task params, task state y result structure nativos;
+- no crear motor paralelo.
+
+## Nuevo bridge
+
+`app/custom/mpt_engine_bridge.py` es el punto de compilacion conceptual.
+
+Responsabilidades:
+
+- descubrir capacidades nativas de MPT sin side effects;
+- transformar un job Kurukin en spec MPT;
+- preservar metadata Kurukin;
+- validar campos faltantes;
+- resumir el spec para UI/operador.
+
+No responsabilidades:
+
+- network;
+- proveedores externos;
+- descargas;
+- pending;
+- task real;
+- API;
+- runner;
+- render.
+
+## Estado de adapters custom
+
+`app/custom/pexels_source.py` queda como fallback experimental/no primario para
+prepare-only controlado. La ruta preferida para stock media es usar
+`app.services.material` mediante el motor nativo MPT cuando el render real este
+autorizado.
+
+No crear adapters propios para Pixabay/Coverr hasta cerrar la integracion con el
+bridge nativo MPT.

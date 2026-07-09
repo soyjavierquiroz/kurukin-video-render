@@ -1,5 +1,22 @@
 # Kurukin Pexels Source Adapter
 
+## Estado arquitectonico
+
+Fallback experimental/no primario.
+
+La ruta preferida para stock media es MoneyPrinterTurbo nativo:
+
+- `app.services.material.search_videos_pexels()`
+- `app.services.material.search_videos_pixabay()`
+- `app.services.material.search_videos_coverr()`
+- `app.services.material.download_videos()`
+
+Kurukin debe compilar intents a specs MPT con
+`app/custom/mpt_engine_bridge.py` y dejar sourcing/render al motor MPT cuando el
+render real este autorizado.
+
+No crear adapters propios para Pixabay/Coverr hasta cerrar esa ruta.
+
 ## Objetivo
 
 Pexels queda preparado como fuente opcional para `open_sources` dentro del flujo
@@ -11,6 +28,7 @@ Esta rama no ejecuta Pexels real, no descarga assets reales y no renderiza.
 ## Contrato
 
 - Pexels no es fuente unica ni default.
+- Pexels custom no es ruta primaria si MPT puede usar su proveedor nativo.
 - Solo aplica a `asset_policy.mode=open_sources`.
 - El materializer sigue siendo generico: combina candidatos locales y adapters
   inyectados permitidos, deduplica y devuelve paths locales.
