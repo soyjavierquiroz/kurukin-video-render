@@ -150,6 +150,12 @@ class TestKurukinJobQueue(unittest.TestCase):
                         "video_resolution": "draft_720p",
                         "aroll_broll": {
                             "subtitles": {"source": "custom_srt"},
+                            "b_roll": {
+                                "assets": [
+                                    "storage/local_assets/one.mp4",
+                                    "storage/local_assets/two.mp4",
+                                ]
+                            },
                         },
                         "runner": {"job_id": "aroll-broll-001"},
                     }
@@ -165,6 +171,7 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertEqual(summary["layout_preset"], "alternating_fullscreen")
         self.assertEqual(summary["audio_summary"], "A-roll original")
         self.assertEqual(summary["broll_summary"], "B-roll muted")
+        self.assertEqual(summary["b_roll_asset_count"], 2)
         self.assertEqual(summary["asset_source"], "A-roll/B-roll")
         self.assertEqual(summary["subtitles"], "SRT propio")
 

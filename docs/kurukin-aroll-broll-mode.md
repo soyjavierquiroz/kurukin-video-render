@@ -61,6 +61,18 @@ activar todavia la cola desde la UI.
 - La duracion final debe ser igual a la duracion del A-roll.
 - El timeline y el comando ffmpeg se clamplean a la duracion del A-roll.
 
+## Multiple B-roll assets
+
+- El MVP soporta entre 1 y 8 assets B-roll locales.
+- `b_roll.assets` acepta una lista de paths; Render Console tambien acepta un
+  path por linea y elimina duplicados exactos preservando el orden.
+- `alternating_fullscreen` rota los assets en orden por cada segmento B-roll y
+  vuelve al primero al completar la lista.
+- El B-roll sigue muted: su audio no se mapea.
+- El A-roll sigue mandando el audio y la duracion final.
+- Todavia no hay seleccion semantica ni matching por transcript.
+- MoneyPrinterTurbo no llama Asset Hub API para esta funcion.
+
 ## Queue integration protegida
 
 La cola A-roll/B-roll esta protegida por `KURUKIN_ENABLE_AROLL_BROLL_QUEUE`.

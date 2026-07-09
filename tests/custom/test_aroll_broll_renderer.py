@@ -212,6 +212,41 @@ class TestArollBrollRenderer(unittest.TestCase):
 
         self.assertLessEqual(self._segment_duration_sum(timeline), 6)
 
+    def test_timeline_rotates_three_broll_assets_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index in range(3):
+                path = root / "storage" / "local_assets" / f"asset-{index}.mp4"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"dummy")
+                paths.append(path)
+            assets = [
+                ArollBrollAsset(path=path, kind="video") for path in paths
+            ]
+            timeline = build_alternating_fullscreen_timeline(
+                30,
+                assets,
+                2,
+                "high",
+            )
+
+        broll_segments = [
+            item for item in timeline if item["visual"] == "b_roll"
+        ]
+        self.assertEqual(
+            [item["broll_index"] for item in broll_segments[:4]],
+            [0, 1, 2, 0],
+        )
+        self.assertEqual(
+            [item["broll_path"] for item in broll_segments[:4]],
+            [paths[0].as_posix(), paths[1].as_posix(), paths[2].as_posix(), paths[0].as_posix()],
+        )
+        self.assertTrue(
+            all(float(item["end"]) > float(item["start"]) for item in timeline)
+        )
+        self.assertLessEqual(max(item["end"] for item in timeline), 30)
+
     def test_command_builder_returns_list_not_string(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = build_alternating_fullscreen_ffmpeg_command(
@@ -306,6 +341,40 @@ class TestArollBrollRenderer(unittest.TestCase):
         self.assertNotIn("1:a", command)
         self.assertNotIn("2:a", command)
 
+    def test_command_contains_inputs_for_all_rotated_broll_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aroll, _, _ = self._make_project_files(root)
+            paths = []
+            for index in range(3):
+                path = root / "storage" / "local_assets" / f"asset-{index}.mp4"
+                path.write_bytes(b"dummy")
+                paths.append(path)
+            assets = [
+                ArollBrollAsset(path=path, kind="video") for path in paths
+            ]
+            plan = ArollBrollRenderPlan(
+                a_roll_path=aroll,
+                b_roll_assets=assets,
+                output_path=build_aroll_broll_output_path("task_003", root),
+                timeline=build_alternating_fullscreen_timeline(
+                    30,
+                    assets,
+                    2,
+                    "high",
+                ),
+                aroll_duration_seconds=30,
+            )
+            command = build_alternating_fullscreen_ffmpeg_command(plan)
+
+        for path in paths:
+            self.assertIn(path.as_posix(), command)
+        self.assertIn("0:a?", command)
+        self.assertNotIn("1:a", command)
+        self.assertNotIn("2:a", command)
+        self.assertNotIn("3:a", command)
+        self.assertTrue(all(isinstance(item, str) for item in command))
+
     def test_command_includes_final_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = build_alternating_fullscreen_ffmpeg_command(
@@ -351,6 +420,19 @@ class TestArollBrollRenderer(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIsInstance(calls[0][0], list)
         self.assertEqual(result["stdout"], "ok")
+
+    def test_run_aroll_broll_render_does_not_enable_shell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._make_plan(Path(tmp))
+            calls = []
+
+            def runner(command, **kwargs):
+                calls.append((command, kwargs))
+                return {"returncode": 0, "stdout": "ok", "stderr": ""}
+
+            run_aroll_broll_render(plan, runner=runner)
+
+        self.assertNotIn("shell", calls[0][1])
 
     def test_run_aroll_broll_render_execute_creates_output_parent_before_runner(self):
         with tempfile.TemporaryDirectory() as tmp:
