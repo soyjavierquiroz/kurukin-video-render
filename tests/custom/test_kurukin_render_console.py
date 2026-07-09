@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_job_adapter import KurukinJobAdapterError
+from app.custom.asset_source_policy import ASSET_SOURCE_MODE_LOCAL_ONLY
 from app.custom.kurukin_job_queue import (
     CONTAINER_API_BASE_URL,
     CONTAINER_NIGHTLY_QUEUE_DIR,
@@ -154,8 +155,10 @@ class TestKurukinRenderConsole(unittest.TestCase):
     def test_build_aroll_broll_payload_from_console_sets_task_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            config = self._aroll_broll_local_config(root)
+            config["asset_policy"] = {"mode": ASSET_SOURCE_MODE_LOCAL_ONLY}
             payload = build_aroll_broll_payload_from_console(
-                self._aroll_broll_local_config(root),
+                config,
                 job_id="aroll-broll-ui-smoke-004",
                 project_root=root,
                 render_quality="draft_720p",
@@ -167,6 +170,11 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(payload["job_id"], "aroll-broll-ui-smoke-004")
         self.assertEqual(payload["task_id"], "aroll-broll-ui-smoke-004")
         self.assertEqual(payload["created_by"], "render_console_ui_smoke_004")
+        self.assertEqual(payload["asset_policy"]["mode"], ASSET_SOURCE_MODE_LOCAL_ONLY)
+        self.assertEqual(
+            payload["aroll_broll"]["asset_policy"]["mode"],
+            ASSET_SOURCE_MODE_LOCAL_ONLY,
+        )
         self.assertEqual(
             payload["aroll_broll"]["b_roll"]["assets"],
             [(root / "storage" / "local_videos" / "cutaway.mp4").as_posix()],
@@ -331,6 +339,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Cola A-roll/B-roll: protegida",
             "Activa KURUKIN_ENABLE_AROLL_BROLL_QUEUE=1 solo para pruebas controladas.",
             "Renderer preparado: alternating_fullscreen",
+            'summary["asset_policy"]',
+            "asset_policy_short_label",
             "Uno o varios paths B-roll locales",
             "B-roll assets:",
             "El runner no lo renderiza todavía",

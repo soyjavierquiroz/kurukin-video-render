@@ -6,6 +6,12 @@ from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from app.custom.asset_source_policy import (
+    normalize_asset_source_policy,
+    summarize_asset_source_policy,
+    validate_asset_source_policy,
+)
+
 
 RENDER_MODE_AROLL_BROLL = "aroll_broll"
 AROLL_BROLL_QUEUE_GUARD = "renderer_not_enabled"
@@ -95,6 +101,7 @@ def build_default_aroll_broll_config() -> dict[str, Any]:
             "provider": "none",
             "custom_srt_path": "",
         },
+        "asset_policy": normalize_asset_source_policy(None),
     }
 
 
@@ -276,6 +283,9 @@ def validate_aroll_broll_config(
     b_roll = normalized.setdefault("b_roll", {})
     layout = normalized.setdefault("layout", {})
     subtitles = normalized.setdefault("subtitles", {})
+    asset_policy = normalize_asset_source_policy(normalized.get("asset_policy"))
+    normalized["asset_policy"] = asset_policy
+    errors.extend(validate_asset_source_policy(asset_policy))
 
     if a_roll.get("audio_policy") != AROLL_AUDIO_ORIGINAL:
         errors.append("a_roll.audio_policy must be original")
@@ -503,6 +513,12 @@ def summarize_aroll_broll_config(config: dict[str, Any]) -> dict[str, str]:
         ),
         "crop": str(normalized.get("a_roll", {}).get("crop") or SPEAKER_CROP_CENTER),
         "renderer": "Renderer preparado: alternating_fullscreen",
+        "asset_policy": summarize_asset_source_policy(
+            normalized.get("asset_policy")
+        )["console_label"],
+        "asset_policy_short": summarize_asset_source_policy(
+            normalized.get("asset_policy")
+        )["short_label"],
     }
 
 
@@ -546,6 +562,7 @@ def build_aroll_broll_queue_payload(
         "description": "A-roll/B-roll queued job; renderer execution disabled",
         "render_mode": RENDER_MODE_AROLL_BROLL,
         "aroll_broll": deepcopy(normalized),
+        "asset_policy": deepcopy(normalized.get("asset_policy")),
         "video_subject": video_title,
         "video_aspect": "9:16",
         "video_resolution": quality,

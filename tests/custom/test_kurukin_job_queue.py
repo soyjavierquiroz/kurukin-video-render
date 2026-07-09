@@ -175,6 +175,54 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertEqual(summary["asset_source"], "A-roll/B-roll")
         self.assertEqual(summary["subtitles"], "SRT propio")
 
+    def test_summarize_pending_job_shows_open_asset_policy(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pending_path = Path(tmp_dir) / "20260709-120000-aroll-broll.json"
+            pending_path.write_text(
+                json.dumps(
+                    {
+                        "job_id": "aroll-broll-open",
+                        "render_mode": "aroll_broll",
+                        "aroll_broll": {
+                            "asset_policy": {"mode": "open_sources"},
+                        },
+                        "runner": {"job_id": "aroll-broll-open"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = summarize_pending_job(pending_path)
+
+        self.assertEqual(summary["asset_policy_label"], "Open sources")
+        self.assertEqual(summary["asset_policy_short_label"], "Fuentes: abiertas")
+
+    def test_summarize_pending_job_shows_exclusive_brand_asset_policy(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pending_path = Path(tmp_dir) / "20260709-121000-aroll-broll.json"
+            pending_path.write_text(
+                json.dumps(
+                    {
+                        "job_id": "aroll-broll-exclusive",
+                        "render_mode": "aroll_broll",
+                        "asset_policy": {
+                            "mode": "exclusive_brand_assets",
+                            "brand_asset_bundle_uid": "jab_test",
+                        },
+                        "runner": {"job_id": "aroll-broll-exclusive"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = summarize_pending_job(pending_path)
+
+        self.assertEqual(summary["asset_policy_label"], "Exclusive brand assets")
+        self.assertEqual(
+            summary["asset_policy_short_label"],
+            "Fuentes: marca exclusiva",
+        )
+
     def test_summarize_render_mode_returns_human_labels(self):
         self.assertEqual(summarize_render_mode("normal"), "Video normal")
         self.assertEqual(summarize_render_mode("aroll_broll"), "Presentador + B-roll")
@@ -476,6 +524,49 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertEqual(result["layout_preset"], "alternating_fullscreen")
         self.assertEqual(result["audio_summary"], "A-roll original")
         self.assertEqual(result["broll_summary"], "B-roll muted")
+        self.assertNotIn("asset_policy_short_label", result)
+
+    def test_find_result_for_job_preserves_asset_policy_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                job_id="job-aroll-result",
+                task_id="aroll-broll-result-001",
+                job_payload={
+                    "job_id": "job-aroll-result",
+                    "render_mode": "aroll_broll",
+                    "asset_policy": {"mode": "local_only"},
+                },
+            )
+
+            result = find_result_for_job(
+                "job-aroll-result",
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["asset_policy_label"], "Local only")
+        self.assertEqual(result["asset_policy_short_label"], "Fuentes: locales")
+
+    def test_old_completed_aroll_broll_job_without_asset_policy_does_not_break(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                job_id="job-aroll-old",
+                task_id="aroll-broll-old-001",
+                job_payload={"job_id": "job-aroll-old", "render_mode": "aroll_broll"},
+            )
+
+            jobs = list_completed_render_jobs(
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertEqual(jobs[0]["render_mode"], "aroll_broll")
+        self.assertNotIn("asset_policy_short_label", jobs[0])
 
     def test_find_result_for_job_returns_none_without_mp4(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

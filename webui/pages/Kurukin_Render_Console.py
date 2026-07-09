@@ -937,6 +937,7 @@ def _aroll_broll_summary_block(config):
     cols[3].metric("Layout", summary["layout"])
     cols[4].metric("Crop", summary["crop"])
     st.caption(summary["renderer"])
+    st.caption(summary["asset_policy"])
     asset_count = len(config.get("b_roll", {}).get("assets") or [])
     if asset_count:
         st.caption(f"B-roll assets: {asset_count}")
@@ -1297,6 +1298,8 @@ def _aroll_broll_visibility_block(item):
     st.caption(f"Layout: {item.get('layout_preset') or 'alternating_fullscreen'}")
     st.caption(f"Audio: {item.get('audio_summary') or 'A-roll original'}")
     st.caption(item.get("broll_summary") or "B-roll muted")
+    if item.get("asset_policy_short_label"):
+        st.caption(item["asset_policy_short_label"])
     if item.get("b_roll_asset_count"):
         st.caption(f"B-roll assets: {item['b_roll_asset_count']}")
     task_id = item.get("task_id")

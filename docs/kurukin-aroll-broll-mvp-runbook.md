@@ -128,9 +128,23 @@ Runner E2E PASS:
 - No existe seleccion semantica en esta fase.
 - No se llama Asset Hub API.
 
+## Asset source policy
+
+- Introducida como metadata/schema/helper para A-roll/B-roll.
+- Default: `open_sources`, buscar recursos en fuentes disponibles/autorizadas.
+- Marca exclusiva: `exclusive_brand_assets`, requiere
+  `brand_asset_bundle_uid` y usa solo Asset Hub/manifest local de marca.
+- Local: `local_only`, solo assets locales o subidos.
+- Cola/Resultados pueden mostrar `Fuentes: abiertas`,
+  `Fuentes: marca exclusiva` o `Fuentes: locales` cuando existe metadata.
+- El renderer no decide fuentes, no llama Pexels, no llama Asset Hub API y
+  consume assets locales ya materializados en `b_roll.assets` o manifest local.
+- Ver: `docs/kurukin-asset-source-policy.md`.
+
 ## Guardrails
 
 - MPT no llama Asset Hub API para A-roll/B-roll
+- renderer no llama Pexels ni proveedores externos
 - no /api/v1/videos para render_mode=aroll_broll
 - no DB
 - no rclone
