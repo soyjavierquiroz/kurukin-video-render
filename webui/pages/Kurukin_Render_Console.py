@@ -1300,6 +1300,10 @@ def _aroll_broll_visibility_block(item):
     st.caption(item.get("broll_summary") or "B-roll muted")
     if item.get("asset_policy_short_label"):
         st.caption(item["asset_policy_short_label"])
+    if item.get("asset_materialization_source_label"):
+        st.caption(f"Fuente: {item['asset_materialization_source_label']}")
+    if item.get("asset_materialization_query"):
+        st.caption(f"Query: {item['asset_materialization_query']}")
     if item.get("b_roll_asset_count"):
         st.caption(f"B-roll assets: {item['b_roll_asset_count']}")
     task_id = item.get("task_id")

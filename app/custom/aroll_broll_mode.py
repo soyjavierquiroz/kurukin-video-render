@@ -143,6 +143,37 @@ def _merge_default_config(config: Any) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_asset_materialization_metadata(
+    value: Any,
+    *,
+    asset_policy: dict[str, Any],
+    b_roll_assets: Any = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    try:
+        asset_count = int(
+            value.get("b_roll_asset_count")
+            or value.get("asset_count")
+            or len(b_roll_assets or [])
+        )
+    except (TypeError, ValueError):
+        asset_count = 0
+
+    metadata = {
+        "source_provider": _clean_text(value.get("source_provider")),
+        "query": _clean_text(value.get("query") or value.get("search_query")),
+        "b_roll_asset_count": max(0, asset_count),
+        "asset_policy": summarize_asset_source_policy(asset_policy),
+    }
+    return {
+        key: item
+        for key, item in metadata.items()
+        if item or key == "b_roll_asset_count"
+    }
+
+
 def _has_path_traversal(value: str) -> bool:
     if "\\" in value:
         return True
@@ -286,6 +317,15 @@ def validate_aroll_broll_config(
     asset_policy = normalize_asset_source_policy(normalized.get("asset_policy"))
     normalized["asset_policy"] = asset_policy
     errors.extend(validate_asset_source_policy(asset_policy))
+    asset_materialization = _normalize_asset_materialization_metadata(
+        normalized.get("asset_materialization"),
+        asset_policy=asset_policy,
+        b_roll_assets=b_roll.get("assets"),
+    )
+    if asset_materialization:
+        normalized["asset_materialization"] = asset_materialization
+    else:
+        normalized.pop("asset_materialization", None)
 
     if a_roll.get("audio_policy") != AROLL_AUDIO_ORIGINAL:
         errors.append("a_roll.audio_policy must be original")
@@ -581,4 +621,8 @@ def build_aroll_broll_queue_payload(
     }
     if isinstance(b_roll_assets, list) and b_roll_assets:
         payload["b_roll_asset_count"] = len(b_roll_assets)
+    if normalized.get("asset_materialization"):
+        payload["asset_materialization"] = deepcopy(
+            normalized.get("asset_materialization")
+        )
     return payload

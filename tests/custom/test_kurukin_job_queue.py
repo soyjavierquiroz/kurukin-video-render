@@ -223,6 +223,31 @@ class TestKurukinJobQueue(unittest.TestCase):
             "Fuentes: marca exclusiva",
         )
 
+    def test_summarize_pending_job_shows_asset_materialization_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pending_path = Path(tmp_dir) / "20260709-122000-aroll-broll.json"
+            pending_path.write_text(
+                json.dumps(
+                    {
+                        "job_id": "aroll-broll-materialized",
+                        "render_mode": "aroll_broll",
+                        "asset_materialization": {
+                            "source_provider": "pexels",
+                            "query": "city walking",
+                            "b_roll_asset_count": 3,
+                        },
+                        "runner": {"job_id": "aroll-broll-materialized"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = summarize_pending_job(pending_path)
+
+        self.assertEqual(summary["asset_materialization_source_label"], "Pexels")
+        self.assertEqual(summary["asset_materialization_query"], "city walking")
+        self.assertEqual(summary["b_roll_asset_count"], 3)
+
     def test_summarize_render_mode_returns_human_labels(self):
         self.assertEqual(summarize_render_mode("normal"), "Video normal")
         self.assertEqual(summarize_render_mode("aroll_broll"), "Presentador + B-roll")
@@ -549,6 +574,35 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["asset_policy_label"], "Local only")
         self.assertEqual(result["asset_policy_short_label"], "Fuentes: locales")
+
+    def test_find_result_for_job_preserves_asset_materialization_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            completed_dir, tasks_dir, _ = self._write_completed_job(
+                base,
+                job_id="job-aroll-materialized",
+                task_id="aroll-broll-materialized-001",
+                job_payload={
+                    "job_id": "job-aroll-materialized",
+                    "render_mode": "aroll_broll",
+                    "asset_materialization": {
+                        "source_provider": "manifest",
+                        "query": "brand launch",
+                        "b_roll_asset_count": 2,
+                    },
+                },
+            )
+
+            result = find_result_for_job(
+                "job-aroll-materialized",
+                completed_dir=completed_dir.parent,
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["asset_materialization_source_label"], "manifest")
+        self.assertEqual(result["asset_materialization_query"], "brand launch")
+        self.assertEqual(result["b_roll_asset_count"], 2)
 
     def test_old_completed_aroll_broll_job_without_asset_policy_does_not_break(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

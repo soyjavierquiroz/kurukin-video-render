@@ -87,6 +87,22 @@ la etapa de sourcing/materializacion. El renderer no decide fuentes.
 - El renderer sigue consumiendo assets locales ya materializados en
   `b_roll.assets` o un manifest local bajo `/data/job-assets`.
 
+## Asset materializer
+
+El materializer minimo vive en `app/custom/asset_materializer.py`.
+
+- Convierte una `asset_policy` y request en `b_roll_assets` locales.
+- `open_sources` usa candidatos locales primero y puede completar con downloader
+  inyectado.
+- `local_only` no usa downloader ni Asset Hub.
+- `exclusive_brand_assets` usa manifest local de marca y bloquea Pexels/fuentes
+  abiertas.
+- En esta fase no se conecta al runner ni al renderer; solo expone helper,
+  schema, docs y tests con fakes.
+- Cola/Resultados pueden mostrar metadata read-only como `Fuente: Pexels`,
+  `Fuente: local`, `Fuente: manifest`, `Query: ...` y `B-roll assets: N`
+  cuando viene en el job.
+
 ## Queue integration protegida
 
 La cola A-roll/B-roll esta protegida por `KURUKIN_ENABLE_AROLL_BROLL_QUEUE`.
@@ -162,6 +178,7 @@ un fixture pequeno y controlado.
 
 - MoneyPrinterTurbo no llama Asset Hub API para este modo.
 - El renderer no llama Pexels ni proveedores externos.
+- El materializer no llama proveedores reales en tests; usa fakes inyectados.
 - No usa rclone.
 - No toca DB.
 - No acepta paths arbitrarios.

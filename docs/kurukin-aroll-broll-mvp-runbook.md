@@ -141,10 +141,24 @@ Runner E2E PASS:
   consume assets locales ya materializados en `b_roll.assets` o manifest local.
 - Ver: `docs/kurukin-asset-source-policy.md`.
 
+## Asset materializer
+
+- Introducido como helper puro en `app/custom/asset_materializer.py`.
+- Convierte `asset_policy` + request en `b_roll_assets` locales.
+- `open_sources` usa candidatos locales primero y completa solo con downloader
+  inyectado.
+- `local_only` solo usa candidatos locales.
+- `exclusive_brand_assets` usa manifest local de marca y bloquea fuentes
+  abiertas.
+- Tests usan fakes; no hay Pexels real, descargas reales ni Asset Hub API.
+- No se conecta a runner/render en esta fase.
+- Ver: `docs/kurukin-asset-materializer.md`.
+
 ## Guardrails
 
 - MPT no llama Asset Hub API para A-roll/B-roll
 - renderer no llama Pexels ni proveedores externos
+- materializer solo usa proveedores inyectados/fakes en tests
 - no /api/v1/videos para render_mode=aroll_broll
 - no DB
 - no rclone

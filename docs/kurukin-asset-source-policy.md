@@ -38,6 +38,8 @@ Asset sourcing/materializer:
 - decide fuentes.
 - busca/descarga/materializa.
 - entrega paths locales o manifest local.
+- el helper minimo vive en `app/custom/asset_materializer.py` y usa
+  downloader/manifest_reader inyectables en tests.
 
 Renderer:
 
@@ -45,6 +47,16 @@ Renderer:
 - no llama Asset Hub API.
 - no usa rclone.
 - consume `b_roll.assets`/manifest local.
+
+## Materializer minimo
+
+- `open_sources` usa candidatos locales primero y solo completa con downloader
+  inyectado si la policy lo permite.
+- `local_only` usa solo candidatos locales y falla si no alcanzan.
+- `exclusive_brand_assets` usa manifest local de marca y no usa downloader.
+- El resultado final expone `b_roll_assets`, `b_roll_asset_count`,
+  `source_provider` y metadata read-only para Cola/Resultados.
+- No hay Pexels real ni Asset Hub API en tests.
 
 ## Relación con smoke-005
 
