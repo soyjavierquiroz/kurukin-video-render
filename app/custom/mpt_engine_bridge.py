@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import re
 from typing import Any
 
 from app.custom.asset_source_policy import (
+    ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS,
     ASSET_SOURCE_MODE_LOCAL_ONLY,
     ASSET_SOURCE_MODE_OPEN_SOURCES,
     normalize_asset_source_policy,
@@ -27,6 +29,54 @@ MPT_SUPPORTED_VIDEO_SOURCES = (
 )
 
 RENDER_MODE_AROLL_BROLL = "aroll_broll"
+
+_KNOWN_VIDEO_PARAMS_FIELDS = {
+    "video_subject",
+    "video_script",
+    "video_terms",
+    "video_aspect",
+    "video_resolution",
+    "video_concat_mode",
+    "video_transition_mode",
+    "video_clip_duration",
+    "match_materials_to_script",
+    "video_count",
+    "video_source",
+    "video_materials",
+    "asset_hub_renderer_manifest_path",
+    "asset_hub_bundle_uid",
+    "asset_hub_scene_mode",
+    "asset_hub_strict",
+    "image_motion_enabled",
+    "image_motion_preset",
+    "image_motion_intensity",
+    "custom_audio_file",
+    "custom_subtitle_file",
+    "subtitle_provider",
+    "subtitle_correction_enabled",
+    "subtitle_optimization_enabled",
+    "video_language",
+    "voice_name",
+    "voice_volume",
+    "voice_rate",
+    "bgm_type",
+    "bgm_file",
+    "bgm_volume",
+    "subtitle_enabled",
+    "subtitle_position",
+    "custom_position",
+    "font_name",
+    "text_fore_color",
+    "text_background_color",
+    "rounded_subtitle_background",
+    "font_size",
+    "stroke_color",
+    "stroke_width",
+    "n_threads",
+    "paragraph_number",
+    "video_script_prompt",
+    "custom_system_prompt",
+}
 
 _RENDER_QUALITY_TO_MPT_RESOLUTION = {
     "draft_720p": "720p",
@@ -71,23 +121,173 @@ def _normalize_render_quality(value: Any) -> str:
 
 def _material_info(path_or_material: Any, *, provider: str = "local") -> dict[str, Any]:
     if isinstance(path_or_material, dict):
-        material = deepcopy(path_or_material)
-        if "url" not in material:
-            material["url"] = _first_clean_text(
-                material.get("path"),
-                material.get("local_path"),
-                material.get("file_path"),
-                material.get("source_path"),
-                material.get("resolved_path"),
-            )
-        material["provider"] = _clean_text(material.get("provider")) or provider
-        material.setdefault("duration", 0)
-        return material
+        source = deepcopy(path_or_material)
+        return {
+            "provider": _clean_text(source.get("provider")) or provider,
+            "url": _first_clean_text(
+                source.get("url"),
+                source.get("path"),
+                source.get("local_path"),
+                source.get("file_path"),
+                source.get("source_path"),
+                source.get("resolved_path"),
+            ),
+            "duration": int(source.get("duration") or 0),
+            "motion": _clean_text(source.get("motion")),
+            "motion_intensity": float(source.get("motion_intensity") or 0.0),
+        }
 
     return {
         "provider": provider,
         "url": _clean_text(path_or_material),
         "duration": 0,
+    }
+
+
+def _video_params_fields_from_model(model: Any) -> set[str]:
+    fields = getattr(model, "model_fields", None)
+    if fields is None:
+        fields = getattr(model, "__fields__", None)
+    if isinstance(fields, dict):
+        return set(fields.keys())
+    return set(_KNOWN_VIDEO_PARAMS_FIELDS)
+
+
+def _video_params_fields() -> set[str]:
+    try:
+        return _video_params_fields_from_model(get_mpt_video_params_model())
+    except Exception:
+        return set(_KNOWN_VIDEO_PARAMS_FIELDS)
+
+
+def _redact_sensitive_text(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    sensitive_words = (
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "credential",
+        "password",
+        "secret",
+        "token",
+    )
+    redacted = text
+    for word in sensitive_words:
+        redacted = re.sub(
+            rf"(?i)({re.escape(word)})(\\s*[=:]\\s*)([^\\s,;]+)",
+            r"\1\2<redacted>",
+            redacted,
+        )
+    if any(word in redacted.lower() for word in sensitive_words):
+        return "<redacted>"
+    return redacted
+
+
+def _normalize_validation_errors(error: Exception) -> list[dict[str, str]]:
+    raw_errors = None
+    if hasattr(error, "errors"):
+        try:
+            raw_errors = error.errors()
+        except Exception:
+            raw_errors = None
+
+    normalized: list[dict[str, str]] = []
+    if isinstance(raw_errors, list):
+        for item in raw_errors:
+            if not isinstance(item, dict):
+                continue
+            loc = item.get("loc") or item.get("location") or ""
+            if isinstance(loc, (list, tuple)):
+                field = ".".join(str(part) for part in loc)
+            else:
+                field = str(loc)
+            normalized.append(
+                {
+                    "field": _redact_sensitive_text(field),
+                    "message": _redact_sensitive_text(item.get("msg", "invalid value")),
+                    "type": _redact_sensitive_text(item.get("type", "validation_error")),
+                }
+            )
+
+    if normalized:
+        return normalized
+
+    return [
+        {
+            "field": "",
+            "message": _redact_sensitive_text(error),
+            "type": error.__class__.__name__,
+        }
+    ]
+
+
+def get_mpt_video_params_model() -> Any:
+    """Return the real MPT VideoParams model without calling services or APIs."""
+
+    from app.models.schema import VideoParams
+
+    return VideoParams
+
+
+def normalize_mpt_video_params_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Return only fields accepted by app.models.schema.VideoParams."""
+
+    source = _as_dict(spec)
+    if isinstance(source.get("mpt_params"), dict):
+        source = _as_dict(source.get("mpt_params"))
+
+    fields = _video_params_fields()
+    normalized = {
+        key: deepcopy(value)
+        for key, value in source.items()
+        if key in fields
+    }
+
+    if "video_subject" in normalized:
+        normalized["video_subject"] = _clean_text(normalized.get("video_subject"))
+    if "video_source" in fields:
+        video_source = _clean_text(normalized.get("video_source"))
+        normalized["video_source"] = (
+            video_source
+            if video_source in MPT_SUPPORTED_VIDEO_SOURCES
+            else MPT_VIDEO_SOURCE_PEXELS
+        )
+    if normalized.get("video_source") != MPT_VIDEO_SOURCE_LOCAL:
+        normalized.setdefault("video_materials", [])
+
+    return normalized
+
+
+def validate_against_mpt_video_params(spec: dict[str, Any]) -> dict[str, Any]:
+    """Validate a spec against the real VideoParams model without execution."""
+
+    normalized = normalize_mpt_video_params_spec(spec)
+    model_name = "VideoParams"
+    try:
+        model = get_mpt_video_params_model()
+        model_name = getattr(model, "__name__", model_name)
+        if hasattr(model, "model_validate"):
+            model.model_validate(normalized)
+        elif hasattr(model, "parse_obj"):
+            model.parse_obj(normalized)
+        else:
+            model(**normalized)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "spec": normalized,
+            "validated_model": model_name,
+            "errors": _normalize_validation_errors(exc),
+        }
+
+    return {
+        "ok": True,
+        "spec": normalized,
+        "validated_model": model_name,
+        "errors": [],
     }
 
 
@@ -276,11 +476,25 @@ def build_mpt_video_task_from_kurukin_job(
     mpt_params = _base_mpt_params(job)
     materials = _local_materials_from_job(job)
     manifest_path = _clean_text(mpt_params.get("asset_hub_renderer_manifest_path"))
+    gaps: list[str] = []
+
+    if asset_policy.get("brand_asset_bundle_uid") and not mpt_params.get(
+        "asset_hub_bundle_uid"
+    ):
+        mpt_params["asset_hub_bundle_uid"] = asset_policy["brand_asset_bundle_uid"]
 
     if manifest_path:
         mpt_params["video_source"] = MPT_VIDEO_SOURCE_LOCAL
         mpt_params["video_materials"] = []
         mpt_params["video_terms"] = []
+    elif asset_policy.get("mode") == ASSET_SOURCE_MODE_EXCLUSIVE_BRAND_ASSETS:
+        mpt_params["video_source"] = MPT_VIDEO_SOURCE_LOCAL
+        mpt_params["video_materials"] = materials
+        mpt_params["video_terms"] = []
+        if not materials:
+            gaps.append(
+                "exclusive_brand_assets requires a local renderer manifest path or local materials before MPT submit; no Asset Hub API is called by this bridge."
+            )
     elif materials or asset_policy.get("mode") == ASSET_SOURCE_MODE_LOCAL_ONLY:
         mpt_params["video_source"] = MPT_VIDEO_SOURCE_LOCAL
         mpt_params["video_materials"] = materials
@@ -293,7 +507,7 @@ def build_mpt_video_task_from_kurukin_job(
         asset_policy=asset_policy,
         kurukin_job=job,
         render_mode=_first_clean_text(job.get("render_mode"), "normal"),
-        gaps=[],
+        gaps=gaps,
         warnings=[],
     )
 
@@ -412,6 +626,33 @@ def build_mpt_aroll_broll_task_spec(kurukin_job: dict[str, Any]) -> dict[str, An
     return spec
 
 
+def build_validated_mpt_video_task_from_kurukin_job(
+    kurukin_job: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a bridge spec and validate its MPT params against VideoParams."""
+
+    task_spec = build_mpt_video_task_from_kurukin_job(kurukin_job)
+    structural_errors = validate_mpt_task_spec(task_spec)
+    validation = validate_against_mpt_video_params(task_spec)
+    errors = list(validation["errors"])
+    for message in structural_errors:
+        errors.append(
+            {
+                "field": "",
+                "message": _redact_sensitive_text(message),
+                "type": "bridge_validation",
+            }
+        )
+
+    return {
+        "ok": bool(validation["ok"] and not structural_errors),
+        "spec": validation["spec"],
+        "task_spec": task_spec,
+        "validated_model": validation["validated_model"],
+        "errors": errors,
+    }
+
+
 def _build_spec(
     *,
     mpt_params: dict[str, Any],
@@ -431,7 +672,7 @@ def _build_spec(
             "api": "POST /api/v1/videos",
             "service": "app.services.task.start",
         },
-        "mpt_params": deepcopy(mpt_params),
+        "mpt_params": normalize_mpt_video_params_spec(mpt_params),
         "kurukin_metadata": {
             "job_id": _first_clean_text(
                 kurukin_job.get("job_id"), kurukin_job.get("id")
