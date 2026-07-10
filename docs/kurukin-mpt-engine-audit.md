@@ -232,9 +232,40 @@ Gaps reales:
 - `discover_mpt_engine_capabilities()`
 - `build_mpt_video_task_from_kurukin_job(kurukin_job)`
 - `build_mpt_aroll_broll_task_spec(kurukin_job)`
+- `normalize_mpt_video_params_spec(spec)`
+- `validate_against_mpt_video_params(spec)`
+- `build_validated_mpt_video_task_from_kurukin_job(kurukin_job)`
 - `validate_mpt_task_spec(spec)`
 - `summarize_mpt_task_spec(spec)`
 
 El bridge no llama proveedores, no descarga, no renderiza, no crea pending/task
 y no llama API. Produce un spec `execution="spec_only"` para revisar o someter a
 MPT en una fase autorizada.
+
+## VideoParams validation checkpoint
+
+`mpt_engine_bridge` ahora valida los params generados contra
+`app.models.schema.VideoParams` antes de cualquier submit real. La validacion:
+
+- importa el modelo `VideoParams`;
+- filtra el payload a campos reales del modelo;
+- soporta Pydantic v2 con `model_validate()`;
+- soporta Pydantic v1 con `parse_obj()`;
+- normaliza errores a `{field, message, type}`;
+- redacta mensajes que parezcan contener secretos.
+
+Validar un spec no ejecuta render, no llama proveedores, no descarga assets, no
+crea pending/task y no llama `/api/v1/videos`. El resultado es solo una prueba
+de compatibilidad de schema.
+
+Campos Kurukin que no existen en `VideoParams` quedan fuera del payload MPT y se
+preservan en `kurukin_metadata`. Esto mantiene el contrato del motor nativo y
+evita romper la validacion con metadata de producto.
+
+Gaps A-roll/B-roll conocidos:
+
+- audio desde video A-roll si no existe audio separado;
+- timeline editorial alternando A-roll visible y B-roll visible.
+
+El siguiente paso despues de este checkpoint es un submit controlado al motor
+MPT solo con autorizacion explicita.

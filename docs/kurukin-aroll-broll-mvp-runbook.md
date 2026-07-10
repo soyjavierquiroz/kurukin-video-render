@@ -246,6 +246,33 @@ de alineamiento principal.
 - antes de crear `.env`, confirmar `git check-ignore -v .env`
 - `.env.example` debe contener solo placeholders vacios
 
+## VideoParams validation checkpoint
+
+`app/custom/mpt_engine_bridge.py` ahora valida specs Kurukin contra
+`app.models.schema.VideoParams` antes de cualquier submit real.
+
+- Validar spec no ejecuta render.
+- Validar spec no llama proveedores.
+- Validar spec no descarga assets.
+- Validar spec no crea pending.
+- Validar spec no crea task.
+- Validar spec no llama `/api/v1/videos`.
+- Campos Kurukin sin equivalente nativo quedan en `kurukin_metadata`.
+
+Para A-roll/B-roll local, el bridge compila B-roll local como
+`video_source="local"` y `video_materials` cuando existen materiales locales. El
+`render_mode=aroll_broll`, la intencion A-roll y la policy se preservan en
+metadata Kurukin.
+
+Gaps conocidos:
+
+- audio desde video A-roll si no existe audio separado para
+  `custom_audio_file`;
+- timeline editorial alternando A-roll visible/B-roll visible.
+
+El proximo paso despues de este checkpoint es submit controlado al motor MPT
+solo con autorizacion explicita.
+
 ## Troubleshooting
 
 1. Runner rechaza job:

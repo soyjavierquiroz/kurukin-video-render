@@ -67,6 +67,7 @@ Responsabilidades:
 
 - descubrir capacidades nativas de MPT sin side effects;
 - transformar un job Kurukin en spec MPT;
+- validar `mpt_params` contra `app.models.schema.VideoParams`;
 - preservar metadata Kurukin;
 - validar campos faltantes;
 - resumir el spec para UI/operador.
@@ -91,3 +92,32 @@ autorizado.
 
 No crear adapters propios para Pixabay/Coverr hasta cerrar la integracion con el
 bridge nativo MPT.
+
+## VideoParams validation checkpoint
+
+El bridge ahora tiene una validacion real contra
+`app.models.schema.VideoParams`:
+
+- `normalize_mpt_video_params_spec()` deja en el payload solo campos del modelo
+  MPT.
+- `validate_against_mpt_video_params()` usa `model_validate()` en Pydantic v2 o
+  `parse_obj()` en Pydantic v1.
+- `build_validated_mpt_video_task_from_kurukin_job()` compila un job Kurukin y
+  valida sus params MPT sin ejecutar nada.
+
+Esta validacion no llama proveedores, no descarga, no crea task, no crea
+pending, no llama API y no renderiza. Solo demuestra que la capa Kurukin puede
+producir params compatibles con el modelo nativo.
+
+Metadata de producto como `render_mode=aroll_broll`, intencion A-roll/B-roll,
+policy de assets o diagnosticos queda en `kurukin_metadata`, no dentro de
+`VideoParams`, salvo que exista un campo nativo equivalente.
+
+Gaps A-roll/B-roll aun documentados:
+
+- MPT acepta `custom_audio_file`, pero no extrae audio desde un video A-roll si
+  no hay audio separado.
+- El timeline editorial alternando A-roll visible y B-roll visible no queda
+  expresado solo con `video_materials`.
+
+Siguiente paso: submit controlado al motor MPT solo con autorizacion explicita.
