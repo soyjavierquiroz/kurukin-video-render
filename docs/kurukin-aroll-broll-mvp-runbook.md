@@ -3,8 +3,8 @@
 ## Estado
 
 - Stable branch: custom/mvp
-- Latest stable checkpoint: mvp-local-env-secrets-gitignore-2026-07-09
-- Current feature pending merge: kurukin-use-mpt-engine-audit
+- Latest stable checkpoint: mvp-kurukin-use-mpt-engine-2026-07-09
+- Current feature pending merge: mpt-engine-bridge-video-params-validation
 - MVP técnico: completo
 - E2E runner: completo
 - UI E2E: completo
@@ -13,7 +13,8 @@
 - Pexels source adapter: merged, fallback experimental/no primario
 - Source provider env wiring: merged
 - Local env secrets gitignore: merged
-- MPT engine audit/bridge: pending merge
+- MPT engine audit/bridge: merged
+- VideoParams validation: pending merge
 - Render mode: render_mode=aroll_broll
 - Layout MVP: alternating_fullscreen
 - Architecture update: Kurukin debe usar MoneyPrinterTurbo como motor base y
