@@ -69,6 +69,7 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     ASSET_SOURCE_ASSET_HUB,
     ASSET_SOURCE_LOCAL,
     ASSET_SOURCE_STOCK,
+    MPT_ENGINE_SUBMIT_FLAG,
     PEXELS_SOURCE_FLAG,
     build_aroll_broll_payload_from_console,
     build_operator_summary,
@@ -76,11 +77,13 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
     get_manifest_summary_for_ui,
+    is_mpt_engine_submit_enabled,
     is_pexels_source_enabled,
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
     safe_relative_path,
+    submit_mpt_native_local_job_from_console,
     validate_and_build_payload_from_console_spec,
 )
 from app.custom.asset_source_policy import (  # noqa: E402
@@ -437,6 +440,11 @@ def _initialize_form_state():
     st.session_state.setdefault("aroll_broll_prepare_bundle_uid", "")
     st.session_state.setdefault("aroll_broll_prepare_manifest_path", "")
     st.session_state.setdefault("aroll_broll_prepared_assets", {})
+    st.session_state.setdefault("mpt_native_task_id", _default_job_id())
+    st.session_state.setdefault("mpt_native_video_local_path", "")
+    st.session_state.setdefault("mpt_native_audio_local_path", "")
+    st.session_state.setdefault("mpt_native_subject", "Kurukin local MPT render")
+    st.session_state.setdefault("mpt_native_script", "Kurukin local MPT render.")
 
 
 def _current_manifest_path():
@@ -909,6 +917,66 @@ def render_validate_enqueue_step(manifest_summary):
         st.caption("Valida el video para ver el resumen y el JSON avanzado.")
         with st.expander("Modo avanzado: ver payload JSON", expanded=False):
             st.caption("El payload aparecerá aquí después de validar el video.")
+
+
+def render_mpt_native_local_submit_step():
+    st.markdown("### Motor MPT nativo")
+    st.caption(
+        "Envía un job local-only directo a app.services.task.start; no crea pending "
+        "ni usa runner."
+    )
+    enabled = is_mpt_engine_submit_enabled()
+    if not enabled:
+        st.warning(
+            f"Submit nativo deshabilitado por seguridad. Activa {MPT_ENGINE_SUBMIT_FLAG}=1 "
+            "solo para una prueba controlada."
+        )
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.text_input("Task ID", key="mpt_native_task_id")
+        st.text_input(
+            "Video local path",
+            key="mpt_native_video_local_path",
+            placeholder="storage/local_videos/clip.mp4",
+        )
+        st.text_input(
+            "Audio local path",
+            key="mpt_native_audio_local_path",
+            placeholder="storage/local_audios/audio.mp3",
+        )
+    with right:
+        st.text_input("Subject", key="mpt_native_subject")
+        st.text_area("Script", key="mpt_native_script", height=108)
+
+    expected_output = (
+        f"storage/tasks/{st.session_state.get('mpt_native_task_id', '')}/final-1.mp4"
+    )
+    st.caption(f"Output esperado: {expected_output}")
+
+    if st.button(
+        "Enviar local-only a MPT",
+        key="mpt_native_local_submit",
+        disabled=not enabled,
+    ):
+        result = submit_mpt_native_local_job_from_console(
+            task_id=st.session_state.get("mpt_native_task_id", ""),
+            video_local_path=st.session_state.get("mpt_native_video_local_path", ""),
+            audio_local_path=st.session_state.get("mpt_native_audio_local_path", ""),
+            video_subject=st.session_state.get("mpt_native_subject", ""),
+            video_script=st.session_state.get("mpt_native_script", ""),
+        )
+        st.session_state["mpt_native_last_submit_result"] = result
+        if result.get("ok"):
+            st.success("Job enviado al motor MPT nativo.")
+            st.caption(f"Output esperado: {result.get('expected_output')}")
+        else:
+            st.error("No se pudo enviar el job al motor MPT nativo.")
+            st.json({"errors": result.get("errors", [])})
+
+    if st.session_state.get("mpt_native_last_submit_result"):
+        with st.expander("Resultado MPT nativo", expanded=False):
+            st.json(st.session_state["mpt_native_last_submit_result"])
 
 
 def _current_aroll_broll_config():
@@ -1476,6 +1544,7 @@ def _new_render_view():
     render_audio_subtitles_step()
     render_quality_style_step()
     render_validate_enqueue_step(manifest_summary)
+    render_mpt_native_local_submit_step()
 
 
 def _status_label(status):

@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,6 +45,7 @@ from app.custom.kurukin_render_console import (
     ASSET_SOURCE_LOCAL,
     ASSET_SOURCE_ASSET_HUB,
     ASSET_SOURCE_STOCK,
+    MPT_ENGINE_SUBMIT_FLAG,
     PEXELS_SOURCE_FLAG,
     SOURCE_MODE_ASSET_HUB,
     SOURCE_MODE_LOCAL,
@@ -55,11 +57,13 @@ from app.custom.kurukin_render_console import (
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
     get_manifest_summary_for_ui,
+    is_mpt_engine_submit_enabled,
     is_pexels_source_enabled,
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
     safe_relative_path,
+    submit_mpt_native_local_job_from_console,
     validate_and_build_payload_from_console_spec,
 )
 
@@ -104,6 +108,44 @@ def make_spec(**overrides):
 
 
 class TestKurukinRenderConsole(unittest.TestCase):
+    class _FakeMaterial:
+        def __init__(self, url):
+            self.url = url
+
+    class _FakeVideoParams:
+        validated_payloads = []
+
+        @classmethod
+        def model_validate(cls, payload):
+            cls.validated_payloads.append(payload)
+            params = type("FakeParams", (), {})()
+            params.video_source = payload.get("video_source")
+            params.custom_audio_file = payload.get("custom_audio_file")
+            params.video_materials = [
+                TestKurukinRenderConsole._FakeMaterial(item.get("url"))
+                for item in payload.get("video_materials", [])
+            ]
+            return params
+
+    def _fake_mpt_bridge(self, seen_jobs):
+        def bridge(job):
+            seen_jobs.append(job)
+            return {
+                "ok": True,
+                "spec": {
+                    "video_subject": job["video_subject"],
+                    "video_script": job["video_script"],
+                    "video_source": job["video_source"],
+                    "video_materials": job["video_materials"],
+                    "custom_audio_file": job["custom_audio_file"],
+                    "subtitle_enabled": job["subtitle_enabled"],
+                },
+                "validated_model": "VideoParams",
+                "errors": [],
+            }
+
+        return bridge
+
     def _aroll_broll_local_config(self, root: Path) -> dict:
         aroll = root / "storage" / "local_videos" / "presenter.mp4"
         broll = root / "storage" / "local_videos" / "cutaway.mp4"
@@ -383,6 +425,107 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertFalse(is_pexels_source_enabled({PEXELS_SOURCE_FLAG: "0"}))
         self.assertTrue(is_pexels_source_enabled({PEXELS_SOURCE_FLAG: "1"}))
 
+    def test_mpt_engine_submit_flag_helper_defaults_off(self):
+        self.assertFalse(is_mpt_engine_submit_enabled({}))
+        self.assertFalse(is_mpt_engine_submit_enabled({MPT_ENGINE_SUBMIT_FLAG: "0"}))
+        self.assertTrue(is_mpt_engine_submit_enabled({MPT_ENGINE_SUBMIT_FLAG: "1"}))
+
+    def test_mpt_native_local_submit_flag_off_blocks_task_start(self):
+        calls = []
+
+        result = submit_mpt_native_local_job_from_console(
+            task_id="mpt-console-test-001",
+            video_local_path="storage/local_videos/clip.mp4",
+            audio_local_path="storage/local_audios/audio.mp3",
+            video_subject="Console test",
+            video_script="Console test script.",
+            environ={},
+            task_start=lambda **kwargs: calls.append(kwargs),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(calls, [])
+        self.assertIn(MPT_ENGINE_SUBMIT_FLAG, result["errors"][0])
+        self.assertEqual(
+            result["expected_output"],
+            "storage/tasks/mpt-console-test-001/final-1.mp4",
+        )
+
+    def test_mpt_native_local_submit_flag_on_validates_and_calls_task_start_once(self):
+        calls = []
+        seen_jobs = []
+        self._FakeVideoParams.validated_payloads = []
+
+        def fake_task_start(*, task_id, params):
+            calls.append({"task_id": task_id, "params": params})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pending_dir = Path(tmp) / "storage" / "nightly_jobs" / "pending"
+            result = submit_mpt_native_local_job_from_console(
+                task_id="mpt-console-test-001",
+                video_local_path="storage/local_videos/clip.mp4",
+                audio_local_path="storage/local_audios/audio.mp3",
+                video_subject="Console test",
+                video_script="Console test script.",
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                task_start=fake_task_start,
+                bridge_builder=self._fake_mpt_bridge(seen_jobs),
+                video_params_model=self._FakeVideoParams,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(seen_jobs[0]["video_materials"][0]["url"], "clip.mp4")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["task_id"], "mpt-console-test-001")
+        self.assertEqual(calls[0]["params"].video_source, "local")
+        self.assertEqual(
+            calls[0]["params"].custom_audio_file,
+            "storage/local_audios/audio.mp3",
+        )
+        self.assertEqual(calls[0]["params"].video_materials[0].url, "clip.mp4")
+        self.assertEqual(len(self._FakeVideoParams.validated_payloads), 1)
+        self.assertEqual(result["validated_model"], "VideoParams")
+        self.assertFalse(pending_dir.exists())
+
+    def test_mpt_native_local_submit_does_not_call_queue_api_or_runner_helpers(self):
+        calls = []
+        seen_jobs = []
+        with mock.patch(
+            "app.custom.kurukin_render_console.enqueue_moneyprinter_payload",
+            side_effect=AssertionError("pending queue must not be used"),
+        ):
+            result = submit_mpt_native_local_job_from_console(
+                task_id="mpt-console-test-002",
+                video_local_path="local_videos/clip.mp4",
+                audio_local_path="local_audios/audio.mp3",
+                video_subject="Console test",
+                video_script="Console test script.",
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                task_start=lambda **kwargs: calls.append(kwargs),
+                bridge_builder=self._fake_mpt_bridge(seen_jobs),
+                video_params_model=self._FakeVideoParams,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(calls), 1)
+
+    def test_mpt_native_local_submit_errors_are_redacted(self):
+        result = submit_mpt_native_local_job_from_console(
+            task_id="mpt-console-test-003",
+            video_local_path="clip.mp4",
+            audio_local_path="audio.mp3",
+            video_subject="Console test",
+            video_script="Console test script.",
+            environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+            bridge_builder=lambda _job: (_ for _ in ()).throw(
+                RuntimeError("api_key=super-secret")
+            ),
+            task_start=lambda **_kwargs: None,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["errors"], ["<redacted>"])
+
     def test_prepare_broll_assets_exclusive_brand_without_manifest_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = prepare_broll_assets_from_console(
@@ -571,6 +714,10 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "form_enqueue_disabled",
             "Tipo de video",
             "Video normal con assets",
+            "Motor MPT nativo",
+            "Enviar local-only a MPT",
+            "mpt_native_local_submit",
+            "MPT_ENGINE_SUBMIT_FLAG",
         )
 
         for expected in required_copy:
@@ -1657,6 +1804,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
         original_flag = os.environ.pop("KURUKIN_ENABLE_UI_RUNNER", None)
         original_queue_flag = os.environ.pop("KURUKIN_ENABLE_AROLL_BROLL_QUEUE", None)
+        original_mpt_flag = os.environ.pop("KURUKIN_ENABLE_MPT_ENGINE_SUBMIT", None)
         original_cwd = Path.cwd()
         page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
         try:
@@ -1670,6 +1818,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 os.environ["KURUKIN_ENABLE_UI_RUNNER"] = original_flag
             if original_queue_flag is not None:
                 os.environ["KURUKIN_ENABLE_AROLL_BROLL_QUEUE"] = original_queue_flag
+            if original_mpt_flag is not None:
+                os.environ["KURUKIN_ENABLE_MPT_ENGINE_SUBMIT"] = original_mpt_flag
 
         self.assertEqual(len(at.exception), 0)
         rendered_text = "\n".join(
@@ -1690,6 +1840,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn("Resultados generados", rendered_text)
         self.assertIn("Todavía no hay videos generados", rendered_text)
         self.assertIn("Ejecución controlada", rendered_text)
+        self.assertIn("Motor MPT nativo", rendered_text)
+        self.assertIn("Submit nativo deshabilitado por seguridad.", rendered_text)
         self.assertIn("Procesar 1 trabajo ahora", rendered_text)
         self.assertIn(
             "salta la ventana nocturna solo para una ejecución manual controlada",
@@ -1700,6 +1852,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn(CONTAINER_API_BASE_URL, rendered_text)
         self.assertIn("--api-base-url", rendered_text)
         self.assertNotIn("<div", rendered_text)
+        self.assertTrue(at.button(key="mpt_native_local_submit").disabled)
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
 
     def test_app_test_aroll_broll_skeleton_does_not_enqueue_when_streamlit_available(self):
