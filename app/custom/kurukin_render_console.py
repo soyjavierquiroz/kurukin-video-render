@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -41,6 +42,7 @@ from app.custom.kurukin_job_queue import (
 
 
 DEFAULT_VOICE_NAME = "es-MX-DaliaNeural-Female"
+MPT_ENGINE_SUBMIT_FLAG = "KURUKIN_ENABLE_MPT_ENGINE_SUBMIT"
 PEXELS_SOURCE_FLAG = "KURUKIN_ENABLE_PEXELS_SOURCE"
 SOURCE_MODE_ASSET_HUB = "asset_hub_bundle"
 SOURCE_MODE_LOCAL = "local_assets"
@@ -155,6 +157,200 @@ def _validate_aroll_broll_local_asset_path(value: str) -> str:
 
 def _has_parent_path(path: PurePosixPath) -> bool:
     return ".." in path.parts
+
+
+def is_mpt_engine_submit_enabled(environ: dict[str, str] | None = None) -> bool:
+    """Return whether native MPT submit is explicitly enabled."""
+
+    source = environ if environ is not None else os.environ
+    return source.get(MPT_ENGINE_SUBMIT_FLAG) == "1"
+
+
+def _redact_mpt_submit_message(value: Any) -> str:
+    message = str(value or "")
+    sensitive_words = (
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "credential",
+        "password",
+        "secret",
+        "token",
+    )
+    for word in sensitive_words:
+        message = re.sub(
+            rf"(?i)({re.escape(word)})(\s*[=:]\s*)([^\s,;]+)",
+            r"\1\2<redacted>",
+            message,
+        )
+    if any(word in message.lower() for word in sensitive_words):
+        return "<redacted>"
+    return message
+
+
+def _safe_mpt_submit_error(exc: Exception) -> str:
+    return _redact_mpt_submit_message(_safe_error_message(exc))
+
+
+def _safe_mpt_local_material_path(value: str) -> str:
+    text = _clean_text(value)
+    if not text:
+        raise ValueError("video local path is required")
+    path = PurePosixPath(text)
+    if path.is_absolute() or "\\" in text or _has_parent_path(path):
+        raise ValueError("video local path must stay under storage/local_videos")
+    parts = path.parts
+    if len(parts) >= 3 and parts[:2] == ("storage", "local_videos"):
+        path = PurePosixPath(*parts[2:])
+    elif parts and parts[0] == "local_videos":
+        path = PurePosixPath(*parts[1:])
+    if not path.parts:
+        raise ValueError("video local path is required")
+    extension = path.suffix.lower().lstrip(".")
+    if extension not in ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        raise ValueError(f"video local path must use one of: {allowed}")
+    return path.as_posix()
+
+
+def _safe_mpt_audio_path(value: str) -> str:
+    text = _clean_text(value)
+    if not text:
+        raise ValueError("audio local path is required")
+    path = PurePosixPath(text)
+    if path.is_absolute() or "\\" in text or _has_parent_path(path):
+        raise ValueError("audio local path must stay under storage/local_audios")
+    parts = path.parts
+    if len(parts) >= 3 and parts[:2] == ("storage", "local_audios"):
+        normalized = path
+    elif parts and parts[0] == "local_audios":
+        normalized = PurePosixPath("storage", *parts)
+    else:
+        normalized = PurePosixPath("storage", "local_audios", *parts)
+    extension = normalized.suffix.lower().lstrip(".")
+    if extension not in ALLOWED_AUDIO_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_AUDIO_EXTENSIONS))
+        raise ValueError(f"audio local path must use one of: {allowed}")
+    return normalized.as_posix()
+
+
+def submit_mpt_native_local_job_from_console(
+    *,
+    task_id: str,
+    video_local_path: str,
+    audio_local_path: str,
+    video_subject: str,
+    video_script: str,
+    environ: dict[str, str] | None = None,
+    task_start=None,
+    bridge_builder=None,
+    video_params_model=None,
+) -> dict[str, Any]:
+    """Submit a local-only job directly to native MPT when explicitly enabled."""
+
+    clean_task_id = _clean_text(task_id)
+    expected_output = (
+        f"storage/tasks/{clean_task_id}/final-1.mp4" if clean_task_id else ""
+    )
+    if not is_mpt_engine_submit_enabled(environ):
+        return {
+            "ok": False,
+            "task_id": clean_task_id,
+            "expected_output": expected_output,
+            "errors": [f"{MPT_ENGINE_SUBMIT_FLAG}=1 is required"],
+        }
+
+    try:
+        if not clean_task_id:
+            raise ValueError("task_id is required")
+        if sanitize_job_id(clean_task_id) != clean_task_id:
+            raise ValueError("task_id must contain only letters, numbers, - or _")
+        material_path = _safe_mpt_local_material_path(video_local_path)
+        audio_path = _safe_mpt_audio_path(audio_local_path)
+        subject = _clean_text(video_subject) or "Kurukin local MPT render"
+        script = _clean_text(video_script) or subject
+
+        job = {
+            "task_id": clean_task_id,
+            "render_mode": "mpt_native_local_console",
+            "video_subject": subject,
+            "video_script": script,
+            "video_terms": "",
+            "video_source": "local",
+            "video_materials": [
+                {
+                    "provider": "local",
+                    "url": material_path,
+                    "duration": 0,
+                }
+            ],
+            "custom_audio_file": audio_path,
+            "subtitle_enabled": False,
+            "subtitle_provider": "none",
+            "asset_policy": {
+                "mode": "local_only",
+                "allowed_sources": ["local"],
+            },
+            "kurukin_metadata": {
+                "source": "render_console_mpt_native_local_submit",
+                "external_providers_allowed": False,
+            },
+        }
+
+        if bridge_builder is None:
+            from app.custom.mpt_engine_bridge import (
+                build_validated_mpt_video_task_from_kurukin_job,
+            )
+
+            bridge_builder = build_validated_mpt_video_task_from_kurukin_job
+        validated = bridge_builder(job)
+        if not validated.get("ok"):
+            errors = [
+                _redact_mpt_submit_message(
+                    item.get("message") if isinstance(item, dict) else item
+                )
+                for item in validated.get("errors") or []
+            ]
+            return {
+                "ok": False,
+                "task_id": clean_task_id,
+                "expected_output": expected_output,
+                "errors": errors or ["VideoParams validation failed"],
+            }
+
+        params_payload = validated["spec"]
+        if video_params_model is None:
+            from app.models.schema import VideoParams
+
+            video_params_model = VideoParams
+        if hasattr(video_params_model, "model_validate"):
+            params = video_params_model.model_validate(params_payload)
+        elif hasattr(video_params_model, "parse_obj"):
+            params = video_params_model.parse_obj(params_payload)
+        else:
+            params = video_params_model(**params_payload)
+
+        if task_start is None:
+            from app.services import task as task_service
+
+            task_start = task_service.start
+        task_start(task_id=clean_task_id, params=params)
+
+        return {
+            "ok": True,
+            "task_id": clean_task_id,
+            "expected_output": expected_output,
+            "errors": [],
+            "validated_model": validated.get("validated_model", "VideoParams"),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "task_id": clean_task_id,
+            "expected_output": expected_output,
+            "errors": [_safe_mpt_submit_error(exc)],
+        }
 
 
 def normalize_aroll_broll_local_asset_paths(value: str | list[Any]) -> list[str]:
