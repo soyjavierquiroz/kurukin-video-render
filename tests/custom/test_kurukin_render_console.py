@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import inspect
 import os
 import sys
 import tempfile
@@ -475,6 +476,13 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertEqual(seen_jobs[0]["video_materials"][0]["url"], "clip.mp4")
+        self.assertEqual(seen_jobs[0]["video_materials"][0]["provider"], "local")
+        self.assertEqual(seen_jobs[0]["video_source"], "local")
+        self.assertEqual(seen_jobs[0]["asset_policy"]["mode"], "local_only")
+        self.assertFalse(
+            seen_jobs[0]["kurukin_metadata"]["external_providers_allowed"]
+        )
+        self.assertNotIn("/api/v1/videos", json.dumps(seen_jobs[0]))
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["task_id"], "mpt-console-test-001")
         self.assertEqual(calls[0]["params"].video_source, "local")
@@ -490,6 +498,14 @@ class TestKurukinRenderConsole(unittest.TestCase):
     def test_mpt_native_local_submit_does_not_call_queue_api_or_runner_helpers(self):
         calls = []
         seen_jobs = []
+        source = inspect.getsource(submit_mpt_native_local_job_from_console)
+        self.assertNotIn("run_controlled_runner", source)
+        self.assertNotIn("nightly_runner", source)
+        self.assertNotIn("/api/v1/videos", source)
+        self.assertNotIn("pexels", source.lower())
+        self.assertNotIn("pixabay", source.lower())
+        self.assertNotIn("coverr", source.lower())
+
         with mock.patch(
             "app.custom.kurukin_render_console.enqueue_moneyprinter_payload",
             side_effect=AssertionError("pending queue must not be used"),
@@ -715,9 +731,16 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Tipo de video",
             "Video normal con assets",
             "Motor MPT nativo",
+            "mpt-native-ui-job",
+            "Kurukin MPT native render",
+            "storage/tasks/<task_id>/final-1.mp4",
+            "Output pendiente/no encontrado todavía",
+            "Output existe:",
+            "_mpt_native_expected_output_video",
             "Enviar local-only a MPT",
             "mpt_native_local_submit",
             "MPT_ENGINE_SUBMIT_FLAG",
+            "Submit real MPT desactivado. Activa",
         )
 
         for expected in required_copy:
@@ -1841,7 +1864,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn("Todavía no hay videos generados", rendered_text)
         self.assertIn("Ejecución controlada", rendered_text)
         self.assertIn("Motor MPT nativo", rendered_text)
-        self.assertIn("Submit nativo deshabilitado por seguridad.", rendered_text)
+        self.assertIn("Submit real MPT desactivado.", rendered_text)
+        self.assertIn("Output pendiente/no encontrado todavía", rendered_text)
         self.assertIn("Procesar 1 trabajo ahora", rendered_text)
         self.assertIn(
             "salta la ventana nocturna solo para una ejecución manual controlada",
@@ -1852,8 +1876,96 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertIn(CONTAINER_API_BASE_URL, rendered_text)
         self.assertIn("--api-base-url", rendered_text)
         self.assertNotIn("<div", rendered_text)
-        self.assertTrue(at.button(key="mpt_native_local_submit").disabled)
+        self.assertFalse(at.button(key="mpt_native_local_submit").disabled)
         self.assertTrue(at.button(key="controlled_runner_execute").disabled)
+
+    def test_app_test_mpt_flag_off_button_does_not_call_submit_when_streamlit_available(self):
+        try:
+            from streamlit.testing.v1 import AppTest
+        except ModuleNotFoundError:
+            self.skipTest("streamlit is not installed in this Python environment")
+
+        original_mpt_flag = os.environ.pop("KURUKIN_ENABLE_MPT_ENGINE_SUBMIT", None)
+        original_cwd = Path.cwd()
+        page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.chdir(tmp)
+                with mock.patch(
+                    "app.custom.kurukin_render_console.submit_mpt_native_local_job_from_console",
+                    side_effect=AssertionError("submit real must stay blocked"),
+                ) as fake_submit:
+                    at = AppTest.from_file(str(page_path))
+                    at.run(timeout=30)
+                    at.button(key="mpt_native_local_submit").click()
+                    at.run(timeout=30)
+        finally:
+            os.chdir(original_cwd)
+            if original_mpt_flag is not None:
+                os.environ["KURUKIN_ENABLE_MPT_ENGINE_SUBMIT"] = original_mpt_flag
+
+        self.assertEqual(len(at.exception), 0)
+        self.assertEqual(fake_submit.call_count, 0)
+        rendered_text = "\n".join(
+            str(getattr(item, "value", getattr(item, "label", item)))
+            for collection in (
+                at.warning,
+                at.caption,
+                at.json,
+                at.text_input,
+                at.text_area,
+                at.button,
+            )
+            for item in collection
+        )
+        self.assertIn("Submit real MPT desactivado.", rendered_text)
+        self.assertIn("mpt-native-ui-job", rendered_text)
+        self.assertIn("storage/tasks/mpt-native-ui-job/final-1.mp4", rendered_text)
+
+    def test_app_test_mpt_expected_output_preview_when_file_exists_if_streamlit_available(self):
+        try:
+            from streamlit.testing.v1 import AppTest
+        except ModuleNotFoundError:
+            self.skipTest("streamlit is not installed in this Python environment")
+
+        original_mpt_flag = os.environ.pop("KURUKIN_ENABLE_MPT_ENGINE_SUBMIT", None)
+        original_cwd = Path.cwd()
+        page_path = original_cwd / "webui/pages/Kurukin_Render_Console.py"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                task_dir = tmp_path / "storage" / "tasks" / "mpt-native-ui-job"
+                task_dir.mkdir(parents=True)
+                (task_dir / "final-1.mp4").write_bytes(
+                    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+                )
+                os.chdir(tmp)
+                at = AppTest.from_file(str(page_path))
+                at.run(timeout=30)
+        finally:
+            os.chdir(original_cwd)
+            if original_mpt_flag is not None:
+                os.environ["KURUKIN_ENABLE_MPT_ENGINE_SUBMIT"] = original_mpt_flag
+
+        self.assertEqual(len(at.exception), 0)
+        rendered_text = "\n".join(
+            str(getattr(item, "value", getattr(item, "label", item)))
+            for collection in (
+                at.markdown,
+                at.info,
+                at.success,
+                at.warning,
+                at.caption,
+                at.button,
+            )
+            for item in collection
+        )
+        self.assertIn(
+            "Output existe: storage/tasks/mpt-native-ui-job/final-1.mp4",
+            rendered_text,
+        )
+        self.assertIn("Preview", rendered_text)
+        self.assertIn("Descargar MP4", rendered_text)
 
     def test_app_test_aroll_broll_skeleton_does_not_enqueue_when_streamlit_available(self):
         try:
