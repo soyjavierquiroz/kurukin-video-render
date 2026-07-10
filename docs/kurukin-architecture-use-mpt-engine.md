@@ -121,3 +121,21 @@ Gaps A-roll/B-roll aun documentados:
   expresado solo con `video_materials`.
 
 Siguiente paso: submit controlado al motor MPT solo con autorizacion explicita.
+
+## Submit dry-run plan
+
+`app/custom/mpt_engine_submitter.py` prepara un plan de submit hacia el motor
+MPT usando specs ya validados contra `VideoParams`.
+
+Esta capa mantiene el target futuro como metadata:
+
+- `submit_target.api_path="/api/v1/videos"`
+- `submit_target.service_path="app.services.task.start"`
+
+En este checkpoint no ejecuta el target. Por defecto opera en `dry_run`, no usa
+executor y no llama API, proveedores, descargas, pending, task real, runner ni
+render.
+
+Un submit no-dry-run queda bloqueado salvo que exista autorizacion explicita,
+`KURUKIN_ENABLE_MPT_ENGINE_SUBMIT=1` y un executor inyectado. Esta rama no
+implementa el executor real.
