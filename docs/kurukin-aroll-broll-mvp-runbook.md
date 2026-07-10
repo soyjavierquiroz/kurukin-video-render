@@ -3,8 +3,8 @@
 ## Estado
 
 - Stable branch: custom/mvp
-- Latest stable checkpoint: mvp-kurukin-use-mpt-engine-2026-07-09
-- Current feature pending merge: mpt-engine-bridge-video-params-validation
+- Latest stable checkpoint: mvp-mpt-engine-video-params-validation-2026-07-09
+- Current feature pending merge: mpt-engine-submit-dry-run-plan
 - MVP técnico: completo
 - E2E runner: completo
 - UI E2E: completo
@@ -14,7 +14,8 @@
 - Source provider env wiring: merged
 - Local env secrets gitignore: merged
 - MPT engine audit/bridge: merged
-- VideoParams validation: pending merge
+- VideoParams validation: merged
+- MPT engine submit dry-run plan: pending merge
 - Render mode: render_mode=aroll_broll
 - Layout MVP: alternating_fullscreen
 - Architecture update: Kurukin debe usar MoneyPrinterTurbo como motor base y
@@ -273,6 +274,25 @@ Gaps conocidos:
 
 El proximo paso despues de este checkpoint es submit controlado al motor MPT
 solo con autorizacion explicita.
+
+## MPT engine submit dry-run plan
+
+`app/custom/mpt_engine_submitter.py` planifica submit hacia el motor MPT usando
+specs ya validados por el bridge.
+
+- Planifica submit.
+- No ejecuta `/api/v1/videos`.
+- No llama `task.start`.
+- No crea task.
+- No crea pending.
+- No llama proveedores.
+- No descarga assets.
+- No renderiza.
+- El submit real queda para autorizacion explicita.
+
+Por defecto `submit_mpt_engine_plan(..., dry_run=True)` devuelve un resultado de
+planificacion y no usa executor. Cualquier submit no-dry-run requiere
+`KURUKIN_ENABLE_MPT_ENGINE_SUBMIT=1` y un executor inyectado.
 
 ## Troubleshooting
 
