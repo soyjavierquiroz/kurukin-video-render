@@ -65,6 +65,14 @@ from app.custom.kurukin_job_queue import (  # noqa: E402
     sanitize_job_id,
     validate_runner_execution_request,
 )
+from app.custom.kurukin_job_intent import (  # noqa: E402
+    MODE_AUDIO_TO_VIDEO,
+    MODE_SPEAKER_VIDEO_TO_ENHANCED_VIDEO,
+    MODE_TOPIC_TO_VIDEO,
+    STATUS_READY_TO_SUBMIT,
+    compile_job_intent_to_mpt_spec,
+    validate_job_intent,
+)
 from app.custom.kurukin_render_console import (  # noqa: E402
     ASSET_SOURCE_ASSET_HUB,
     ASSET_SOURCE_LOCAL,
@@ -176,6 +184,12 @@ SUBTITLE_STYLE_PRESETS = [
     "boxed_bottom",
     "large_hook_center",
 ]
+JOB_INTENT_MODE_LABELS = {
+    "Tema a video": MODE_TOPIC_TO_VIDEO,
+    "Audio a video": MODE_AUDIO_TO_VIDEO,
+    "Presentador a video mejorado": MODE_SPEAKER_VIDEO_TO_ENHANCED_VIDEO,
+}
+JOB_INTENT_FORMATS = ["vertical", "horizontal", "square"]
 
 
 def _default_job_id() -> str:
@@ -448,6 +462,16 @@ def _initialize_form_state():
         "mpt_native_script",
         "Render local-only con video y audio ya disponibles.",
     )
+    st.session_state.setdefault("job_intent_mode", MODE_TOPIC_TO_VIDEO)
+    st.session_state.setdefault("job_intent_task_id", "")
+    st.session_state.setdefault("job_intent_topic", "")
+    st.session_state.setdefault("job_intent_script", "")
+    st.session_state.setdefault("job_intent_audio_path", "")
+    st.session_state.setdefault("job_intent_video_path", "")
+    st.session_state.setdefault("job_intent_language", "es")
+    st.session_state.setdefault("job_intent_duration_seconds", 45)
+    st.session_state.setdefault("job_intent_format", "vertical")
+    st.session_state.setdefault("job_intent_preset", "educational")
 
 
 def _current_manifest_path():
@@ -1013,6 +1037,144 @@ def render_mpt_native_local_submit_step():
             st.json(st.session_state["mpt_native_last_submit_result"])
 
 
+def _build_job_intent_from_state():
+    return {
+        "mode": st.session_state.get("job_intent_mode", MODE_TOPIC_TO_VIDEO),
+        "task_id": st.session_state.get("job_intent_task_id", ""),
+        "topic": st.session_state.get("job_intent_topic", ""),
+        "script": st.session_state.get("job_intent_script", ""),
+        "audio_path": st.session_state.get("job_intent_audio_path", ""),
+        "video_path": st.session_state.get("job_intent_video_path", ""),
+        "language": st.session_state.get("job_intent_language", "es"),
+        "duration_seconds": int(
+            st.session_state.get("job_intent_duration_seconds", 45)
+        ),
+        "format": st.session_state.get("job_intent_format", "vertical"),
+        "preset": st.session_state.get("job_intent_preset", "educational"),
+    }
+
+
+def _job_intent_result_block(result):
+    status = result.get("status") or "-"
+    if status == STATUS_READY_TO_SUBMIT:
+        st.success("Intención lista para preparar/enviar con insumos locales.")
+    elif result.get("errors"):
+        st.error("La intención requiere ajustes.")
+    else:
+        st.warning(f"Estado de intención: {status}")
+    if result.get("reasons"):
+        st.caption("Pendiente: " + ", ".join(result.get("reasons") or []))
+    if result.get("errors"):
+        st.json({"errors": result.get("errors")})
+
+
+def render_job_intent_step():
+    st.markdown("### Crear por intención")
+    st.caption(
+        "Convierte una intención simple a una spec MPT local-only; no llama OpenAI, "
+        "TTS, stock externo, Asset Hub API ni runner."
+    )
+
+    left, right = st.columns([1, 1])
+    with left:
+        mode_label = st.selectbox(
+            "mode",
+            list(JOB_INTENT_MODE_LABELS),
+            index=_index_for_value(
+                JOB_INTENT_MODE_LABELS,
+                st.session_state.get("job_intent_mode", MODE_TOPIC_TO_VIDEO),
+                MODE_TOPIC_TO_VIDEO,
+            ),
+            key="job_intent_mode_label",
+        )
+        st.session_state["job_intent_mode"] = JOB_INTENT_MODE_LABELS[mode_label]
+        st.text_input("task_id opcional", key="job_intent_task_id")
+        st.text_input("topic", key="job_intent_topic")
+        st.text_area("script opcional", key="job_intent_script", height=96)
+        st.text_input(
+            "audio_path",
+            key="job_intent_audio_path",
+            placeholder="storage/local_audios/audio.mp3",
+        )
+    with right:
+        st.text_input(
+            "video_path",
+            key="job_intent_video_path",
+            placeholder="storage/local_videos/visual.mp4",
+        )
+        st.text_input("language", key="job_intent_language")
+        st.number_input(
+            "duration_seconds",
+            min_value=4,
+            max_value=300,
+            step=1,
+            key="job_intent_duration_seconds",
+        )
+        st.selectbox("format", JOB_INTENT_FORMATS, key="job_intent_format")
+        st.text_input("preset", key="job_intent_preset")
+
+    action_cols = st.columns([1, 1, 1])
+    with action_cols[0]:
+        if st.button("Validar intención", key="job_intent_validate"):
+            st.session_state["job_intent_last_validation"] = validate_job_intent(
+                _build_job_intent_from_state()
+            )
+    with action_cols[1]:
+        if st.button("Preparar spec MPT", key="job_intent_prepare_mpt_spec"):
+            st.session_state["job_intent_last_compile"] = compile_job_intent_to_mpt_spec(
+                _build_job_intent_from_state()
+            )
+    compiled = st.session_state.get("job_intent_last_compile") or {}
+    ready_to_submit = compiled.get("status") == STATUS_READY_TO_SUBMIT
+    submit_enabled = is_mpt_engine_submit_enabled()
+    with action_cols[2]:
+        if st.button(
+            "Enviar a MPT nativo",
+            key="job_intent_submit_mpt_native",
+            disabled=not (ready_to_submit and submit_enabled),
+            help=(
+                "Requiere READY_TO_SUBMIT y "
+                f"{MPT_ENGINE_SUBMIT_FLAG}=1."
+            ),
+        ):
+            intent = compiled.get("intent") or _build_job_intent_from_state()
+            result = submit_mpt_native_local_job_from_console(
+                task_id=intent.get("task_id") or _default_job_id(),
+                video_local_path=intent.get("video_path", ""),
+                audio_local_path=intent.get("audio_path", ""),
+                video_subject=intent.get("topic") or intent.get("script", ""),
+                video_script=intent.get("script", ""),
+            )
+            st.session_state["job_intent_last_submit_result"] = result
+            if result.get("ok"):
+                st.success("Intención enviada al motor MPT nativo.")
+            else:
+                st.error("No se pudo enviar la intención al motor MPT nativo.")
+
+    validation = st.session_state.get("job_intent_last_validation")
+    if validation:
+        with st.expander("Resultado de intención", expanded=False):
+            _job_intent_result_block(validation)
+            st.json(validation.get("intent") or {})
+
+    if compiled:
+        _job_intent_result_block(compiled)
+        with st.expander("Spec MPT preparada por intención", expanded=False):
+            st.json(compiled.get("mpt_spec") or {})
+        if ready_to_submit and not submit_enabled:
+            st.warning(
+                "READY_TO_SUBMIT detectado, pero el envío real requiere "
+                f"{MPT_ENGINE_SUBMIT_FLAG}=1."
+            )
+    elif not submit_enabled:
+        st.caption(f"Enviar a MPT nativo bloqueado por {MPT_ENGINE_SUBMIT_FLAG}.")
+
+    submit_result = st.session_state.get("job_intent_last_submit_result")
+    if submit_result:
+        with st.expander("Resultado submit por intención", expanded=False):
+            st.json(submit_result)
+
+
 def _current_aroll_broll_config():
     config = build_default_aroll_broll_config()
     prepared = st.session_state.get("aroll_broll_prepared_assets") or {}
@@ -1570,6 +1732,7 @@ def _new_render_view():
         _aroll_broll_view()
         return
 
+    render_job_intent_step()
     _first_video_guide()
     _progress_steps()
     _recommended_test_mode_block()
