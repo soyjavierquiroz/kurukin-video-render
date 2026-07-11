@@ -440,11 +440,14 @@ def _initialize_form_state():
     st.session_state.setdefault("aroll_broll_prepare_bundle_uid", "")
     st.session_state.setdefault("aroll_broll_prepare_manifest_path", "")
     st.session_state.setdefault("aroll_broll_prepared_assets", {})
-    st.session_state.setdefault("mpt_native_task_id", _default_job_id())
+    st.session_state.setdefault("mpt_native_task_id", "mpt-native-ui-job")
     st.session_state.setdefault("mpt_native_video_local_path", "")
     st.session_state.setdefault("mpt_native_audio_local_path", "")
-    st.session_state.setdefault("mpt_native_subject", "Kurukin local MPT render")
-    st.session_state.setdefault("mpt_native_script", "Kurukin local MPT render.")
+    st.session_state.setdefault("mpt_native_subject", "Kurukin MPT native render")
+    st.session_state.setdefault(
+        "mpt_native_script",
+        "Render local-only con video y audio ya disponibles.",
+    )
 
 
 def _current_manifest_path():
@@ -919,60 +922,91 @@ def render_validate_enqueue_step(manifest_summary):
             st.caption("El payload aparecerá aquí después de validar el video.")
 
 
+def _mpt_native_expected_output_video(task_id):
+    clean_task_id = str(task_id or "").strip()
+    if not clean_task_id:
+        return None
+    expected_relative_path = f"{clean_task_id}/final-1.mp4"
+    for video in list_rendered_videos():
+        if video.get("relative_path") == expected_relative_path:
+            return video
+    return None
+
+
 def render_mpt_native_local_submit_step():
     st.markdown("### Motor MPT nativo")
     st.caption(
-        "Envía un job local-only directo a app.services.task.start; no crea pending "
-        "ni usa runner."
+        "Envía un job local-only directo al motor MPT nativo; no crea pending "
+        "ni usa runner ni proveedores externos."
     )
     enabled = is_mpt_engine_submit_enabled()
+    disabled_warning = (
+        "Submit real MPT desactivado. Activa "
+        f"{MPT_ENGINE_SUBMIT_FLAG}=1 para ejecutar."
+    )
     if not enabled:
-        st.warning(
-            f"Submit nativo deshabilitado por seguridad. Activa {MPT_ENGINE_SUBMIT_FLAG}=1 "
-            "solo para una prueba controlada."
-        )
+        st.warning(disabled_warning)
 
     left, right = st.columns([1, 1])
     with left:
-        st.text_input("Task ID", key="mpt_native_task_id")
+        st.text_input("task_id", key="mpt_native_task_id")
         st.text_input(
-            "Video local path",
+            "video local path",
             key="mpt_native_video_local_path",
-            placeholder="storage/local_videos/clip.mp4",
+            placeholder="storage/local_videos/...",
         )
         st.text_input(
-            "Audio local path",
+            "audio local path",
             key="mpt_native_audio_local_path",
-            placeholder="storage/local_audios/audio.mp3",
+            placeholder="storage/local_audios/...",
         )
     with right:
-        st.text_input("Subject", key="mpt_native_subject")
-        st.text_area("Script", key="mpt_native_script", height=108)
+        st.text_input("subject", key="mpt_native_subject")
+        st.text_area("script", key="mpt_native_script", height=108)
 
+    task_id = st.session_state.get("mpt_native_task_id", "")
     expected_output = (
-        f"storage/tasks/{st.session_state.get('mpt_native_task_id', '')}/final-1.mp4"
+        f"storage/tasks/{task_id}/final-1.mp4" if task_id else "storage/tasks/<task_id>/final-1.mp4"
     )
     st.caption(f"Output esperado: {expected_output}")
 
     if st.button(
         "Enviar local-only a MPT",
         key="mpt_native_local_submit",
-        disabled=not enabled,
     ):
-        result = submit_mpt_native_local_job_from_console(
-            task_id=st.session_state.get("mpt_native_task_id", ""),
-            video_local_path=st.session_state.get("mpt_native_video_local_path", ""),
-            audio_local_path=st.session_state.get("mpt_native_audio_local_path", ""),
-            video_subject=st.session_state.get("mpt_native_subject", ""),
-            video_script=st.session_state.get("mpt_native_script", ""),
-        )
-        st.session_state["mpt_native_last_submit_result"] = result
-        if result.get("ok"):
-            st.success("Job enviado al motor MPT nativo.")
-            st.caption(f"Output esperado: {result.get('expected_output')}")
+        if not enabled:
+            st.session_state["mpt_native_last_submit_result"] = {
+                "ok": False,
+                "task_id": task_id,
+                "expected_output": expected_output,
+                "errors": [disabled_warning],
+            }
+            st.warning(disabled_warning)
         else:
-            st.error("No se pudo enviar el job al motor MPT nativo.")
-            st.json({"errors": result.get("errors", [])})
+            result = submit_mpt_native_local_job_from_console(
+                task_id=task_id,
+                video_local_path=st.session_state.get("mpt_native_video_local_path", ""),
+                audio_local_path=st.session_state.get("mpt_native_audio_local_path", ""),
+                video_subject=st.session_state.get("mpt_native_subject", ""),
+                video_script=st.session_state.get("mpt_native_script", ""),
+            )
+            st.session_state["mpt_native_last_submit_result"] = result
+            if result.get("ok"):
+                st.success("Job enviado al motor MPT nativo.")
+                st.caption(f"task_id: {result.get('task_id')}")
+                st.caption(f"Output esperado: {result.get('expected_output')}")
+            else:
+                st.error("No se pudo enviar el job al motor MPT nativo.")
+                st.caption(f"task_id: {result.get('task_id') or task_id or '-'}")
+                st.caption(f"Output esperado: {result.get('expected_output') or expected_output}")
+                st.json({"errors": result.get("errors", [])})
+
+    output_video = _mpt_native_expected_output_video(task_id)
+    if output_video:
+        st.success(f"Output existe: {expected_output}")
+        _result_preview_download(output_video, key_prefix="mpt_native_expected_output")
+    else:
+        st.info("Output pendiente/no encontrado todavía")
 
     if st.session_state.get("mpt_native_last_submit_result"):
         with st.expander("Resultado MPT nativo", expanded=False):
