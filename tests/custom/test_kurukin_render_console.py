@@ -741,6 +741,14 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "mpt_native_local_submit",
             "MPT_ENGINE_SUBMIT_FLAG",
             "Submit real MPT desactivado. Activa",
+            "Crear por intención",
+            "Validar intención",
+            "Preparar spec MPT",
+            "Enviar a MPT nativo",
+            "job_intent_submit_mpt_native",
+            "STATUS_READY_TO_SUBMIT",
+            "compile_job_intent_to_mpt_spec",
+            "validate_job_intent",
         )
 
         for expected in required_copy:
