@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import json
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -352,6 +354,235 @@ def submit_mpt_native_local_job_from_console(
             "expected_output": expected_output,
             "errors": [_safe_mpt_submit_error(exc)],
         }
+
+
+INTENT_QUEUE_PROCESSABLE_STATUSES = {"QUEUED", "PENDING"}
+INTENT_QUEUE_DONE_STATUS = "DONE"
+INTENT_QUEUE_FAILED_STATUS = "FAILED"
+INTENT_QUEUE_PROCESSING_STATUS = "PROCESSING"
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temp_path.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _looks_like_url(value: Any) -> bool:
+    return bool(re.search(r"(?i)\b(?:https?|ftp|s3)://", str(value or "")))
+
+
+def _find_url_value(value: Any, *, path: str = "") -> str:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _find_url_value(item, path=f"{path}.{key}" if path else str(key))
+            if found:
+                return found
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found = _find_url_value(item, path=f"{path}[{index}]")
+            if found:
+                return found
+    elif isinstance(value, str) and _looks_like_url(value):
+        return path or "value"
+    return ""
+
+
+def _first_material_path(mpt_params: dict[str, Any]) -> str:
+    materials = mpt_params.get("video_materials")
+    if not isinstance(materials, list) or not materials:
+        return ""
+    first = materials[0]
+    if isinstance(first, dict):
+        return _clean_text(first.get("url") or first.get("path"))
+    return _clean_text(first)
+
+
+def _validate_intent_queue_payload_for_manual_process(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if payload.get("source") != "job_intent_v1":
+        errors.append("queue item source must be job_intent_v1")
+
+    status = _clean_text(payload.get("status")).upper()
+    if status not in INTENT_QUEUE_PROCESSABLE_STATUSES:
+        errors.append("queue item status must be QUEUED or PENDING")
+
+    mpt_spec = payload.get("compiled_mpt_spec")
+    if not isinstance(mpt_spec, dict) or not mpt_spec:
+        errors.append("compiled_mpt_spec is required")
+        mpt_spec = {}
+    mpt_params = mpt_spec.get("mpt_params")
+    if not isinstance(mpt_params, dict) or not mpt_params:
+        errors.append("compiled_mpt_spec.mpt_params is required")
+        mpt_params = {}
+
+    guardrails = payload.get("guardrails")
+    if not isinstance(guardrails, dict):
+        errors.append("guardrails are required")
+        guardrails = {}
+    for key in (
+        "external_providers_allowed",
+        "ai_generation_allowed",
+        "asset_hub_api_allowed",
+    ):
+        if guardrails.get(key) is not False:
+            errors.append(f"guardrails.{key} must be false")
+
+    if _clean_text(mpt_params.get("video_source")) != "local":
+        errors.append("compiled_mpt_spec.mpt_params.video_source must be local")
+    if _clean_text(mpt_params.get("asset_hub_renderer_manifest_path")):
+        errors.append("asset_hub_renderer_manifest_path is not allowed")
+
+    materials = mpt_params.get("video_materials")
+    if not isinstance(materials, list) or not materials:
+        errors.append("compiled_mpt_spec.mpt_params.video_materials is required")
+    else:
+        for index, material in enumerate(materials):
+            if not isinstance(material, dict):
+                errors.append(f"video_materials[{index}] must be an object")
+                continue
+            if _clean_text(material.get("provider")) != "local":
+                errors.append(f"video_materials[{index}].provider must be local")
+            if not _clean_text(material.get("url") or material.get("path")):
+                errors.append(f"video_materials[{index}].url is required")
+
+    audio_path = _clean_text(mpt_params.get("custom_audio_file"))
+    if not audio_path:
+        errors.append("compiled_mpt_spec.mpt_params.custom_audio_file is required")
+
+    url_field = _find_url_value(
+        {
+            "original_intent": payload.get("original_intent"),
+            "normalized_intent": payload.get("normalized_intent"),
+            "resolved_visual_path": payload.get("resolved_visual_path"),
+            "compiled_mpt_spec": mpt_spec,
+        }
+    )
+    if url_field:
+        errors.append(f"URLs are not allowed in queue item: {url_field}")
+
+    return errors
+
+
+def _queue_process_result(
+    *,
+    ok: bool,
+    queue_item_path: Path,
+    payload: dict[str, Any] | None = None,
+    status: str = "",
+    output_path: str = "",
+    errors: list[str] | None = None,
+) -> dict[str, Any]:
+    source = payload or {}
+    return {
+        "ok": ok,
+        "pending_path": queue_item_path.as_posix(),
+        "task_id": _clean_text(source.get("task_id")),
+        "status": status or _clean_text(source.get("status")),
+        "source": _clean_text(source.get("source")),
+        "mode": _clean_text(source.get("mode")),
+        "resolved_visual_path": _clean_text(source.get("resolved_visual_path")),
+        "visual_autofill_source": _clean_text(source.get("visual_autofill_source")),
+        "output_path": output_path or _clean_text(source.get("output_path")),
+        "errors": errors or [],
+    }
+
+
+def process_queued_intent_with_mpt_native(
+    queue_item_path: str | Path,
+    *,
+    environ: dict[str, str] | None = None,
+    submitter=None,
+) -> dict[str, Any]:
+    """Manually process one job_intent_v1 pending item through native MPT."""
+
+    path = Path(queue_item_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        return _queue_process_result(
+            ok=False,
+            queue_item_path=path,
+            errors=[_safe_mpt_submit_error(exc)],
+        )
+    if not isinstance(payload, dict):
+        return _queue_process_result(
+            ok=False,
+            queue_item_path=path,
+            errors=["queue item must be a JSON object"],
+        )
+
+    validation_errors = _validate_intent_queue_payload_for_manual_process(payload)
+    if validation_errors:
+        return _queue_process_result(
+            ok=False,
+            queue_item_path=path,
+            payload=payload,
+            errors=validation_errors,
+        )
+    if not is_mpt_engine_submit_enabled(environ):
+        return _queue_process_result(
+            ok=False,
+            queue_item_path=path,
+            payload=payload,
+            errors=[f"{MPT_ENGINE_SUBMIT_FLAG}=1 is required"],
+        )
+
+    mpt_params = payload["compiled_mpt_spec"]["mpt_params"]
+    task_id = _clean_text(payload.get("task_id"))
+    output_path = f"storage/tasks/{task_id}/final-1.mp4" if task_id else ""
+    processing_payload = dict(payload)
+    processing_payload.update(
+        {
+            "status": INTENT_QUEUE_PROCESSING_STATUS,
+            "processing_started_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    _write_json_atomic(path, processing_payload)
+
+    if submitter is None:
+        submitter = submit_mpt_native_local_job_from_console
+
+    result = submitter(
+        task_id=task_id,
+        video_local_path=_first_material_path(mpt_params),
+        audio_local_path=_clean_text(mpt_params.get("custom_audio_file")),
+        video_subject=_clean_text(mpt_params.get("video_subject")),
+        video_script=_clean_text(mpt_params.get("video_script")),
+        environ=environ,
+    )
+    final_payload = dict(processing_payload)
+    final_payload["processed_at"] = datetime.now(timezone.utc).isoformat()
+    final_payload["manual_process_result"] = result
+    if result.get("ok"):
+        output_path = _clean_text(result.get("output_path") or result.get("expected_output")) or output_path
+        final_payload["status"] = INTENT_QUEUE_DONE_STATUS
+        final_payload["output_path"] = output_path
+        final_payload["guardrails"] = dict(final_payload.get("guardrails") or {})
+        final_payload["guardrails"]["real_render_started"] = True
+        errors: list[str] = []
+    else:
+        final_payload["status"] = INTENT_QUEUE_FAILED_STATUS
+        final_payload["error"] = "; ".join(str(item) for item in result.get("errors") or ["MPT native submit failed"])
+        errors = [final_payload["error"]]
+    _write_json_atomic(path, final_payload)
+
+    return _queue_process_result(
+        ok=bool(result.get("ok")),
+        queue_item_path=path,
+        payload=final_payload,
+        status=final_payload["status"],
+        output_path=output_path,
+        errors=errors,
+    )
 
 
 def normalize_aroll_broll_local_asset_paths(value: str | list[Any]) -> list[str]:
