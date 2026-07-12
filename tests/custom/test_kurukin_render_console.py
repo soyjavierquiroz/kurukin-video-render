@@ -64,6 +64,7 @@ from app.custom.kurukin_render_console import (
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
+    process_queued_intent_with_mpt_native,
     safe_relative_path,
     submit_mpt_native_local_job_from_console,
     validate_and_build_payload_from_console_spec,
@@ -147,6 +148,68 @@ class TestKurukinRenderConsole(unittest.TestCase):
             }
 
         return bridge
+
+    def _intent_queue_payload(self, **overrides):
+        payload = {
+            "task_id": "manual-intent-001",
+            "job_id": "manual-intent-001",
+            "mode": "audio_to_video",
+            "status": "QUEUED",
+            "source": "job_intent_v1",
+            "original_intent": {
+                "mode": "audio_to_video",
+                "task_id": "manual-intent-001",
+                "audio_path": "storage/local_audios/audio.mp3",
+                "topic": "Manual intent",
+            },
+            "normalized_intent": {
+                "mode": "audio_to_video",
+                "task_id": "manual-intent-001",
+                "audio_path": "storage/local_audios/audio.mp3",
+                "video_path": "storage/local_videos/visual.mp4",
+                "visual_path": "storage/local_videos/visual.mp4",
+                "resolved_visual_path": "storage/local_videos/visual.mp4",
+                "topic": "Manual intent",
+            },
+            "resolved_visual_path": "storage/local_videos/visual.mp4",
+            "visual_autofill_source": "local_picker_v1",
+            "compiled_mpt_spec": {
+                "kind": "mpt_video_task_spec",
+                "execution": "spec_only",
+                "safe_to_build_without_side_effects": True,
+                "mpt_params": {
+                    "video_subject": "Manual intent",
+                    "video_script": "Manual intent script.",
+                    "video_source": "local",
+                    "video_materials": [
+                        {
+                            "provider": "local",
+                            "url": "storage/local_videos/visual.mp4",
+                            "duration": 0,
+                        }
+                    ],
+                    "custom_audio_file": "storage/local_audios/audio.mp3",
+                    "subtitle_enabled": False,
+                },
+            },
+            "guardrails": {
+                "external_providers_allowed": False,
+                "ai_generation_allowed": False,
+                "asset_hub_api_allowed": False,
+                "real_render_started": False,
+            },
+        }
+        payload.update(overrides)
+        return payload
+
+    def _write_intent_queue_item(self, root: Path, payload: dict | None = None) -> Path:
+        pending = root / "pending" / "20260712-120000-manual-intent.json"
+        pending.parent.mkdir(parents=True)
+        pending.write_text(
+            json.dumps(payload or self._intent_queue_payload()),
+            encoding="utf-8",
+        )
+        return pending
 
     def _aroll_broll_local_config(self, root: Path) -> dict:
         aroll = root / "storage" / "local_videos" / "presenter.mp4"
@@ -655,6 +718,170 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(payload["original_intent"]["task_id"], "console-intent-queue")
         self.assertFalse((root / "storage" / "tasks").exists())
 
+    def test_process_queued_intent_requires_compiled_mpt_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_intent_queue_item(
+                Path(tmp),
+                self._intent_queue_payload(compiled_mpt_spec={}),
+            )
+            submitter = mock.Mock(return_value={"ok": True})
+
+            result = process_queued_intent_with_mpt_native(
+                path,
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("compiled_mpt_spec is required", result["errors"])
+        submitter.assert_not_called()
+
+    def test_process_queued_intent_rejects_wrong_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_intent_queue_item(
+                Path(tmp),
+                self._intent_queue_payload(source="legacy_queue"),
+            )
+            submitter = mock.Mock(return_value={"ok": True})
+
+            result = process_queued_intent_with_mpt_native(
+                path,
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("queue item source must be job_intent_v1", result["errors"])
+        submitter.assert_not_called()
+
+    def test_process_queued_intent_rejects_external_guardrails(self):
+        guardrail_cases = (
+            "external_providers_allowed",
+            "ai_generation_allowed",
+            "asset_hub_api_allowed",
+        )
+        for key in guardrail_cases:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp:
+                payload = self._intent_queue_payload()
+                payload["guardrails"][key] = True
+                path = self._write_intent_queue_item(Path(tmp), payload)
+                submitter = mock.Mock(return_value={"ok": True})
+
+                result = process_queued_intent_with_mpt_native(
+                    path,
+                    environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                    submitter=submitter,
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertIn(f"guardrails.{key} must be false", result["errors"])
+                submitter.assert_not_called()
+
+    def test_process_queued_intent_rejects_urls_in_audio_visual_or_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._intent_queue_payload()
+            payload["normalized_intent"]["audio_path"] = "https://example.test/audio.mp3"
+            path = self._write_intent_queue_item(Path(tmp), payload)
+            submitter = mock.Mock(return_value={"ok": True})
+
+            result = process_queued_intent_with_mpt_native(
+                path,
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("URLs are not allowed" in error for error in result["errors"])
+        )
+        submitter.assert_not_called()
+
+    def test_process_queued_intent_flag_off_does_not_render(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_intent_queue_item(Path(tmp))
+            submitter = mock.Mock(return_value={"ok": True})
+
+            result = process_queued_intent_with_mpt_native(
+                path,
+                environ={},
+                submitter=submitter,
+            )
+            payload_after = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertFalse(result["ok"])
+        self.assertIn(MPT_ENGINE_SUBMIT_FLAG, result["errors"][0])
+        self.assertEqual(payload_after["status"], "QUEUED")
+        submitter.assert_not_called()
+
+    def test_process_queued_intent_submitter_ok_marks_done_and_output_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_intent_queue_item(Path(tmp))
+            submitter = mock.Mock(
+                return_value={
+                    "ok": True,
+                    "expected_output": "storage/tasks/manual-intent-001/final-1.mp4",
+                    "errors": [],
+                }
+            )
+
+            result = process_queued_intent_with_mpt_native(
+                path,
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+            payload_after = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "DONE")
+        self.assertEqual(
+            result["output_path"],
+            "storage/tasks/manual-intent-001/final-1.mp4",
+        )
+        self.assertEqual(payload_after["status"], "DONE")
+        self.assertEqual(
+            payload_after["output_path"],
+            "storage/tasks/manual-intent-001/final-1.mp4",
+        )
+        self.assertTrue(payload_after["guardrails"]["real_render_started"])
+        submitter.assert_called_once()
+        self.assertEqual(
+            submitter.call_args.kwargs["video_local_path"],
+            "storage/local_videos/visual.mp4",
+        )
+        self.assertEqual(
+            submitter.call_args.kwargs["audio_local_path"],
+            "storage/local_audios/audio.mp3",
+        )
+
+    def test_process_queued_intent_submitter_error_marks_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_intent_queue_item(Path(tmp))
+            submitter = mock.Mock(return_value={"ok": False, "errors": ["boom"]})
+
+            result = process_queued_intent_with_mpt_native(
+                path,
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+            payload_after = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["errors"], ["boom"])
+        self.assertEqual(payload_after["status"], "FAILED")
+        self.assertEqual(payload_after["error"], "boom")
+
+    def test_process_queued_intent_helper_does_not_call_runner_or_api(self):
+        source = inspect.getsource(process_queued_intent_with_mpt_native)
+        self.assertNotIn("run_controlled_runner", source)
+        self.assertNotIn("nightly_runner", source)
+        self.assertNotIn("/api/v1/videos", source)
+        self.assertNotIn("openai", source.lower())
+        self.assertNotIn("text_to_speech", source.lower())
+        self.assertNotIn("pexels", source.lower())
+        self.assertNotIn("pixabay", source.lower())
+        self.assertNotIn("coverr", source.lower())
+
     def test_enqueue_aroll_broll_from_console_accepts_multiline_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -778,6 +1005,8 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Source visual:",
             "Enviar a MPT nativo",
             "job_intent_submit_mpt_native",
+            "Procesar con MPT nativo",
+            "process_queued_intent_with_mpt_native",
             "STATUS_READY_TO_SUBMIT",
             "compile_job_intent_to_mpt_spec",
             "validate_job_intent",

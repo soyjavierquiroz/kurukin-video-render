@@ -91,6 +91,7 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
+    process_queued_intent_with_mpt_native,
     safe_relative_path,
     submit_mpt_native_local_job_from_console,
     validate_and_build_payload_from_console_spec,
@@ -1928,6 +1929,60 @@ def _last_enqueued_pending_job(pending_jobs):
     return None
 
 
+def _intent_queue_jobs(pending_jobs):
+    jobs = []
+    for job in pending_jobs:
+        raw = job.get("raw") or {}
+        if raw.get("source") != "job_intent_v1":
+            continue
+        if str(raw.get("status") or "").upper() not in {"QUEUED", "PENDING"}:
+            continue
+        jobs.append(job)
+    return jobs
+
+
+def _manual_intent_queue_process_block(pending_jobs):
+    intent_jobs = _intent_queue_jobs(pending_jobs)
+    submit_enabled = is_mpt_engine_submit_enabled()
+    st.markdown("### Intenciones en cola")
+    if not intent_jobs:
+        st.caption("No hay intenciones job_intent_v1 en estado QUEUED.")
+        return
+    if not submit_enabled:
+        st.warning(
+            "Procesar con MPT nativo bloqueado por "
+            f"{MPT_ENGINE_SUBMIT_FLAG}=1."
+        )
+    for index, job in enumerate(intent_jobs):
+        raw = job.get("raw") or {}
+        with st.expander(f"{raw.get('task_id') or job.get('job_id')} - job_intent_v1", expanded=False):
+            st.caption(f"task_id: {raw.get('task_id')}")
+            st.caption(f"status: {raw.get('status')}")
+            st.caption(f"source: {raw.get('source')}")
+            st.caption(f"mode: {raw.get('mode')}")
+            st.caption(f"resolved_visual_path: {raw.get('resolved_visual_path')}")
+            if raw.get("output_path"):
+                st.caption(f"output_path: {raw.get('output_path')}")
+            if raw.get("error"):
+                st.warning(str(raw.get("error")))
+            key = f"process_intent_queue_{index}_{sanitize_job_id(str(raw.get('task_id') or job.get('job_id') or 'intent'))}"
+            if st.button(
+                "Procesar con MPT nativo",
+                key=key,
+                disabled=not submit_enabled,
+                help=f"Requiere {MPT_ENGINE_SUBMIT_FLAG}=1.",
+            ):
+                result = process_queued_intent_with_mpt_native(job.get("path", ""))
+                st.session_state["intent_queue_last_process_result"] = result
+                if result.get("ok"):
+                    st.success("Intención procesada con MPT nativo.")
+                else:
+                    st.error("No se pudo procesar la intención en cola.")
+            result = st.session_state.get("intent_queue_last_process_result") or {}
+            if result.get("pending_path") == job.get("path"):
+                st.json(result)
+
+
 def _queue_storage_view():
     st.title("Cola y resultados")
     st.write("Revisa trabajos pendientes, resultados generados y errores sin entrar por terminal.")
@@ -1957,6 +2012,7 @@ def _queue_storage_view():
     last_pending_job = _last_enqueued_pending_job(pending_jobs)
     if last_pending_job:
         st.success(f"Último video enviado a cola: {last_pending_job.get('job_id')}")
+    _manual_intent_queue_process_block(pending_jobs)
     if pending_jobs:
         for job in pending_jobs:
             _pending_job_block(job)
