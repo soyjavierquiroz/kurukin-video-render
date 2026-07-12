@@ -18,6 +18,11 @@ from app.custom.kurukin_job_intent import (
     normalize_job_intent,
     validate_job_intent,
 )
+from app.custom.kurukin_local_visual_picker import (
+    discover_local_visual_candidates,
+    is_safe_local_visual_path,
+    pick_local_visual_for_intent,
+)
 
 
 class TestKurukinJobIntent(unittest.TestCase):
@@ -77,6 +82,7 @@ class TestKurukinJobIntent(unittest.TestCase):
                 "audio_path": "https://example.com/audio.mp3",
                 "video_path": "http://example.com/video.mp4",
                 "visual_path": "https://example.com/visual.png",
+                "resolved_visual_path": "https://example.com/resolved.png",
             }
         )
 
@@ -84,6 +90,7 @@ class TestKurukinJobIntent(unittest.TestCase):
         self.assertIn("audio_path", fields)
         self.assertIn("video_path", fields)
         self.assertIn("visual_path", fields)
+        self.assertIn("resolved_visual_path", fields)
 
     def test_duration_out_of_range_fails(self):
         low = validate_job_intent(
@@ -138,6 +145,70 @@ class TestKurukinJobIntent(unittest.TestCase):
         self.assertEqual(params["custom_audio_file"], "storage/local_audios/audio.mp3")
         self.assertEqual(params["video_materials"][0]["url"], "storage/local_videos/visual.mp4")
 
+    def test_local_visual_picker_detects_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "storage" / "local_videos" / "topic-short.mp4"
+            image = root / "storage" / "local_images" / "topic.png"
+            video.parent.mkdir(parents=True)
+            image.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            image.write_bytes(b"image")
+
+            candidates = discover_local_visual_candidates(project_root=root)
+
+        self.assertEqual(
+            [candidate["path"] for candidate in candidates],
+            [
+                "storage/local_images/topic.png",
+                "storage/local_videos/topic-short.mp4",
+            ],
+        )
+        self.assertEqual({candidate["source"] for candidate in candidates}, {"local_picker_v1"})
+
+    def test_local_visual_picker_ignores_urls_hidden_and_outside_paths(self):
+        self.assertFalse(is_safe_local_visual_path("https://example.com/video.mp4"))
+        self.assertFalse(is_safe_local_visual_path("http://example.com/video.mp4"))
+        self.assertFalse(is_safe_local_visual_path("../storage/local_videos/video.mp4"))
+        self.assertFalse(is_safe_local_visual_path("tmp/video.mp4"))
+        self.assertFalse(is_safe_local_visual_path("storage/local_videos/.hidden.mp4"))
+        self.assertTrue(is_safe_local_visual_path("storage/local_videos/video.mp4"))
+
+    def test_local_visual_picker_prefers_video_over_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / "storage" / "local_images" / "casa-vertical.png"
+            video = root / "storage" / "local_videos" / "generic.mp4"
+            image.parent.mkdir(parents=True)
+            video.parent.mkdir(parents=True)
+            image.write_bytes(b"image")
+            video.write_bytes(b"video")
+
+            picked = pick_local_visual_for_intent(
+                {"topic": "casa"},
+                project_root=root,
+            )
+
+        self.assertEqual(picked["path"], "storage/local_videos/generic.mp4")
+        self.assertEqual(picked["type"], "video")
+
+    def test_local_visual_picker_prefers_topic_name_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            generic = root / "storage" / "local_videos" / "generic.mp4"
+            topic = root / "storage" / "local_videos" / "casa-usada-9x16.mp4"
+            generic.parent.mkdir(parents=True)
+            generic.write_bytes(b"video")
+            topic.write_bytes(b"video")
+
+            picked = pick_local_visual_for_intent(
+                {"topic": "casa usada", "preset": "educational"},
+                project_root=root,
+            )
+
+        self.assertEqual(picked["path"], "storage/local_videos/casa-usada-9x16.mp4")
+        self.assertEqual(picked["source"], "local_picker_v1")
+
     def test_visual_path_alias_can_supply_audio_to_video_visual(self):
         result = compile_job_intent_to_mpt_spec(
             {
@@ -173,8 +244,16 @@ class TestKurukinJobIntent(unittest.TestCase):
         self.assertEqual(result["reasons"], [])
         self.assertEqual(result["intent"]["video_path"], "storage/local_videos/auto_visual.mp4")
         self.assertEqual(
+            result["intent"]["resolved_visual_path"],
+            "storage/local_videos/auto_visual.mp4",
+        )
+        self.assertEqual(
+            result["intent"]["visual_autofill_source"],
+            "local_picker_v1",
+        )
+        self.assertEqual(
             result["intent"]["visual_autofill"]["source"],
-            "audio_to_video_local_autofill",
+            "local_picker_v1",
         )
         self.assertEqual(params["video_source"], "local")
         self.assertEqual(
@@ -196,6 +275,7 @@ class TestKurukinJobIntent(unittest.TestCase):
         self.assertEqual(result["status"], STATUS_NEEDS_INPUT)
         self.assertIn("needs_local_visual_asset", result["reasons"])
         self.assertEqual(result["intent"]["video_path"], "")
+        self.assertEqual(result["intent"]["resolved_visual_path"], "")
         self.assertEqual(result["mpt_spec"]["mpt_params"]["video_materials"], [])
 
     def test_speaker_video_mode_is_not_ready_without_audio_extract(self):
@@ -224,7 +304,14 @@ class TestKurukinJobIntent(unittest.TestCase):
         create_connection.assert_not_called()
 
     def test_helper_source_does_not_reference_external_provider_calls(self):
-        source = Path("app/custom/kurukin_job_intent.py").read_text(encoding="utf-8")
+        source = "\n".join(
+            [
+                Path("app/custom/kurukin_job_intent.py").read_text(encoding="utf-8"),
+                Path("app/custom/kurukin_local_visual_picker.py").read_text(
+                    encoding="utf-8"
+                ),
+            ]
+        )
 
         forbidden = (
             "openai",
