@@ -747,6 +747,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "video_path (opcional para audio_to_video)",
             "Si no pasas video_path, Kurukin intentará usar un visual local automático.",
             "Visual local resuelto:",
+            "Source visual:",
             "Enviar a MPT nativo",
             "job_intent_submit_mpt_native",
             "STATUS_READY_TO_SUBMIT",

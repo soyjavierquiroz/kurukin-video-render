@@ -1162,9 +1162,16 @@ def render_job_intent_step():
 
     if compiled:
         _job_intent_result_block(compiled)
-        resolved_visual = (compiled.get("intent") or {}).get("video_path", "")
+        compiled_intent = compiled.get("intent") or {}
+        resolved_visual = (
+            compiled_intent.get("resolved_visual_path")
+            or compiled_intent.get("video_path", "")
+        )
         if resolved_visual:
             st.caption(f"Visual local resuelto: {resolved_visual}")
+        visual_source = compiled_intent.get("visual_autofill_source", "")
+        if visual_source:
+            st.caption(f"Source visual: {visual_source}")
         with st.expander("Spec MPT preparada por intención", expanded=False):
             st.json(compiled.get("mpt_spec") or {})
         if ready_to_submit and not submit_enabled:
