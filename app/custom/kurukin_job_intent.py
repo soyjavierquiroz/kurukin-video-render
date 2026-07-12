@@ -10,6 +10,7 @@ from app.custom.kurukin_local_visual_picker import (
     LOCAL_PICKER_SOURCE,
     pick_local_visual_for_intent,
 )
+from app.custom.kurukin_topic_planner import build_topic_script_plan
 from app.custom.mpt_engine_bridge import build_mpt_video_task_from_kurukin_job
 
 
@@ -147,7 +148,7 @@ def _autofill_audio_to_video_visual(
     project_root: str | Path | None = None,
 ) -> dict[str, Any]:
     normalized = deepcopy(intent)
-    if normalized.get("mode") != MODE_AUDIO_TO_VIDEO:
+    if normalized.get("mode") not in {MODE_TOPIC_TO_VIDEO, MODE_AUDIO_TO_VIDEO}:
         return normalized
     if not normalized.get("audio_path") or _local_visual_paths(normalized):
         return normalized
@@ -169,6 +170,20 @@ def _autofill_audio_to_video_visual(
         "path": visual_path,
         "picker": picked,
     }
+    return normalized
+
+
+def _enrich_topic_to_video_plan(intent: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(intent)
+    if normalized.get("mode") != MODE_TOPIC_TO_VIDEO:
+        return normalized
+
+    plan = build_topic_script_plan(normalized)
+    normalized["topic_plan"] = plan
+    if plan.get("ok"):
+        normalized["script"] = normalized.get("script") or plan.get("script", "")
+        normalized["scenes"] = deepcopy(plan.get("scenes") or [])
+        normalized["visual_keywords"] = list(plan.get("visual_keywords") or [])
     return normalized
 
 
@@ -204,6 +219,7 @@ def normalize_job_intent(intent: dict[str, Any]) -> dict[str, Any]:
         "visual_path"
     ] or normalized["resolved_visual_path"]
     normalized["task_id"] = _safe_task_id(source.get("task_id"))
+    normalized = _enrich_topic_to_video_plan(normalized)
     return normalized
 
 
@@ -262,10 +278,16 @@ def validate_job_intent(intent: dict[str, Any]) -> dict[str, Any]:
         if value and not _path_looks_local(value):
             errors.append(_error(field, f"{field} must be a local path, not a URL"))
 
+    status = STATUS_NEEDS_INPUT
+    reasons: list[str] = []
+    if not errors:
+        status, reasons = _readiness_for_intent(normalized)
+
     return {
         "ok": not errors,
-        "status": STATUS_NEEDS_INPUT if errors else STATUS_READY_TO_SUBMIT,
+        "status": status,
         "intent": normalized,
+        "reasons": reasons,
         "errors": errors,
     }
 
@@ -278,7 +300,7 @@ def _readiness_for_intent(intent: dict[str, Any]) -> tuple[str, list[str]]:
     if mode == MODE_TOPIC_TO_VIDEO:
         if not intent.get("audio_path"):
             reasons.append("needs_audio_or_tts")
-        if not visual_paths:
+        elif not visual_paths:
             reasons.append("needs_local_visual_asset")
         return (STATUS_NEEDS_INPUT if reasons else STATUS_READY_TO_SUBMIT), reasons
 
@@ -309,6 +331,11 @@ def _mpt_materials(paths: list[str]) -> list[dict[str, Any]]:
 def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
     subject = _clean_text(intent.get("topic") or intent.get("script")) or "Kurukin video"
     script = _clean_text(intent.get("script"))
+    visual_keywords = [
+        _clean_text(item)
+        for item in _as_list(intent.get("visual_keywords"))
+        if _clean_text(item)
+    ]
     mode = intent["mode"]
     visual_paths = _local_visual_paths(intent)
     job: dict[str, Any] = {
@@ -316,7 +343,7 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
         "task_id": intent.get("task_id") or "",
         "video_subject": subject,
         "video_script": script,
-        "video_terms": [intent["topic"]] if intent.get("topic") else [],
+        "video_terms": visual_keywords or ([intent["topic"]] if intent.get("topic") else []),
         "video_aspect": FORMAT_TO_MPT_ASPECT.get(intent["format"], "9:16"),
         "video_resolution": "1080p",
         "video_clip_duration": min(10, max(1, int(intent["duration_seconds"]))),
@@ -341,6 +368,9 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
                 "resolved_visual_path": intent.get("resolved_visual_path", ""),
                 "visual_autofill_source": intent.get("visual_autofill_source", ""),
                 "visual_autofill": deepcopy(intent.get("visual_autofill", {})),
+                "topic_plan": deepcopy(intent.get("topic_plan", {})),
+                "scenes": deepcopy(intent.get("scenes", [])),
+                "visual_keywords": list(visual_keywords),
                 "external_providers_allowed": False,
                 "ai_generation_allowed": False,
                 "asset_hub_api_allowed": False,

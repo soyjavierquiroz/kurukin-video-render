@@ -49,11 +49,19 @@ class TestKurukinJobIntent(unittest.TestCase):
 
         self.assertEqual(result["status"], STATUS_NEEDS_INPUT)
         self.assertIn("needs_audio_or_tts", result["reasons"])
-        self.assertIn("needs_local_visual_asset", result["reasons"])
+        self.assertNotIn("needs_local_visual_asset", result["reasons"])
         self.assertEqual(
             result["mpt_spec"]["mpt_params"]["video_subject"],
             "5 errores al comprar una casa usada",
         )
+        self.assertIn("5 errores al comprar una casa usada", result["intent"]["script"])
+        self.assertGreaterEqual(len(result["intent"]["scenes"]), 3)
+        self.assertIn(
+            "5 errores al comprar una casa usada",
+            result["intent"]["visual_keywords"],
+        )
+        self.assertEqual(result["intent"]["topic_plan"]["status"], "NEEDS_AUDIO")
+        self.assertEqual(result["intent"]["topic_plan"]["reason"], "needs_audio_or_tts")
 
     def test_topic_to_video_without_topic_or_script_fails(self):
         result = validate_job_intent({"mode": MODE_TOPIC_TO_VIDEO})
@@ -261,6 +269,41 @@ class TestKurukinJobIntent(unittest.TestCase):
             "storage/local_videos/auto_visual.mp4",
         )
 
+    def test_topic_to_video_with_audio_autofills_local_visual_and_is_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            visual_dir = Path(tmp) / "storage" / "local_videos"
+            visual_dir.mkdir(parents=True)
+            (visual_dir / "casa-usada-vertical.mp4").write_bytes(b"visual")
+
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_TOPIC_TO_VIDEO,
+                    "topic": "casa usada",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "duration_seconds": 45,
+                    "preset": "educational",
+                },
+                project_root=tmp,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], STATUS_READY_TO_SUBMIT)
+        self.assertEqual(result["reasons"], [])
+        self.assertIn("casa usada", result["intent"]["script"])
+        self.assertEqual(
+            result["intent"]["resolved_visual_path"],
+            "storage/local_videos/casa-usada-vertical.mp4",
+        )
+        self.assertEqual(result["intent"]["visual_autofill_source"], "local_picker_v1")
+        self.assertEqual(
+            result["mpt_spec"]["mpt_params"]["custom_audio_file"],
+            "storage/local_audios/audio.mp3",
+        )
+        self.assertEqual(
+            result["mpt_spec"]["mpt_params"]["video_materials"][0]["url"],
+            "storage/local_videos/casa-usada-vertical.mp4",
+        )
+
     def test_audio_to_video_audio_only_needs_input_without_local_visual(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = compile_job_intent_to_mpt_spec(
@@ -308,6 +351,9 @@ class TestKurukinJobIntent(unittest.TestCase):
             [
                 Path("app/custom/kurukin_job_intent.py").read_text(encoding="utf-8"),
                 Path("app/custom/kurukin_local_visual_picker.py").read_text(
+                    encoding="utf-8"
+                ),
+                Path("app/custom/kurukin_topic_planner.py").read_text(
                     encoding="utf-8"
                 ),
             ]

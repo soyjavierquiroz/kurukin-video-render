@@ -1200,6 +1200,10 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Resultado cola por intención",
             "video_path (opcional para audio_to_video)",
             "Si no pasas video_path, Kurukin intentará usar un visual local automático.",
+            "Topic-to-video v1 genera plan y script local. Para renderizar falta audio/TTS.",
+            "script generado",
+            "Escenas generadas",
+            "visual_keywords:",
             "Visual local resuelto:",
             "Source visual:",
             "Enviar a MPT nativo",
@@ -1226,6 +1230,15 @@ class TestKurukinRenderConsole(unittest.TestCase):
 
         for expected in required_copy:
             self.assertIn(expected, page)
+
+    def test_webui_page_includes_topic_plan_helpers(self):
+        page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("_topic_plan_block", page)
+        self.assertIn("topic_plan", page)
+        self.assertIn("_topic_plan_script", page)
 
     def test_webui_page_includes_aroll_broll_foundation_copy(self):
         page = Path("webui/pages/Kurukin_Render_Console.py").read_text(
