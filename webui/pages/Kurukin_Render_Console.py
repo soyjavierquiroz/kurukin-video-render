@@ -92,6 +92,7 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
+    process_queued_intent_batch_with_mpt_native,
     process_queued_intent_with_mpt_native,
     safe_relative_path,
     submit_mpt_native_local_job_from_console,
@@ -484,6 +485,7 @@ def _initialize_form_state():
     st.session_state.setdefault("batch_audio_format", "vertical")
     st.session_state.setdefault("batch_audio_preset", "educational")
     st.session_state.setdefault("batch_audio_max_items", 10)
+    st.session_state.setdefault("intent_queue_process_max_items", 2)
 
 
 def _current_manifest_path():
@@ -2066,6 +2068,52 @@ def _manual_intent_queue_process_block(pending_jobs):
             "Procesar con MPT nativo bloqueado por "
             f"{MPT_ENGINE_SUBMIT_FLAG}=1."
         )
+    batch_cols = st.columns([1, 2])
+    with batch_cols[0]:
+        st.number_input(
+            "max_items proceso lote",
+            min_value=1,
+            max_value=5,
+            step=1,
+            key="intent_queue_process_max_items",
+        )
+    with batch_cols[1]:
+        if st.button(
+            "Procesar lote con MPT nativo",
+            key="process_intent_queue_batch",
+            disabled=not submit_enabled,
+            help=f"Requiere {MPT_ENGINE_SUBMIT_FLAG}=1.",
+        ):
+            result = process_queued_intent_batch_with_mpt_native(
+                [job.get("path", "") for job in intent_jobs],
+                max_items=int(st.session_state.get("intent_queue_process_max_items", 2)),
+            )
+            st.session_state["intent_queue_last_batch_process_result"] = result
+            if result.get("ok"):
+                st.success("Lote procesado con MPT nativo.")
+            else:
+                st.warning("El proceso de lote terminó con errores.")
+    batch_result = st.session_state.get("intent_queue_last_batch_process_result") or {}
+    if batch_result:
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("processed", batch_result.get("processed", 0))
+        metric_cols[1].metric("done", batch_result.get("done", 0))
+        metric_cols[2].metric("failed", batch_result.get("failed", 0))
+        if batch_result.get("items"):
+            st.dataframe(
+                [
+                    {
+                        "task_id": item.get("task_id", ""),
+                        "status": item.get("status", ""),
+                        "output_path": item.get("output_path", ""),
+                        "queue_item_path": item.get("queue_item_path", ""),
+                        "error": item.get("error", ""),
+                    }
+                    for item in batch_result.get("items", [])
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
     for index, job in enumerate(intent_jobs):
         raw = job.get("raw") or {}
         with st.expander(f"{raw.get('task_id') or job.get('job_id')} - job_intent_v1", expanded=False):

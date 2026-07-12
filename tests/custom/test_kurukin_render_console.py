@@ -64,6 +64,7 @@ from app.custom.kurukin_render_console import (
     list_local_storage_files,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
+    process_queued_intent_batch_with_mpt_native,
     process_queued_intent_with_mpt_native,
     safe_relative_path,
     submit_mpt_native_local_job_from_console,
@@ -202,9 +203,15 @@ class TestKurukinRenderConsole(unittest.TestCase):
         payload.update(overrides)
         return payload
 
-    def _write_intent_queue_item(self, root: Path, payload: dict | None = None) -> Path:
-        pending = root / "pending" / "20260712-120000-manual-intent.json"
-        pending.parent.mkdir(parents=True)
+    def _write_intent_queue_item(
+        self,
+        root: Path,
+        payload: dict | None = None,
+        *,
+        filename: str = "20260712-120000-manual-intent.json",
+    ) -> Path:
+        pending = root / "pending" / filename
+        pending.parent.mkdir(parents=True, exist_ok=True)
         pending.write_text(
             json.dumps(payload or self._intent_queue_payload()),
             encoding="utf-8",
@@ -882,6 +889,198 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertNotIn("pixabay", source.lower())
         self.assertNotIn("coverr", source.lower())
 
+    def test_process_queued_intent_batch_limits_max_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [
+                self._write_intent_queue_item(
+                    root,
+                    self._intent_queue_payload(task_id=f"manual-intent-00{index}"),
+                    filename=f"20260712-12000{index}-manual-intent.json",
+                )
+                for index in range(1, 4)
+            ]
+            submitter = mock.Mock(
+                return_value={
+                    "ok": True,
+                    "expected_output": "storage/tasks/manual-intent/final-1.mp4",
+                }
+            )
+
+            result = process_queued_intent_batch_with_mpt_native(
+                paths,
+                max_items=2,
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(result["done"], 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(submitter.call_count, 2)
+
+    def test_process_queued_intent_batch_rejects_wrong_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_intent_queue_item(
+                Path(tmp),
+                self._intent_queue_payload(source="legacy_queue"),
+            )
+            submitter = mock.Mock(return_value={"ok": True})
+
+            result = process_queued_intent_batch_with_mpt_native(
+                [path],
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["failed"], 1)
+        self.assertIn("queue item source must be job_intent_v1", result["errors"])
+        submitter.assert_not_called()
+
+    def test_process_queued_intent_batch_rejects_missing_compiled_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_intent_queue_item(
+                Path(tmp),
+                self._intent_queue_payload(compiled_mpt_spec={}),
+            )
+            submitter = mock.Mock(return_value={"ok": True})
+
+            result = process_queued_intent_batch_with_mpt_native(
+                [path],
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+            payload_after = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failed"], 1)
+        self.assertIn("compiled_mpt_spec is required", result["errors"])
+        self.assertEqual(payload_after["status"], "FAILED")
+        submitter.assert_not_called()
+
+    def test_process_queued_intent_batch_rejects_dangerous_guardrails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._intent_queue_payload()
+            payload["guardrails"]["asset_hub_api_allowed"] = True
+            path = self._write_intent_queue_item(Path(tmp), payload)
+            submitter = mock.Mock(return_value={"ok": True})
+
+            result = process_queued_intent_batch_with_mpt_native(
+                [path],
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=submitter,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("guardrails.asset_hub_api_allowed must be false", result["errors"])
+        submitter.assert_not_called()
+
+    def test_process_queued_intent_batch_flag_off_does_not_render(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_intent_queue_item(Path(tmp))
+            submitter = mock.Mock(return_value={"ok": True})
+
+            result = process_queued_intent_batch_with_mpt_native(
+                [path],
+                environ={},
+                submitter=submitter,
+            )
+            payload_after = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["processed"], 0)
+        self.assertIn(MPT_ENGINE_SUBMIT_FLAG, result["errors"][0])
+        self.assertEqual(payload_after["status"], "QUEUED")
+        submitter.assert_not_called()
+
+    def test_process_queued_intent_batch_submitter_ok_marks_done_per_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [
+                self._write_intent_queue_item(
+                    root,
+                    self._intent_queue_payload(task_id=f"manual-intent-00{index}"),
+                    filename=f"20260712-12000{index}-manual-intent.json",
+                )
+                for index in range(1, 3)
+            ]
+
+            def fake_submitter(*, task_id, **_kwargs):
+                return {
+                    "ok": True,
+                    "expected_output": f"storage/tasks/{task_id}/final-1.mp4",
+                    "errors": [],
+                }
+
+            result = process_queued_intent_batch_with_mpt_native(
+                paths,
+                max_items=2,
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=fake_submitter,
+            )
+            payloads = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(result["done"], 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual([payload["status"] for payload in payloads], ["DONE", "DONE"])
+        self.assertTrue(all(item["output_path"] for item in result["items"]))
+
+    def test_process_queued_intent_batch_submitter_error_marks_failed_and_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [
+                self._write_intent_queue_item(
+                    root,
+                    self._intent_queue_payload(task_id="manual-intent-ok"),
+                    filename="20260712-120001-manual-intent.json",
+                ),
+                self._write_intent_queue_item(
+                    root,
+                    self._intent_queue_payload(task_id="manual-intent-fail"),
+                    filename="20260712-120002-manual-intent.json",
+                ),
+            ]
+
+            def fake_submitter(*, task_id, **_kwargs):
+                if task_id.endswith("fail"):
+                    return {"ok": False, "errors": ["boom"]}
+                return {
+                    "ok": True,
+                    "expected_output": f"storage/tasks/{task_id}/final-1.mp4",
+                    "errors": [],
+                }
+
+            result = process_queued_intent_batch_with_mpt_native(
+                paths,
+                max_items=2,
+                environ={MPT_ENGINE_SUBMIT_FLAG: "1"},
+                submitter=fake_submitter,
+            )
+            payloads = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(result["done"], 1)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual([payload["status"] for payload in payloads], ["DONE", "FAILED"])
+        self.assertEqual(result["items"][1]["error"], "boom")
+
+    def test_process_queued_intent_batch_helper_does_not_call_runner_or_api(self):
+        source = inspect.getsource(process_queued_intent_batch_with_mpt_native)
+        self.assertNotIn("run_controlled_runner", source)
+        self.assertNotIn("nightly_runner", source)
+        self.assertNotIn("/api/v1/videos", source)
+        self.assertNotIn("openai", source.lower())
+        self.assertNotIn("text_to_speech", source.lower())
+        self.assertNotIn("pexels", source.lower())
+        self.assertNotIn("pixabay", source.lower())
+        self.assertNotIn("coverr", source.lower())
+
     def test_enqueue_aroll_broll_from_console_accepts_multiline_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1007,6 +1206,9 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "job_intent_submit_mpt_native",
             "Procesar con MPT nativo",
             "process_queued_intent_with_mpt_native",
+            "Procesar lote con MPT nativo",
+            "process_queued_intent_batch_with_mpt_native",
+            "max_items proceso lote",
             "STATUS_READY_TO_SUBMIT",
             "compile_job_intent_to_mpt_spec",
             "validate_job_intent",
