@@ -1010,6 +1010,10 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "STATUS_READY_TO_SUBMIT",
             "compile_job_intent_to_mpt_spec",
             "validate_job_intent",
+            "Crear lote desde audios",
+            "Agregar lote a cola",
+            "batch_audio_enqueue",
+            "enqueue_audio_batch_intents",
         )
 
         for expected in required_copy:
