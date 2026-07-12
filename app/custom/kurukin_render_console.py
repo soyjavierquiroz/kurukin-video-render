@@ -585,6 +585,113 @@ def process_queued_intent_with_mpt_native(
     )
 
 
+def _mark_intent_queue_item_failed(path: Path, errors: list[str]) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("source") != "job_intent_v1":
+        return None
+    failed_payload = dict(payload)
+    failed_payload["status"] = INTENT_QUEUE_FAILED_STATUS
+    failed_payload["error"] = "; ".join(errors or ["batch manual process failed"])
+    failed_payload["processed_at"] = datetime.now(timezone.utc).isoformat()
+    _write_json_atomic(path, failed_payload)
+    return failed_payload
+
+
+def process_queued_intent_batch_with_mpt_native(
+    queue_item_paths: list[str | Path],
+    *,
+    max_items: int = 5,
+    continue_on_error: bool = True,
+    environ: dict[str, str] | None = None,
+    submitter=None,
+    processor=None,
+) -> dict[str, Any]:
+    """Manually process multiple job_intent_v1 queue items through native MPT."""
+
+    try:
+        limit = int(max_items)
+    except (TypeError, ValueError):
+        limit = 5
+    limit = max(1, min(limit, 5))
+    selected_paths = [Path(path) for path in (queue_item_paths or [])[:limit]]
+    if not selected_paths:
+        return {
+            "ok": False,
+            "processed": 0,
+            "done": 0,
+            "failed": 0,
+            "items": [],
+            "errors": ["queue_item_paths is required"],
+        }
+    if not is_mpt_engine_submit_enabled(environ):
+        return {
+            "ok": False,
+            "processed": 0,
+            "done": 0,
+            "failed": 0,
+            "items": [],
+            "errors": [f"{MPT_ENGINE_SUBMIT_FLAG}=1 is required"],
+        }
+
+    if processor is None:
+        processor = process_queued_intent_with_mpt_native
+
+    items: list[dict[str, Any]] = []
+    errors: list[str] = []
+    done = 0
+    failed = 0
+    for path in selected_paths:
+        result = processor(path, environ=environ, submitter=submitter)
+        item_errors = [str(error) for error in result.get("errors") or []]
+        if result.get("ok"):
+            done += 1
+            status = result.get("status") or INTENT_QUEUE_DONE_STATUS
+        else:
+            failed += 1
+            status = result.get("status") or INTENT_QUEUE_FAILED_STATUS
+            errors.extend(item_errors)
+            if status != INTENT_QUEUE_FAILED_STATUS:
+                failed_payload = _mark_intent_queue_item_failed(path, item_errors)
+                if failed_payload is not None:
+                    status = INTENT_QUEUE_FAILED_STATUS
+                    result = dict(result)
+                    result["status"] = status
+                    result["task_id"] = _clean_text(failed_payload.get("task_id"))
+            if not continue_on_error:
+                items.append(
+                    {
+                        "queue_item_path": result.get("pending_path", path.as_posix()),
+                        "task_id": result.get("task_id", ""),
+                        "status": status,
+                        "output_path": result.get("output_path", ""),
+                        "error": "; ".join(item_errors),
+                    }
+                )
+                break
+        items.append(
+            {
+                "queue_item_path": result.get("pending_path", path.as_posix()),
+                "task_id": result.get("task_id", ""),
+                "status": status,
+                "output_path": result.get("output_path", ""),
+                "error": "; ".join(item_errors),
+            }
+        )
+
+    processed = len(items)
+    return {
+        "ok": processed > 0 and failed == 0,
+        "processed": processed,
+        "done": done,
+        "failed": failed,
+        "items": items,
+        "errors": errors,
+    }
+
+
 def normalize_aroll_broll_local_asset_paths(value: str | list[Any]) -> list[str]:
     """Return safe storage-relative B-roll asset paths from UI text/list input."""
 
