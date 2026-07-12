@@ -785,6 +785,120 @@ def list_pending_jobs(pending_dir: str | Path | None = None) -> list[dict[str, A
     return jobs
 
 
+def resolve_task_output_path(
+    task_id: str,
+    *,
+    tasks_dir: str | Path | None = None,
+) -> str | None:
+    """Return the expected final MP4 for a task id when it exists."""
+
+    safe_task_id = sanitize_job_id(task_id)
+    if not safe_task_id:
+        return None
+    tasks_root = _resolve_tasks_dir(tasks_dir)
+    candidate = tasks_root / safe_task_id / "final-1.mp4"
+    resolved = _safe_video_path(candidate, tasks_root)
+    if resolved is None:
+        return None
+    return resolved.as_posix()
+
+
+def _intent_audio_path(payload: Mapping[str, Any]) -> str:
+    for container_name in ("normalized_intent", "original_intent"):
+        container = payload.get(container_name)
+        if isinstance(container, Mapping) and container.get("audio_path"):
+            return str(container.get("audio_path") or "")
+    spec = payload.get("compiled_mpt_spec")
+    if isinstance(spec, Mapping):
+        params = spec.get("params")
+        if isinstance(params, Mapping):
+            return str(
+                params.get("custom_audio_file")
+                or params.get("audio_path")
+                or params.get("voice_audio")
+                or ""
+            )
+    return ""
+
+
+def summarize_intent_job_item(
+    item: Mapping[str, Any],
+    *,
+    tasks_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Summarize one job_intent_v1 queue item and its local final output."""
+
+    raw = item.get("raw") if isinstance(item.get("raw"), Mapping) else item
+    if not isinstance(raw, Mapping):
+        raw = {}
+    task_id = str(raw.get("task_id") or item.get("task_id") or "")
+    stored_output_path = str(raw.get("output_path") or "")
+    resolved_output_path = resolve_task_output_path(task_id, tasks_dir=tasks_dir)
+    output_path = stored_output_path or resolved_output_path or ""
+    if output_path and not Path(output_path).is_file() and resolved_output_path:
+        output_path = resolved_output_path
+    output_exists = bool(output_path and Path(output_path).is_file())
+
+    return {
+        "task_id": task_id,
+        "mode": str(raw.get("mode") or ""),
+        "status": str(raw.get("status") or ""),
+        "source": str(raw.get("source") or ""),
+        "audio_path": _intent_audio_path(raw),
+        "resolved_visual_path": str(raw.get("resolved_visual_path") or ""),
+        "visual_autofill_source": str(raw.get("visual_autofill_source") or ""),
+        "queue_item_path": str(item.get("path") or raw.get("queue_item_path") or ""),
+        "output_exists": output_exists,
+        "output_path": output_path if output_exists or output_path else "",
+        "error": str(raw.get("error") or item.get("error") or ""),
+        "created_at": str(raw.get("created_at") or item.get("created_at_iso") or ""),
+        "modified_at": str(item.get("modified_at_iso") or ""),
+        "raw": dict(raw),
+    }
+
+
+def list_intent_queue_items(
+    pending_dir: str | Path | None = None,
+    *,
+    tasks_dir: str | Path | None = None,
+    status: str = "ALL",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """List job_intent_v1 queue items with local output metadata."""
+
+    normalized_status = str(status or "ALL").upper()
+    max_items = max(1, int(limit or 20))
+    results: list[dict[str, Any]] = []
+    for job in reversed(list_pending_jobs(pending_dir)):
+        raw = job.get("raw") or {}
+        if not isinstance(raw, dict) or raw.get("source") != JOB_INTENT_QUEUE_SOURCE:
+            continue
+        item_status = str(raw.get("status") or "").upper()
+        if normalized_status != "ALL" and item_status != normalized_status:
+            continue
+        results.append(summarize_intent_job_item(job, tasks_dir=tasks_dir))
+        if len(results) >= max_items:
+            break
+    return results
+
+
+def list_intent_results(
+    pending_dir: str | Path | None = None,
+    *,
+    tasks_dir: str | Path | None = None,
+    status: str = "ALL",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Alias for the intent results panel: queue items plus output presence."""
+
+    return list_intent_queue_items(
+        pending_dir,
+        tasks_dir=tasks_dir,
+        status=status,
+        limit=limit,
+    )
+
+
 def _iter_task_files(
     task_dir: Path,
     *,

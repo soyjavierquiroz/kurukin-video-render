@@ -1216,6 +1216,12 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Agregar lote a cola",
             "batch_audio_enqueue",
             "enqueue_audio_batch_intents",
+            "Resultados de intenciones",
+            "status intenciones",
+            "limit intenciones",
+            "list_intent_results",
+            "output_exists",
+            "Reintentar con MPT nativo",
         )
 
         for expected in required_copy:
@@ -1396,6 +1402,10 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "read_video_bytes_for_download",
             "VIDEO_PREVIEW_MAX_BYTES",
             "VIDEO_DOWNLOAD_MEMORY_MAX_BYTES",
+            "Resultados de intenciones",
+            "source: job_intent_v1",
+            "output_exists",
+            "queue_item_path",
         )
 
         for expected in required_copy:

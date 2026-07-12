@@ -1,4 +1,5 @@
 import json
+import inspect
 import os
 import sys
 import tempfile
@@ -23,12 +24,16 @@ from app.custom.kurukin_job_queue import (
     get_storage_summary,
     is_aroll_broll_queue_enabled,
     is_aroll_broll_renderer_enabled,
+    list_intent_results,
+    list_intent_queue_items,
     list_completed_render_jobs,
     list_rendered_videos,
     list_nightly_queue,
     list_render_tasks,
     read_video_bytes_for_download,
+    resolve_task_output_path,
     sanitize_job_id,
+    summarize_intent_job_item,
     summarize_render_mode,
     summarize_pending_job,
 )
@@ -77,6 +82,45 @@ class TestKurukinJobQueue(unittest.TestCase):
         if combined_bytes is not None:
             (task_dir / "combined-1.mp4").write_bytes(combined_bytes)
         return completed_dir, tasks_dir, task_dir
+
+    def _write_intent_queue_item(
+        self,
+        pending_dir: Path,
+        *,
+        task_id: str = "intent-results-001",
+        status: str = "QUEUED",
+        source: str = JOB_INTENT_QUEUE_SOURCE,
+        filename: str | None = None,
+        error: str = "",
+    ) -> Path:
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "task_id": task_id,
+            "status": status,
+            "source": source,
+            "mode": "audio_to_video",
+            "original_intent": {
+                "mode": "audio_to_video",
+                "task_id": task_id,
+                "audio_path": "storage/local_audios/example.mp3",
+                "topic": "intent results test",
+            },
+            "normalized_intent": {
+                "mode": "audio_to_video",
+                "task_id": task_id,
+                "audio_path": "storage/local_audios/example.mp3",
+            },
+            "compiled_mpt_spec": {
+                "task_id": task_id,
+                "params": {"custom_audio_file": "storage/local_audios/example.mp3"},
+            },
+            "resolved_visual_path": "storage/local_videos/example.mp4",
+            "visual_autofill_source": "local_picker_v1",
+            "error": error,
+        }
+        path = pending_dir / (filename or f"20260712-120000-{task_id}.json")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
 
     def test_sanitize_job_id_normal(self):
         self.assertEqual(sanitize_job_id("render_001-abc"), "render_001-abc")
@@ -867,6 +911,162 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertEqual(api_url, CONTAINER_API_BASE_URL)
         self.assertEqual(command["api_base_url"], CONTAINER_API_BASE_URL)
         self.assertNotIn("127.0.0.1:18080", api_url)
+
+    def test_list_intent_results_lists_job_intent_source_only(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pending_dir = Path(tmp_dir) / "pending"
+            self._write_intent_queue_item(pending_dir, task_id="intent-results-001")
+            self._write_intent_queue_item(
+                pending_dir,
+                task_id="other-source-001",
+                source="nightly_runner",
+            )
+
+            results = list_intent_results(pending_dir, tasks_dir=Path(tmp_dir) / "tasks")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["task_id"], "intent-results-001")
+        self.assertEqual(results[0]["source"], JOB_INTENT_QUEUE_SOURCE)
+        self.assertEqual(results[0]["visual_autofill_source"], "local_picker_v1")
+
+    def test_list_intent_results_detects_done_output_exists(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            pending_dir = root / "pending"
+            tasks_dir = root / "tasks"
+            task_dir = tasks_dir / "intent-results-done"
+            task_dir.mkdir(parents=True)
+            final_path = task_dir / "final-1.mp4"
+            final_path.write_bytes(b"mp4")
+            self._write_intent_queue_item(
+                pending_dir,
+                task_id="intent-results-done",
+                status="DONE",
+            )
+
+            results = list_intent_results(
+                pending_dir,
+                tasks_dir=tasks_dir,
+                status="DONE",
+            )
+            resolved = resolve_task_output_path(
+                "intent-results-done",
+                tasks_dir=tasks_dir,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["output_exists"])
+        self.assertEqual(results[0]["output_path"], final_path.resolve().as_posix())
+        self.assertEqual(resolved, final_path.resolve().as_posix())
+
+    def test_list_intent_results_output_exists_false_without_final(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pending_dir = Path(tmp_dir) / "pending"
+            self._write_intent_queue_item(
+                pending_dir,
+                task_id="intent-results-missing",
+                status="DONE",
+            )
+
+            results = list_intent_results(pending_dir, tasks_dir=Path(tmp_dir) / "tasks")
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]["output_exists"])
+        self.assertEqual(results[0]["output_path"], "")
+
+    def test_list_intent_results_failed_includes_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pending_dir = Path(tmp_dir) / "pending"
+            self._write_intent_queue_item(
+                pending_dir,
+                task_id="intent-results-failed",
+                status="FAILED",
+                error="native submit failed",
+            )
+
+            results = list_intent_queue_items(
+                pending_dir,
+                tasks_dir=Path(tmp_dir) / "tasks",
+                status="FAILED",
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "FAILED")
+        self.assertEqual(results[0]["error"], "native submit failed")
+
+    def test_list_intent_results_filters_status_and_respects_limit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pending_dir = Path(tmp_dir) / "pending"
+            self._write_intent_queue_item(
+                pending_dir,
+                task_id="intent-results-queued-001",
+                filename="20260712-120001-intent-results-queued-001.json",
+            )
+            self._write_intent_queue_item(
+                pending_dir,
+                task_id="intent-results-done-001",
+                status="DONE",
+                filename="20260712-120002-intent-results-done-001.json",
+            )
+            self._write_intent_queue_item(
+                pending_dir,
+                task_id="intent-results-done-002",
+                status="DONE",
+                filename="20260712-120003-intent-results-done-002.json",
+            )
+
+            results = list_intent_results(
+                pending_dir,
+                tasks_dir=Path(tmp_dir) / "tasks",
+                status="DONE",
+                limit=1,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "DONE")
+        self.assertEqual(results[0]["task_id"], "intent-results-done-002")
+
+    def test_summarize_intent_job_item_keeps_core_fields(self):
+        payload = {
+            "task_id": "intent-summary-001",
+            "status": "QUEUED",
+            "source": JOB_INTENT_QUEUE_SOURCE,
+            "mode": "audio_to_video",
+            "normalized_intent": {"audio_path": "storage/local_audios/a.mp3"},
+            "resolved_visual_path": "storage/local_videos/v.mp4",
+            "visual_autofill_source": "local_picker_v1",
+        }
+
+        summary = summarize_intent_job_item({"path": "pending/item.json", "raw": payload})
+
+        self.assertEqual(summary["task_id"], "intent-summary-001")
+        self.assertEqual(summary["audio_path"], "storage/local_audios/a.mp3")
+        self.assertEqual(summary["queue_item_path"], "pending/item.json")
+        self.assertFalse(summary["output_exists"])
+
+    def test_intent_results_helpers_do_not_reference_execution_surfaces(self):
+        source = "\n".join(
+            inspect.getsource(func)
+            for func in (
+                list_intent_results,
+                list_intent_queue_items,
+                summarize_intent_job_item,
+                resolve_task_output_path,
+            )
+        )
+
+        for forbidden in (
+            "run_controlled_runner",
+            "nightly_runner",
+            "/api/v1/videos",
+            "submit_mpt",
+            "openai",
+            "pexels",
+            "pixabay",
+            "coverr",
+            "asset_hub",
+        ):
+            self.assertNotIn(forbidden, source.lower())
 
 
 if __name__ == "__main__":

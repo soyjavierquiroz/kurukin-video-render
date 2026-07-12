@@ -60,6 +60,7 @@ from app.custom.kurukin_job_queue import (  # noqa: E402
     get_runner_preflight_summary,
     is_aroll_broll_queue_enabled,
     is_ui_runner_enabled,
+    list_intent_results,
     list_rendered_videos,
     read_video_bytes_for_download,
     run_controlled_runner,
@@ -486,6 +487,8 @@ def _initialize_form_state():
     st.session_state.setdefault("batch_audio_preset", "educational")
     st.session_state.setdefault("batch_audio_max_items", 10)
     st.session_state.setdefault("intent_queue_process_max_items", 2)
+    st.session_state.setdefault("intent_results_status_filter", "ALL")
+    st.session_state.setdefault("intent_results_limit", 20)
 
 
 def _current_manifest_path():
@@ -2144,6 +2147,130 @@ def _manual_intent_queue_process_block(pending_jobs):
                 st.json(result)
 
 
+def _intent_result_video(result):
+    output_path = result.get("output_path")
+    if not output_path:
+        return None
+    path = Path(str(output_path))
+    try:
+        absolute_path = path.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+    if not absolute_path.is_file() or absolute_path.suffix.lower() != ".mp4":
+        return None
+    tasks_root = Path("storage/tasks").resolve(strict=False)
+    try:
+        relative_path = absolute_path.relative_to(tasks_root).as_posix()
+    except ValueError:
+        relative_path = absolute_path.name
+    size_bytes = absolute_path.stat().st_size
+    return {
+        "absolute_path": absolute_path.as_posix(),
+        "relative_path": relative_path,
+        "file_name": absolute_path.name,
+        "task_id": result.get("task_id"),
+        "kind": "final" if absolute_path.name.startswith("final-") else "other",
+        "size_bytes": size_bytes,
+        "size_label": _human_bytes(size_bytes),
+        "is_previewable": size_bytes <= VIDEO_PREVIEW_MAX_BYTES,
+    }
+
+
+def _intent_results_panel():
+    st.markdown("### Resultados de intenciones")
+    st.caption("source: job_intent_v1")
+    filter_cols = st.columns([1, 1, 2])
+    with filter_cols[0]:
+        status_filter = st.selectbox(
+            "status intenciones",
+            ["ALL", "QUEUED", "PROCESSING", "DONE", "FAILED"],
+            key="intent_results_status_filter",
+        )
+    with filter_cols[1]:
+        limit = st.number_input(
+            "limit intenciones",
+            min_value=1,
+            max_value=100,
+            step=1,
+            key="intent_results_limit",
+        )
+
+    results = list_intent_results(status=status_filter, limit=int(limit))
+    if not results:
+        st.info("No hay resultados de intenciones para el filtro seleccionado.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "task_id": result.get("task_id", ""),
+                "mode": result.get("mode", ""),
+                "status": result.get("status", ""),
+                "output_exists": result.get("output_exists", False),
+                "output_path": result.get("output_path", ""),
+                "queue_item_path": result.get("queue_item_path", ""),
+                "error": result.get("error", ""),
+            }
+            for result in results
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    submit_enabled = is_mpt_engine_submit_enabled()
+    for index, result in enumerate(results):
+        task_id = result.get("task_id") or "intent"
+        status = str(result.get("status") or "").upper()
+        with st.expander(f"{task_id} - {status}", expanded=False):
+            st.caption(f"queue_item_path: {result.get('queue_item_path')}")
+            st.caption(f"resolved_visual_path: {result.get('resolved_visual_path')}")
+            st.caption(f"output_path: {result.get('output_path') or '-'}")
+            if result.get("error"):
+                st.warning(str(result.get("error")))
+
+            video = _intent_result_video(result)
+            if video is not None:
+                _result_preview_download(
+                    video,
+                    key_prefix=(
+                        f"intent_result_{index}_"
+                        f"{sanitize_job_id(str(task_id))}"
+                    ),
+                )
+
+            if status in {"QUEUED", "PENDING", "FAILED"}:
+                if not submit_enabled:
+                    st.warning(
+                        "Procesar con MPT nativo bloqueado por "
+                        f"{MPT_ENGINE_SUBMIT_FLAG}=1."
+                    )
+                label = (
+                    "Reintentar con MPT nativo"
+                    if status == "FAILED"
+                    else "Procesar con MPT nativo"
+                )
+                if st.button(
+                    label,
+                    key=(
+                        f"intent_result_process_{index}_"
+                        f"{sanitize_job_id(str(task_id))}"
+                    ),
+                    disabled=not submit_enabled,
+                    help=f"Requiere {MPT_ENGINE_SUBMIT_FLAG}=1.",
+                ):
+                    process_result = process_queued_intent_with_mpt_native(
+                        result.get("queue_item_path", "")
+                    )
+                    st.session_state["intent_results_last_process_result"] = process_result
+                    if process_result.get("ok"):
+                        st.success("Intención procesada con MPT nativo.")
+                    else:
+                        st.error("No se pudo procesar la intención.")
+            process_result = st.session_state.get("intent_results_last_process_result") or {}
+            if process_result.get("pending_path") == result.get("queue_item_path"):
+                st.json(process_result)
+
+
 def _queue_storage_view():
     st.title("Cola y resultados")
     st.write("Revisa trabajos pendientes, resultados generados y errores sin entrar por terminal.")
@@ -2174,6 +2301,7 @@ def _queue_storage_view():
     if last_pending_job:
         st.success(f"Último video enviado a cola: {last_pending_job.get('job_id')}")
     _manual_intent_queue_process_block(pending_jobs)
+    _intent_results_panel()
     if pending_jobs:
         for job in pending_jobs:
             _pending_job_block(job)
