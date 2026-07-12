@@ -1100,7 +1100,8 @@ def _topic_plan_block(intent, *, key_prefix):
         return
 
     st.caption(
-        "Topic-to-video v1 genera plan y script local. Para renderizar falta audio/TTS."
+        "Topic-to-video v1 genera plan y script local. Si agregas audio_path local, "
+        "puede quedar READY_TO_SUBMIT sin TTS."
     )
     script = plan.get("script") or (intent or {}).get("script", "")
     if script:
@@ -1147,13 +1148,14 @@ def render_job_intent_step():
         st.text_input("topic", key="job_intent_topic")
         st.text_area("script opcional", key="job_intent_script", height=96)
         st.text_input(
-            "audio_path",
+            "audio_path local",
             key="job_intent_audio_path",
             placeholder="storage/local_audios/audio.mp3",
         )
+        st.caption("Tema a video acepta audio_path local; no se genera TTS.")
     with right:
         st.text_input(
-            "video_path (opcional para audio_to_video)",
+            "video_path (opcional para topic_to_video/audio_to_video)",
             key="job_intent_video_path",
             placeholder="storage/local_videos/visual.mp4",
         )

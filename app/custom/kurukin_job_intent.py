@@ -361,6 +361,9 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
         "metadata": {
             "job_intent": {
                 "mode": mode,
+                "topic": intent.get("topic", ""),
+                "script": script,
+                "audio_path": intent.get("audio_path") or "",
                 "language": intent["language"],
                 "duration_seconds": intent["duration_seconds"],
                 "format": intent["format"],
@@ -369,6 +372,12 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
                 "visual_autofill_source": intent.get("visual_autofill_source", ""),
                 "visual_autofill": deepcopy(intent.get("visual_autofill", {})),
                 "topic_plan": deepcopy(intent.get("topic_plan", {})),
+                "topic_plan_summary": {
+                    "status": _as_dict(intent.get("topic_plan")).get("status", ""),
+                    "reason": _as_dict(intent.get("topic_plan")).get("reason", ""),
+                    "scene_count": len(_as_list(intent.get("scenes"))),
+                    "visual_keywords": list(visual_keywords),
+                },
                 "scenes": deepcopy(intent.get("scenes", [])),
                 "visual_keywords": list(visual_keywords),
                 "external_providers_allowed": False,
