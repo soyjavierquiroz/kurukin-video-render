@@ -303,6 +303,63 @@ class TestKurukinJobIntent(unittest.TestCase):
             result["mpt_spec"]["mpt_params"]["video_materials"][0]["url"],
             "storage/local_videos/casa-usada-vertical.mp4",
         )
+        metadata = result["mpt_spec"]["kurukin_metadata"]["metadata"]["job_intent"]
+        self.assertEqual(metadata["mode"], MODE_TOPIC_TO_VIDEO)
+        self.assertEqual(metadata["topic"], "casa usada")
+        self.assertEqual(metadata["audio_path"], "storage/local_audios/audio.mp3")
+        self.assertIn("casa usada", metadata["script"])
+        self.assertEqual(metadata["topic_plan_summary"]["scene_count"], len(result["intent"]["scenes"]))
+
+    def test_topic_to_video_preserves_provided_script(self):
+        provided_script = "Hook propio.\nPunto propio.\nCierre propio."
+
+        with tempfile.TemporaryDirectory() as tmp:
+            visual_dir = Path(tmp) / "storage" / "local_videos"
+            visual_dir.mkdir(parents=True)
+            (visual_dir / "propio-vertical.mp4").write_bytes(b"visual")
+
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_TOPIC_TO_VIDEO,
+                    "topic": "casa usada",
+                    "script": provided_script,
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "preset": "educational",
+                },
+                project_root=tmp,
+            )
+
+        self.assertEqual(result["status"], STATUS_READY_TO_SUBMIT)
+        self.assertEqual(result["intent"]["script"], provided_script)
+        self.assertEqual(result["intent"]["topic_plan"]["script"], provided_script)
+        self.assertEqual(
+            result["mpt_spec"]["mpt_params"]["video_script"],
+            provided_script,
+        )
+
+    def test_topic_to_video_local_picker_uses_topic_plan_keywords(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            generic = root / "storage" / "local_videos" / "generic.mp4"
+            keyword = root / "storage" / "local_videos" / "checklist-detalle.mp4"
+            generic.parent.mkdir(parents=True)
+            generic.write_bytes(b"visual")
+            keyword.write_bytes(b"visual")
+
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_TOPIC_TO_VIDEO,
+                    "topic": "casa usada",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "preset": "educational",
+                },
+                project_root=root,
+            )
+
+        self.assertEqual(
+            result["intent"]["resolved_visual_path"],
+            "storage/local_videos/checklist-detalle.mp4",
+        )
 
     def test_audio_to_video_audio_only_needs_input_without_local_visual(self):
         with tempfile.TemporaryDirectory() as tmp:

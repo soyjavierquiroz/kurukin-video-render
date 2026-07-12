@@ -250,6 +250,47 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertGreaterEqual(len(result["compiled"]["intent"]["scenes"]), 3)
         self.assertFalse(queue_dir.exists())
 
+    def test_enqueue_topic_to_video_with_audio_writes_full_queue_item(self):
+        intent = {
+            "mode": "topic_to_video",
+            "task_id": "topic-with-audio-queue",
+            "topic": "5 errores al comprar una casa usada",
+            "audio_path": "storage/local_audios/audio.mp3",
+            "duration_seconds": 45,
+            "preset": "educational",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            visual = root / "storage" / "local_videos" / "casa-usada-vertical.mp4"
+            visual.parent.mkdir(parents=True)
+            visual.write_bytes(b"visual")
+            queue_dir = root / "pending"
+            result = enqueue_job_intent(
+                intent,
+                queue_dir=queue_dir,
+                project_root=root,
+            )
+            payload = json.loads(Path(result["pending_path"]).read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "QUEUED")
+        self.assertEqual(payload["source"], JOB_INTENT_QUEUE_SOURCE)
+        self.assertEqual(payload["mode"], "topic_to_video")
+        self.assertEqual(payload["status"], "QUEUED")
+        self.assertEqual(payload["original_intent"], intent)
+        self.assertIn("script", payload["normalized_intent"])
+        self.assertIn("topic_plan", payload["normalized_intent"])
+        self.assertEqual(
+            payload["resolved_visual_path"],
+            "storage/local_videos/casa-usada-vertical.mp4",
+        )
+        self.assertEqual(payload["visual_autofill_source"], "local_picker_v1")
+        self.assertEqual(
+            payload["compiled_mpt_spec"]["mpt_params"]["custom_audio_file"],
+            "storage/local_audios/audio.mp3",
+        )
+        self.assertFalse(payload["guardrails"]["real_render_started"])
+
     def test_enqueue_job_intent_does_not_call_render_or_external_surfaces(self):
         source = Path("app/custom/kurukin_job_queue.py").read_text(encoding="utf-8")
 

@@ -90,11 +90,31 @@ def _visual_type(path: Path) -> str:
     return "video" if path.suffix.lower() in VIDEO_EXTENSIONS else "image"
 
 
+def _keyword_values(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        values: list[str] = []
+        for item in value.values():
+            values.extend(_keyword_values(item))
+        return values
+    if isinstance(value, (list, tuple, set)):
+        values = []
+        for item in value:
+            values.extend(_keyword_values(item))
+        return values
+    return [_clean_text(value)] if _clean_text(value) else []
+
+
 def _keyword_tokens(intent: dict[str, Any]) -> set[str]:
-    text = " ".join(
+    values = [
         _clean_text(intent.get(key))
         for key in ("topic", "preset")
-    ).lower()
+    ]
+    values.extend(_keyword_values(intent.get("visual_keywords")))
+    topic_plan = intent.get("topic_plan")
+    if isinstance(topic_plan, dict):
+        values.extend(_keyword_values(topic_plan.get("visual_keywords")))
+
+    text = " ".join(value for value in values if value).lower()
     return {
         token
         for token in re.split(r"[^a-z0-9]+", text)
