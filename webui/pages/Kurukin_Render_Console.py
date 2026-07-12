@@ -1094,6 +1094,35 @@ def _job_intent_result_block(result):
         st.json({"errors": result.get("errors")})
 
 
+def _topic_plan_block(intent, *, key_prefix):
+    plan = (intent or {}).get("topic_plan") or {}
+    if not plan:
+        return
+
+    st.caption(
+        "Topic-to-video v1 genera plan y script local. Para renderizar falta audio/TTS."
+    )
+    script = plan.get("script") or (intent or {}).get("script", "")
+    if script:
+        st.text_area(
+            "script generado",
+            value=script,
+            height=150,
+            key=f"{key_prefix}_topic_plan_script",
+        )
+    scenes = plan.get("scenes") or (intent or {}).get("scenes") or []
+    if scenes:
+        with st.expander("Escenas generadas", expanded=False):
+            st.json(scenes)
+    visual_keywords = (
+        plan.get("visual_keywords")
+        or (intent or {}).get("visual_keywords")
+        or []
+    )
+    if visual_keywords:
+        st.caption("visual_keywords: " + ", ".join(str(item) for item in visual_keywords))
+
+
 def render_job_intent_step():
     st.markdown("### Crear por intención")
     st.caption(
@@ -1204,11 +1233,14 @@ def render_job_intent_step():
     if validation:
         with st.expander("Resultado de intención", expanded=False):
             _job_intent_result_block(validation)
-            st.json(validation.get("intent") or {})
+            validation_intent = validation.get("intent") or {}
+            _topic_plan_block(validation_intent, key_prefix="validation")
+            st.json(validation_intent)
 
     if compiled:
         _job_intent_result_block(compiled)
         compiled_intent = compiled.get("intent") or {}
+        _topic_plan_block(compiled_intent, key_prefix="compiled")
         resolved_visual = (
             compiled_intent.get("resolved_visual_path")
             or compiled_intent.get("video_path", "")

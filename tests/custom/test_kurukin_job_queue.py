@@ -227,6 +227,29 @@ class TestKurukinJobQueue(unittest.TestCase):
         self.assertIn("needs_local_visual_asset", result["reasons"])
         self.assertFalse(queue_dir.exists())
 
+    def test_enqueue_topic_to_video_without_audio_keeps_draft_out_of_queue(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            queue_dir = root / "pending"
+            result = enqueue_job_intent(
+                {
+                    "mode": "topic_to_video",
+                    "task_id": "topic-plan-draft",
+                    "topic": "5 errores al comprar una casa usada",
+                    "duration_seconds": 45,
+                    "preset": "educational",
+                },
+                queue_dir=queue_dir,
+                project_root=root,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "NEEDS_INPUT")
+        self.assertEqual(result["reasons"], ["needs_audio_or_tts"])
+        self.assertIn("script", result["compiled"]["intent"])
+        self.assertGreaterEqual(len(result["compiled"]["intent"]["scenes"]), 3)
+        self.assertFalse(queue_dir.exists())
+
     def test_enqueue_job_intent_does_not_call_render_or_external_surfaces(self):
         source = Path("app/custom/kurukin_job_queue.py").read_text(encoding="utf-8")
 
