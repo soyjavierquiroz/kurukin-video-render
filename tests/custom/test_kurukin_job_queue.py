@@ -11,9 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from app.custom.kurukin_job_queue import (
     CONTAINER_API_BASE_URL,
     CONTAINER_NIGHTLY_QUEUE_DIR,
+    JOB_INTENT_QUEUE_SOURCE,
     KurukinJobQueueError,
     build_pending_job_filename,
     build_safe_runner_command,
+    enqueue_job_intent,
     detect_render_mode_for_job,
     enqueue_moneyprinter_payload,
     find_result_for_job,
@@ -107,6 +109,92 @@ class TestKurukinJobQueue(unittest.TestCase):
 
         self.assertEqual(payload["job_id"], "render-001")
         self.assertTrue(path.name.endswith("render-001.json"))
+
+    def test_enqueue_job_intent_ready_to_submit_writes_queue_item(self):
+        intent = {
+            "mode": "audio_to_video",
+            "task_id": "intent-queue-001",
+            "audio_path": "storage/local_audios/audio.mp3",
+            "topic": "Casa usada",
+            "video_path": "storage/local_videos/casa.mp4",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            queue_dir = Path(tmp_dir) / "pending"
+            result = enqueue_job_intent(intent, queue_dir=queue_dir)
+            payload = json.loads(Path(result["pending_path"]).read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "QUEUED")
+        self.assertEqual(payload["source"], JOB_INTENT_QUEUE_SOURCE)
+        self.assertEqual(payload["status"], "QUEUED")
+        self.assertEqual(payload["task_id"], "intent-queue-001")
+        self.assertEqual(payload["original_intent"], intent)
+        self.assertEqual(payload["normalized_intent"]["video_path"], "storage/local_videos/casa.mp4")
+        self.assertIn("compiled_mpt_spec", payload)
+        self.assertFalse(payload["guardrails"]["real_render_started"])
+
+    def test_enqueue_job_intent_audio_only_uses_local_picker(self):
+        intent = {
+            "mode": "audio_to_video",
+            "task_id": "intent-queue-picker",
+            "audio_path": "storage/local_audios/audio.mp3",
+            "topic": "vertical reel smoke",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            visual = root / "storage" / "local_videos" / "vertical-reel-smoke.mp4"
+            visual.parent.mkdir(parents=True)
+            visual.write_bytes(b"visual")
+            queue_dir = root / "pending"
+            result = enqueue_job_intent(
+                intent,
+                queue_dir=queue_dir,
+                project_root=root,
+            )
+            payload = json.loads(Path(result["pending_path"]).read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            payload["resolved_visual_path"],
+            "storage/local_videos/vertical-reel-smoke.mp4",
+        )
+        self.assertEqual(payload["visual_autofill_source"], "local_picker_v1")
+        self.assertEqual(
+            payload["normalized_intent"]["resolved_visual_path"],
+            "storage/local_videos/vertical-reel-smoke.mp4",
+        )
+
+    def test_enqueue_job_intent_needs_input_does_not_write_queue_item(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            queue_dir = root / "pending"
+            result = enqueue_job_intent(
+                {
+                    "mode": "audio_to_video",
+                    "task_id": "intent-queue-missing",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                },
+                queue_dir=queue_dir,
+                project_root=root,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "NEEDS_INPUT")
+        self.assertIn("needs_local_visual_asset", result["reasons"])
+        self.assertFalse(queue_dir.exists())
+
+    def test_enqueue_job_intent_does_not_call_render_or_external_surfaces(self):
+        source = Path("app/custom/kurukin_job_queue.py").read_text(encoding="utf-8")
+
+        for forbidden in (
+            "openai",
+            "text_to_speech",
+            "requests.",
+            "urlopen",
+            "task.start",
+            "/api/v1/videos",
+        ):
+            self.assertNotIn(forbidden, source.lower())
 
     def test_enqueue_stays_inside_queue_dir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

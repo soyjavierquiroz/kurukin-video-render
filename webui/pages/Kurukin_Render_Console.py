@@ -84,6 +84,7 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     build_render_console_spec,
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
+    enqueue_job_intent_from_console,
     get_manifest_summary_for_ui,
     is_mpt_engine_submit_enabled,
     is_pexels_source_enabled,
@@ -1116,7 +1117,7 @@ def render_job_intent_step():
         st.selectbox("format", JOB_INTENT_FORMATS, key="job_intent_format")
         st.text_input("preset", key="job_intent_preset")
 
-    action_cols = st.columns([1, 1, 1])
+    action_cols = st.columns([1, 1, 1, 1])
     with action_cols[0]:
         if st.button("Validar intención", key="job_intent_validate"):
             st.session_state["job_intent_last_validation"] = validate_job_intent(
@@ -1127,10 +1128,30 @@ def render_job_intent_step():
             st.session_state["job_intent_last_compile"] = compile_job_intent_to_mpt_spec(
                 _build_job_intent_from_state()
             )
+    with action_cols[2]:
+        if st.button("Agregar a cola", key="job_intent_enqueue"):
+            result = enqueue_job_intent_from_console(_build_job_intent_from_state())
+            st.session_state["job_intent_last_queue_result"] = result
+            st.session_state["job_intent_last_compile"] = result.get("compiled") or {}
+            if result.get("ok"):
+                st.session_state["last_enqueued_job_id"] = str(result.get("job_id") or "")
+                st.session_state["last_enqueued_pending_path"] = str(
+                    result.get("pending_path") or ""
+                )
+                st.session_state["last_enqueued_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                st.success("Intención agregada a cola.")
+                st.caption(f"task_id: {result.get('task_id')}")
+                st.caption(f"status: {result.get('status')}")
+            else:
+                st.warning(f"No se encoló la intención: {result.get('status')}")
+                if result.get("reasons"):
+                    st.caption("Pendiente: " + ", ".join(result.get("reasons") or []))
     compiled = st.session_state.get("job_intent_last_compile") or {}
     ready_to_submit = compiled.get("status") == STATUS_READY_TO_SUBMIT
     submit_enabled = is_mpt_engine_submit_enabled()
-    with action_cols[2]:
+    with action_cols[3]:
         if st.button(
             "Enviar a MPT nativo",
             key="job_intent_submit_mpt_native",
@@ -1186,6 +1207,11 @@ def render_job_intent_step():
     if submit_result:
         with st.expander("Resultado submit por intención", expanded=False):
             st.json(submit_result)
+
+    queue_result = st.session_state.get("job_intent_last_queue_result")
+    if queue_result:
+        with st.expander("Resultado cola por intención", expanded=False):
+            st.json(queue_result)
 
 
 def _current_aroll_broll_config():
