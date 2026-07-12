@@ -35,6 +35,7 @@ from app.custom.kurukin_job_adapter import (
     validate_local_filename,
 )
 from app.custom.kurukin_job_queue import (
+    enqueue_job_intent,
     enqueue_moneyprinter_payload,
     is_aroll_broll_queue_enabled,
     sanitize_job_id,
@@ -582,6 +583,23 @@ def enqueue_aroll_broll_from_console(
         "render_mode": payload.get("render_mode"),
         "payload": payload,
     }
+
+
+def enqueue_job_intent_from_console(
+    intent: dict[str, Any],
+    *,
+    queue_dir: str | Path = "storage/nightly_jobs/pending",
+    project_root: str | Path | None = None,
+    now=None,
+) -> dict[str, Any]:
+    """Queue a compiled job intent without rendering or calling providers."""
+
+    return enqueue_job_intent(
+        intent,
+        queue_dir=queue_dir,
+        project_root=project_root,
+        now=now,
+    )
 
 
 def build_render_console_spec(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import os
@@ -19,6 +20,8 @@ QUEUE_GROUPS = ("pending", "processing", "completed", "failed", "logs")
 DEFAULT_PENDING_DIR = Path("storage/nightly_jobs/pending")
 DEFAULT_COMPLETED_DIR = Path("storage/nightly_jobs/completed")
 DEFAULT_TASKS_DIR = Path("storage/tasks")
+JOB_INTENT_QUEUE_SOURCE = "job_intent_v1"
+JOB_INTENT_QUEUE_STATUS = "QUEUED"
 MAX_TASK_SCAN_DEPTH = 4
 MAX_TASK_SCAN_FILES = 500
 MAX_LOG_READ_BYTES = 64 * 1024
@@ -217,6 +220,136 @@ def enqueue_moneyprinter_payload(
             pass
 
     return candidate
+
+
+def _utc_now_iso(now: datetime | None = None) -> str:
+    return (now or datetime.now(timezone.utc)).isoformat()
+
+
+def build_job_intent_queue_payload(
+    *,
+    original_intent: dict[str, Any],
+    compiled: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build the pending JSON for a READY_TO_SUBMIT job intent."""
+
+    if not isinstance(original_intent, dict) or not original_intent:
+        raise KurukinJobQueueError("original_intent must be a non-empty object")
+    if not isinstance(compiled, dict) or not compiled:
+        raise KurukinJobQueueError("compiled intent must be a non-empty object")
+
+    normalized = compiled.get("intent") if isinstance(compiled.get("intent"), dict) else {}
+    task_id = sanitize_job_id(
+        str(normalized.get("task_id") or original_intent.get("task_id") or "")
+    )
+    mode = str(normalized.get("mode") or original_intent.get("mode") or "").strip()
+    mpt_spec = compiled.get("mpt_spec") if isinstance(compiled.get("mpt_spec"), dict) else {}
+    mpt_params = mpt_spec.get("mpt_params") if isinstance(mpt_spec.get("mpt_params"), dict) else {}
+    subject = str(
+        normalized.get("topic")
+        or normalized.get("script")
+        or mpt_params.get("video_subject")
+        or "Kurukin intent"
+    ).strip()
+
+    return {
+        "job_id": task_id,
+        "task_id": task_id,
+        "mode": mode,
+        "status": JOB_INTENT_QUEUE_STATUS,
+        "source": JOB_INTENT_QUEUE_SOURCE,
+        "created_at": _utc_now_iso(now),
+        "title": subject,
+        "video_subject": subject,
+        "original_intent": deepcopy(original_intent),
+        "normalized_intent": deepcopy(normalized),
+        "resolved_visual_path": normalized.get("resolved_visual_path", ""),
+        "visual_autofill_source": normalized.get("visual_autofill_source", ""),
+        "compiled_mpt_spec": deepcopy(mpt_spec),
+        "reasons": list(compiled.get("reasons") or []),
+        "errors": list(compiled.get("errors") or []),
+        "runner": {
+            "job_id": task_id,
+            "task_id": task_id,
+            "source": JOB_INTENT_QUEUE_SOURCE,
+            "execution_mode": "manual_queue_only",
+        },
+        "guardrails": {
+            "external_providers_allowed": False,
+            "ai_generation_allowed": False,
+            "asset_hub_api_allowed": False,
+            "real_render_started": False,
+        },
+    }
+
+
+def enqueue_job_intent(
+    intent: dict[str, Any],
+    *,
+    queue_dir: str | Path = "storage/nightly_jobs/pending",
+    project_root: str | Path | None = None,
+    now: datetime | None = None,
+    compiler: Callable[..., dict[str, Any]] | None = None,
+    enqueuer: Callable[..., Path] = enqueue_moneyprinter_payload,
+) -> dict[str, Any]:
+    """Compile and enqueue a READY_TO_SUBMIT job intent without running it."""
+
+    if compiler is None:
+        from app.custom.kurukin_job_intent import (
+            STATUS_READY_TO_SUBMIT,
+            compile_job_intent_to_mpt_spec,
+        )
+
+        compiler = compile_job_intent_to_mpt_spec
+        ready_status = STATUS_READY_TO_SUBMIT
+    else:
+        ready_status = "READY_TO_SUBMIT"
+
+    try:
+        compiled = compiler(intent, project_root=project_root)
+    except TypeError:
+        compiled = compiler(intent)
+    status = str(compiled.get("status") or "")
+    reasons = list(compiled.get("reasons") or [])
+    errors = list(compiled.get("errors") or [])
+    if not reasons and errors:
+        reasons = [
+            str(item.get("message") or item.get("field") or item)
+            if isinstance(item, dict)
+            else str(item)
+            for item in errors
+        ]
+    normalized = compiled.get("intent") if isinstance(compiled.get("intent"), dict) else {}
+
+    if status != ready_status:
+        return {
+            "ok": False,
+            "status": status or "NOT_READY",
+            "task_id": str(normalized.get("task_id") or intent.get("task_id") or ""),
+            "reasons": reasons,
+            "errors": errors,
+            "compiled": compiled,
+            "pending_path": "",
+        }
+
+    payload = build_job_intent_queue_payload(
+        original_intent=intent,
+        compiled=compiled,
+        now=now,
+    )
+    pending_path = enqueuer(payload, queue_dir=queue_dir, now=now)
+    return {
+        "ok": True,
+        "status": payload["status"],
+        "task_id": payload["task_id"],
+        "job_id": payload["job_id"],
+        "pending_path": pending_path.as_posix(),
+        "payload": payload,
+        "compiled": compiled,
+        "reasons": [],
+        "errors": [],
+    }
 
 
 def _list_entries(directory: Path) -> list[dict[str, Any]]:

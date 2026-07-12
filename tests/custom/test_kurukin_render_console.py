@@ -57,6 +57,7 @@ from app.custom.kurukin_render_console import (
     build_workflow_payload,
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
+    enqueue_job_intent_from_console,
     get_manifest_summary_for_ui,
     is_mpt_engine_submit_enabled,
     is_pexels_source_enabled,
@@ -630,6 +631,30 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(payload["b_roll_asset_count"], 2)
         self.assertEqual(len(payload["aroll_broll"]["b_roll"]["assets"]), 2)
 
+    def test_enqueue_job_intent_from_console_writes_pending_without_render(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = enqueue_job_intent_from_console(
+                {
+                    "mode": "audio_to_video",
+                    "task_id": "console-intent-queue",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "video_path": "storage/local_videos/visual.mp4",
+                    "topic": "Console intent queue",
+                },
+                queue_dir=root / "pending",
+                project_root=root,
+            )
+            payload = json.loads(
+                Path(result["pending_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(payload["source"], "job_intent_v1")
+        self.assertEqual(payload["status"], "QUEUED")
+        self.assertEqual(payload["original_intent"]["task_id"], "console-intent-queue")
+        self.assertFalse((root / "storage" / "tasks").exists())
+
     def test_enqueue_aroll_broll_from_console_accepts_multiline_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -744,6 +769,9 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "Crear por intención",
             "Validar intención",
             "Preparar spec MPT",
+            "Agregar a cola",
+            "job_intent_enqueue",
+            "Resultado cola por intención",
             "video_path (opcional para audio_to_video)",
             "Si no pasas video_path, Kurukin intentará usar un visual local automático.",
             "Visual local resuelto:",
