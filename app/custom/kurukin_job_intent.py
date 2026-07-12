@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 from app.custom.mpt_engine_bridge import build_mpt_video_task_from_kurukin_job
@@ -34,6 +35,18 @@ FORMAT_TO_MPT_ASPECT = {
 }
 MIN_DURATION_SECONDS = 4
 MAX_DURATION_SECONDS = 300
+VISUAL_AUTOFILL_REASON = "needs_local_visual_asset"
+VISUAL_AUTOFILL_SOURCE = "audio_to_video_local_autofill"
+VISUAL_AUTOFILL_SEARCH_DIRS = (
+    Path("storage/local_videos"),
+    Path("storage/local_images"),
+    Path("storage/local_assets"),
+)
+VISUAL_AUTOFILL_EXTENSIONS = {".mp4", ".mov", ".mkv", ".jpg", ".jpeg", ".png"}
+VISUAL_AUTOFILL_PREFERRED_PATHS = (
+    Path("storage/local_videos/_aroll_broll_smoke_001/aroll_presenter_fixture_6s.mp4"),
+    Path("storage/local_videos/_aroll_broll_smoke_001/broll_visual_fixture_2s.mp4"),
+)
 
 
 def _clean_text(value: Any) -> str:
@@ -97,9 +110,21 @@ def _material_path(item: Any) -> str:
     return _clean_text(item)
 
 
+def _safe_local_visual_path(value: Any) -> str:
+    text = _clean_text(value)
+    if not text or not _path_looks_local(text):
+        return ""
+    path = Path(text)
+    if path.is_absolute() or ".." in path.parts:
+        return ""
+    if path.suffix.lower() not in VISUAL_AUTOFILL_EXTENSIONS:
+        return ""
+    return path.as_posix()
+
+
 def _local_visual_paths(intent: dict[str, Any]) -> list[str]:
     paths: list[str] = []
-    for key in ("local_visual_asset", "local_visual_path"):
+    for key in ("local_visual_asset", "local_visual_path", "visual_path"):
         value = _clean_text(intent.get(key))
         if value:
             paths.append(value)
@@ -118,6 +143,86 @@ def _local_visual_paths(intent: dict[str, Any]) -> list[str]:
         if path not in deduped:
             deduped.append(path)
     return deduped
+
+
+def _project_root_path(project_root: str | Path | None) -> Path:
+    return Path(project_root).resolve() if project_root else Path.cwd().resolve()
+
+
+def _path_exists_under_root(root: Path, relative_path: Path) -> bool:
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return False
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return candidate.is_file()
+
+
+def resolve_audio_to_video_autofill_visual_path(
+    *,
+    project_root: str | Path | None = None,
+) -> str:
+    """Return a safe existing local visual path for audio-only intents."""
+
+    root = _project_root_path(project_root)
+    for relative_path in VISUAL_AUTOFILL_PREFERRED_PATHS:
+        if _path_exists_under_root(root, relative_path):
+            return relative_path.as_posix()
+
+    candidates: list[Path] = []
+    for search_dir in VISUAL_AUTOFILL_SEARCH_DIRS:
+        absolute_dir = (root / search_dir).resolve()
+        try:
+            absolute_dir.relative_to(root)
+        except ValueError:
+            continue
+        if not absolute_dir.is_dir():
+            continue
+        for candidate in absolute_dir.rglob("*"):
+            if not candidate.is_file():
+                continue
+            if candidate.suffix.lower() not in VISUAL_AUTOFILL_EXTENSIONS:
+                continue
+            try:
+                relative = candidate.resolve().relative_to(root)
+            except ValueError:
+                continue
+            if _safe_local_visual_path(relative.as_posix()):
+                candidates.append(relative)
+
+    if not candidates:
+        return ""
+
+    candidates.sort(key=lambda item: (item.parts, item.name.lower()))
+    return candidates[0].as_posix()
+
+
+def _autofill_audio_to_video_visual(
+    intent: dict[str, Any],
+    *,
+    project_root: str | Path | None = None,
+) -> dict[str, Any]:
+    normalized = deepcopy(intent)
+    if normalized.get("mode") != MODE_AUDIO_TO_VIDEO:
+        return normalized
+    if not normalized.get("audio_path") or _local_visual_paths(normalized):
+        return normalized
+
+    visual_path = resolve_audio_to_video_autofill_visual_path(
+        project_root=project_root
+    )
+    if not visual_path:
+        return normalized
+
+    normalized["video_path"] = visual_path
+    normalized["visual_path"] = visual_path
+    normalized["visual_autofill"] = {
+        "source": VISUAL_AUTOFILL_SOURCE,
+        "path": visual_path,
+    }
+    return normalized
 
 
 def _safe_task_id(value: Any) -> str:
@@ -141,7 +246,10 @@ def normalize_job_intent(intent: dict[str, Any]) -> dict[str, Any]:
     )
     normalized["preset"] = _clean_text(source.get("preset")) or DEFAULT_PRESET
     normalized["audio_path"] = _clean_text(source.get("audio_path"))
-    normalized["video_path"] = _clean_text(source.get("video_path"))
+    normalized["visual_path"] = _clean_text(source.get("visual_path"))
+    normalized["video_path"] = _clean_text(source.get("video_path")) or normalized[
+        "visual_path"
+    ]
     normalized["task_id"] = _safe_task_id(source.get("task_id"))
     return normalized
 
@@ -184,7 +292,7 @@ def validate_job_intent(intent: dict[str, Any]) -> dict[str, Any]:
             )
         )
 
-    for field in ("audio_path", "video_path"):
+    for field in ("audio_path", "video_path", "visual_path"):
         value = normalized.get(field)
         if value and not _path_looks_local(value):
             errors.append(_error(field, f"{field} must be a local path, not a URL"))
@@ -223,7 +331,7 @@ def _readiness_for_intent(intent: dict[str, Any]) -> tuple[str, list[str]]:
 
     if mode == MODE_AUDIO_TO_VIDEO:
         if not visual_paths:
-            reasons.append("needs_local_visual_asset")
+            reasons.append(VISUAL_AUTOFILL_REASON)
         return (STATUS_NEEDS_INPUT if reasons else STATUS_READY_TO_SUBMIT), reasons
 
     if mode == MODE_SPEAKER_VIDEO_TO_ENHANCED_VIDEO:
@@ -277,6 +385,7 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
                 "duration_seconds": intent["duration_seconds"],
                 "format": intent["format"],
                 "preset": intent["preset"],
+                "visual_autofill": deepcopy(intent.get("visual_autofill", {})),
                 "external_providers_allowed": False,
                 "ai_generation_allowed": False,
                 "asset_hub_api_allowed": False,
@@ -297,11 +406,18 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
     return job
 
 
-def compile_job_intent_to_mpt_spec(intent: dict[str, Any]) -> dict[str, Any]:
+def compile_job_intent_to_mpt_spec(
+    intent: dict[str, Any],
+    *,
+    project_root: str | Path | None = None,
+) -> dict[str, Any]:
     """Compile a valid intent to a side-effect-free MPT-compatible spec."""
 
     validation = validate_job_intent(intent)
-    normalized = validation["intent"]
+    normalized = _autofill_audio_to_video_visual(
+        validation["intent"],
+        project_root=project_root,
+    )
     if not validation["ok"]:
         return {
             "ok": False,

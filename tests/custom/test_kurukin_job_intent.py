@@ -1,5 +1,6 @@
 import socket
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -75,12 +76,14 @@ class TestKurukinJobIntent(unittest.TestCase):
                 "mode": MODE_AUDIO_TO_VIDEO,
                 "audio_path": "https://example.com/audio.mp3",
                 "video_path": "http://example.com/video.mp4",
+                "visual_path": "https://example.com/visual.png",
             }
         )
 
         fields = {error["field"] for error in result["errors"]}
         self.assertIn("audio_path", fields)
         self.assertIn("video_path", fields)
+        self.assertIn("visual_path", fields)
 
     def test_duration_out_of_range_fails(self):
         low = validate_job_intent(
@@ -135,6 +138,66 @@ class TestKurukinJobIntent(unittest.TestCase):
         self.assertEqual(params["custom_audio_file"], "storage/local_audios/audio.mp3")
         self.assertEqual(params["video_materials"][0]["url"], "storage/local_videos/visual.mp4")
 
+    def test_visual_path_alias_can_supply_audio_to_video_visual(self):
+        result = compile_job_intent_to_mpt_spec(
+            {
+                "mode": MODE_AUDIO_TO_VIDEO,
+                "audio_path": "storage/local_audios/audio.mp3",
+                "visual_path": "storage/local_videos/visual.mp4",
+            }
+        )
+
+        params = result["mpt_spec"]["mpt_params"]
+        self.assertEqual(result["status"], STATUS_READY_TO_SUBMIT)
+        self.assertEqual(result["intent"]["video_path"], "storage/local_videos/visual.mp4")
+        self.assertEqual(params["video_materials"][0]["url"], "storage/local_videos/visual.mp4")
+
+    def test_audio_to_video_audio_only_autofills_existing_local_visual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            visual_dir = Path(tmp) / "storage" / "local_videos"
+            visual_dir.mkdir(parents=True)
+            (visual_dir / "auto_visual.mp4").write_bytes(b"local visual placeholder")
+
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_AUDIO_TO_VIDEO,
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "topic": "Audio only intent",
+                },
+                project_root=tmp,
+            )
+
+        params = result["mpt_spec"]["mpt_params"]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], STATUS_READY_TO_SUBMIT)
+        self.assertEqual(result["reasons"], [])
+        self.assertEqual(result["intent"]["video_path"], "storage/local_videos/auto_visual.mp4")
+        self.assertEqual(
+            result["intent"]["visual_autofill"]["source"],
+            "audio_to_video_local_autofill",
+        )
+        self.assertEqual(params["video_source"], "local")
+        self.assertEqual(
+            params["video_materials"][0]["url"],
+            "storage/local_videos/auto_visual.mp4",
+        )
+
+    def test_audio_to_video_audio_only_needs_input_without_local_visual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_AUDIO_TO_VIDEO,
+                    "audio_path": "storage/local_audios/audio.mp3",
+                },
+                project_root=tmp,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], STATUS_NEEDS_INPUT)
+        self.assertIn("needs_local_visual_asset", result["reasons"])
+        self.assertEqual(result["intent"]["video_path"], "")
+        self.assertEqual(result["mpt_spec"]["mpt_params"]["video_materials"], [])
+
     def test_speaker_video_mode_is_not_ready_without_audio_extract(self):
         result = compile_job_intent_to_mpt_spec(
             {
@@ -166,9 +229,14 @@ class TestKurukinJobIntent(unittest.TestCase):
         forbidden = (
             "openai",
             "elevenlabs",
+            "voice.",
+            "voice.create",
+            "text_to_speech",
             "pexels",
             "pixabay",
             "coverr",
+            "asset_hub_manifest",
+            "load_asset_hub",
             "requests.",
             "urlopen",
             "/api/v1/videos",

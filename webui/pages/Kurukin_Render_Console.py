@@ -1098,9 +1098,12 @@ def render_job_intent_step():
         )
     with right:
         st.text_input(
-            "video_path",
+            "video_path (opcional para audio_to_video)",
             key="job_intent_video_path",
             placeholder="storage/local_videos/visual.mp4",
+        )
+        st.caption(
+            "Si no pasas video_path, Kurukin intentará usar un visual local automático."
         )
         st.text_input("language", key="job_intent_language")
         st.number_input(
@@ -1159,6 +1162,9 @@ def render_job_intent_step():
 
     if compiled:
         _job_intent_result_block(compiled)
+        resolved_visual = (compiled.get("intent") or {}).get("video_path", "")
+        if resolved_visual:
+            st.caption(f"Visual local resuelto: {resolved_visual}")
         with st.expander("Spec MPT preparada por intención", expanded=False):
             st.json(compiled.get("mpt_spec") or {})
         if ready_to_submit and not submit_enabled:
