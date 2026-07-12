@@ -41,6 +41,7 @@ from app.custom.kurukin_job_adapter import (  # noqa: E402
     DEFAULT_LOCAL_SUBTITLES_DIR,
     DEFAULT_LOCAL_VIDEOS_DIR,
 )
+from app.custom.kurukin_batch_intents import enqueue_audio_batch_intents  # noqa: E402
 from app.custom.kurukin_job_queue import (  # noqa: E402
     AROLL_BROLL_QUEUE_FLAG,
     CONTAINER_API_BASE_URL,
@@ -474,6 +475,15 @@ def _initialize_form_state():
     st.session_state.setdefault("job_intent_duration_seconds", 45)
     st.session_state.setdefault("job_intent_format", "vertical")
     st.session_state.setdefault("job_intent_preset", "educational")
+    st.session_state.setdefault("batch_audio_folder", "")
+    st.session_state.setdefault("batch_audio_paths", "")
+    st.session_state.setdefault("batch_audio_topic", "")
+    st.session_state.setdefault("batch_audio_task_id_prefix", "kurukin-batch-audio")
+    st.session_state.setdefault("batch_audio_language", "es")
+    st.session_state.setdefault("batch_audio_duration_seconds", 45)
+    st.session_state.setdefault("batch_audio_format", "vertical")
+    st.session_state.setdefault("batch_audio_preset", "educational")
+    st.session_state.setdefault("batch_audio_max_items", 10)
 
 
 def _current_manifest_path():
@@ -1056,6 +1066,15 @@ def _build_job_intent_from_state():
     }
 
 
+def _batch_audio_paths_from_state():
+    value = st.session_state.get("batch_audio_paths", "")
+    return [
+        line.strip()
+        for line in str(value or "").replace(",", "\n").splitlines()
+        if line.strip()
+    ]
+
+
 def _job_intent_result_block(result):
     status = result.get("status") or "-"
     if status == STATUS_READY_TO_SUBMIT:
@@ -1213,6 +1232,99 @@ def render_job_intent_step():
     if queue_result:
         with st.expander("Resultado cola por intención", expanded=False):
             st.json(queue_result)
+
+
+def render_batch_audio_intent_step():
+    st.markdown("### Crear lote desde audios")
+    left, right = st.columns([1, 1])
+    with left:
+        st.text_input(
+            "audio_folder",
+            key="batch_audio_folder",
+            placeholder="storage/local_audios",
+        )
+        st.text_area(
+            "audio_paths",
+            key="batch_audio_paths",
+            height=96,
+            placeholder="storage/local_audios/audio-1.mp3\nstorage/local_audios/audio-2.wav",
+        )
+        st.text_input("topic lote", key="batch_audio_topic")
+        st.text_input("task_id_prefix", key="batch_audio_task_id_prefix")
+    with right:
+        st.text_input("language lote", key="batch_audio_language")
+        st.number_input(
+            "duration_seconds lote",
+            min_value=4,
+            max_value=300,
+            step=1,
+            key="batch_audio_duration_seconds",
+        )
+        st.selectbox("format lote", JOB_INTENT_FORMATS, key="batch_audio_format")
+        st.text_input("preset lote", key="batch_audio_preset")
+        st.number_input(
+            "max_items",
+            min_value=1,
+            max_value=10,
+            step=1,
+            key="batch_audio_max_items",
+        )
+
+    if st.button("Agregar lote a cola", key="batch_audio_enqueue"):
+        result = enqueue_audio_batch_intents(
+            audio_folder=st.session_state.get("batch_audio_folder", ""),
+            audio_paths=_batch_audio_paths_from_state(),
+            topic=st.session_state.get("batch_audio_topic", ""),
+            task_id_prefix=st.session_state.get("batch_audio_task_id_prefix", ""),
+            language=st.session_state.get("batch_audio_language", "es"),
+            duration_seconds=int(
+                st.session_state.get("batch_audio_duration_seconds", 45)
+            ),
+            format=st.session_state.get("batch_audio_format", "vertical"),
+            preset=st.session_state.get("batch_audio_preset", "educational"),
+            max_items=int(st.session_state.get("batch_audio_max_items", 10)),
+        )
+        st.session_state["batch_audio_last_queue_result"] = result
+        if result.get("created"):
+            first_item = (result.get("items") or [{}])[0]
+            st.session_state["last_enqueued_job_id"] = str(
+                first_item.get("task_id") or ""
+            )
+            st.session_state["last_enqueued_pending_path"] = str(
+                first_item.get("queue_item_path") or ""
+            )
+            st.session_state["last_enqueued_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            st.success(f"Lote agregado a cola: {result.get('created')} creado(s).")
+        else:
+            st.warning("No se creó ningún item de lote.")
+
+    batch_result = st.session_state.get("batch_audio_last_queue_result")
+    if batch_result:
+        st.caption(
+            f"created: {batch_result.get('created', 0)} | "
+            f"skipped: {batch_result.get('skipped', 0)}"
+        )
+        items = batch_result.get("items") or []
+        if items:
+            st.dataframe(
+                [
+                    {
+                        "task_id": item.get("task_id", ""),
+                        "status": item.get("status", ""),
+                        "audio_path": item.get("audio_path", ""),
+                        "resolved_visual_path": item.get("resolved_visual_path", ""),
+                        "queue_item_path": item.get("queue_item_path", ""),
+                    }
+                    for item in items
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        if batch_result.get("errors"):
+            with st.expander("Errores lote", expanded=False):
+                st.json(batch_result.get("errors") or [])
 
 
 def _current_aroll_broll_config():
@@ -1773,6 +1885,7 @@ def _new_render_view():
         return
 
     render_job_intent_step()
+    render_batch_audio_intent_step()
     _first_video_guide()
     _progress_steps()
     _recommended_test_mode_block()
