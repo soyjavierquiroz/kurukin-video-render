@@ -438,6 +438,85 @@ class TestKurukinJobIntent(unittest.TestCase):
         )
         self.assertIn("low_relevance_visual_allowed", result["mpt_spec"]["warnings"])
 
+    def test_topic_to_video_low_relevance_can_prepare_mpt_stock_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            visual_dir = Path(tmp) / "storage" / "local_videos"
+            visual_dir.mkdir(parents=True)
+            (visual_dir / "workspace-mistico-velas.mp4").write_bytes(b"visual")
+
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_TOPIC_TO_VIDEO,
+                    "topic": "5 errores al comprar una casa usada",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "allow_mpt_stock_visuals": True,
+                    "preferred_stock_source": "pexels",
+                    "duration_seconds": 4,
+                    "preset": "educational",
+                },
+                project_root=tmp,
+            )
+
+        params = result["mpt_spec"]["mpt_params"]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], STATUS_READY_TO_SUBMIT)
+        self.assertEqual(result["intent"]["visual_source_mode"], "mpt_stock")
+        self.assertEqual(result["intent"]["stock_source"], "pexels")
+        self.assertEqual(params["video_source"], "pexels")
+        self.assertEqual(params["video_materials"], [])
+        self.assertIn("5 errores al comprar una casa usada", params["video_terms"])
+        self.assertIn("checklist", params["video_terms"])
+        self.assertIn(
+            "mpt_stock_visuals_allowed_provider_on_render",
+            result["mpt_spec"]["warnings"],
+        )
+
+    def test_topic_to_video_without_local_visual_can_prepare_mpt_stock_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_TOPIC_TO_VIDEO,
+                    "topic": "5 errores al comprar una casa usada",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "allow_mpt_stock_visuals": True,
+                    "preferred_stock_source": "pixabay",
+                    "duration_seconds": 4,
+                    "preset": "educational",
+                },
+                project_root=tmp,
+            )
+
+        params = result["mpt_spec"]["mpt_params"]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["intent"]["visual_source_mode"], "mpt_stock")
+        self.assertEqual(result["intent"]["stock_source"], "pixabay")
+        self.assertEqual(params["video_source"], "pixabay")
+        self.assertEqual(params["video_materials"], [])
+
+    def test_topic_to_video_mpt_stock_respects_manual_stock_terms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            visual_dir = Path(tmp) / "storage" / "local_videos"
+            visual_dir.mkdir(parents=True)
+            (visual_dir / "workspace-mistico-velas.mp4").write_bytes(b"visual")
+
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_TOPIC_TO_VIDEO,
+                    "topic": "5 errores al comprar una casa usada",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "allow_mpt_stock_visuals": True,
+                    "preferred_stock_source": "pexels",
+                    "stock_terms": "real estate inspection, home checklist",
+                    "duration_seconds": 4,
+                    "preset": "educational",
+                },
+                project_root=tmp,
+            )
+
+        terms = result["mpt_spec"]["mpt_params"]["video_terms"]
+        self.assertEqual(terms[0], "real estate inspection")
+        self.assertEqual(terms[1], "home checklist")
+
     def test_topic_to_video_local_picker_uses_topic_plan_keywords(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -523,13 +602,15 @@ class TestKurukinJobIntent(unittest.TestCase):
             "voice.",
             "voice.create",
             "text_to_speech",
-            "pexels",
-            "pixabay",
-            "coverr",
+            "search_videos_pexels",
+            "search_videos_pixabay",
+            "search_videos_coverr",
+            "create_pexels_downloader",
             "asset_hub_manifest",
             "load_asset_hub",
             "requests.",
             "urlopen",
+            "download",
             "/api/v1/videos",
         )
         for item in forbidden:
