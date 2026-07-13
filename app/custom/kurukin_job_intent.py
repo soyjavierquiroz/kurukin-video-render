@@ -8,6 +8,7 @@ from typing import Any
 
 from app.custom.kurukin_local_visual_picker import (
     LOCAL_PICKER_SOURCE,
+    LOW_RELEVANCE_CONFIDENCE,
     pick_local_visual_for_intent,
 )
 from app.custom.kurukin_topic_planner import build_topic_script_plan
@@ -41,6 +42,25 @@ FORMAT_TO_MPT_ASPECT = {
 MIN_DURATION_SECONDS = 4
 MAX_DURATION_SECONDS = 300
 VISUAL_AUTOFILL_REASON = "needs_local_visual_asset"
+VISUAL_RELEVANCE_REASON = "needs_relevant_local_visual_asset"
+LOW_RELEVANCE_ALLOWED_WARNING = "low_relevance_visual_allowed"
+AUDIO_STRONG_VISUAL_TOPIC_TOKENS = {
+    "casa",
+    "casas",
+    "comprar",
+    "compra",
+    "errores",
+    "error",
+    "inmobiliaria",
+    "inmobiliario",
+    "propiedad",
+    "propiedades",
+    "usada",
+    "usadas",
+    "vivienda",
+    "viviendas",
+    "checklist",
+}
 
 
 def _clean_text(value: Any) -> str:
@@ -74,6 +94,12 @@ def _duration_seconds(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return DEFAULT_DURATION_SECONDS
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return _clean_text(value).lower() in {"1", "true", "yes", "on"}
 
 
 def _error(field: str, message: str, error_type: str = "intent_validation") -> dict[str, str]:
@@ -165,6 +191,27 @@ def _autofill_audio_to_video_visual(
     normalized["visual_path"] = visual_path
     normalized["resolved_visual_path"] = visual_path
     normalized["visual_autofill_source"] = LOCAL_PICKER_SOURCE
+    normalized["visual_relevance_score"] = picked.get("visual_relevance_score", 0)
+    normalized["visual_relevance_confidence"] = _clean_text(
+        picked.get("visual_relevance_confidence")
+    )
+    normalized["visual_relevance_reason"] = _clean_text(
+        picked.get("visual_relevance_reason")
+    )
+    normalized["visual_relevance_matches"] = list(
+        picked.get("visual_relevance_matches") or []
+    )
+    normalized["visual_relevance_strong_matches"] = list(
+        picked.get("visual_relevance_strong_matches") or []
+    )
+    normalized["visual_relevance_topic_tokens"] = list(
+        picked.get("visual_relevance_topic_tokens") or []
+    )
+    if (
+        normalized["visual_relevance_confidence"] == LOW_RELEVANCE_CONFIDENCE
+        and normalized.get("allow_low_relevance_visual")
+    ):
+        normalized["visual_relevance_warning"] = LOW_RELEVANCE_ALLOWED_WARNING
     normalized["visual_autofill"] = {
         "source": LOCAL_PICKER_SOURCE,
         "path": visual_path,
@@ -214,6 +261,19 @@ def normalize_job_intent(intent: dict[str, Any]) -> dict[str, Any]:
     )
     normalized["visual_autofill_source"] = _clean_text(
         source.get("visual_autofill_source")
+    )
+    normalized["visual_relevance_score"] = source.get("visual_relevance_score", 0)
+    normalized["visual_relevance_confidence"] = _clean_text(
+        source.get("visual_relevance_confidence")
+    )
+    normalized["visual_relevance_reason"] = _clean_text(
+        source.get("visual_relevance_reason")
+    )
+    normalized["visual_relevance_warning"] = _clean_text(
+        source.get("visual_relevance_warning")
+    )
+    normalized["allow_low_relevance_visual"] = _as_bool(
+        source.get("allow_low_relevance_visual")
     )
     normalized["video_path"] = _clean_text(source.get("video_path")) or normalized[
         "visual_path"
@@ -296,17 +356,29 @@ def _readiness_for_intent(intent: dict[str, Any]) -> tuple[str, list[str]]:
     mode = intent["mode"]
     reasons: list[str] = []
     visual_paths = _local_visual_paths(intent)
+    low_relevance_autofill = (
+        intent.get("visual_autofill_source") == LOCAL_PICKER_SOURCE
+        and intent.get("visual_relevance_confidence") == LOW_RELEVANCE_CONFIDENCE
+        and not intent.get("allow_low_relevance_visual")
+    )
 
     if mode == MODE_TOPIC_TO_VIDEO:
         if not intent.get("audio_path"):
             reasons.append("needs_audio_or_tts")
         elif not visual_paths:
             reasons.append("needs_local_visual_asset")
+        elif low_relevance_autofill:
+            reasons.append(VISUAL_RELEVANCE_REASON)
         return (STATUS_NEEDS_INPUT if reasons else STATUS_READY_TO_SUBMIT), reasons
 
     if mode == MODE_AUDIO_TO_VIDEO:
         if not visual_paths:
             reasons.append(VISUAL_AUTOFILL_REASON)
+        elif low_relevance_autofill and any(
+            token in AUDIO_STRONG_VISUAL_TOPIC_TOKENS
+            for token in _as_list(intent.get("visual_relevance_topic_tokens"))
+        ):
+            reasons.append(VISUAL_RELEVANCE_REASON)
         return (STATUS_NEEDS_INPUT if reasons else STATUS_READY_TO_SUBMIT), reasons
 
     if mode == MODE_SPEAKER_VIDEO_TO_ENHANCED_VIDEO:
@@ -370,6 +442,12 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
                 "preset": intent["preset"],
                 "resolved_visual_path": intent.get("resolved_visual_path", ""),
                 "visual_autofill_source": intent.get("visual_autofill_source", ""),
+                "visual_relevance_score": intent.get("visual_relevance_score", 0),
+                "visual_relevance_confidence": intent.get(
+                    "visual_relevance_confidence", ""
+                ),
+                "visual_relevance_reason": intent.get("visual_relevance_reason", ""),
+                "visual_relevance_warning": intent.get("visual_relevance_warning", ""),
                 "visual_autofill": deepcopy(intent.get("visual_autofill", {})),
                 "topic_plan": deepcopy(intent.get("topic_plan", {})),
                 "topic_plan_summary": {
@@ -431,6 +509,12 @@ def compile_job_intent_to_mpt_spec(
         if reason not in gaps:
             gaps.append(reason)
     mpt_spec["gaps"] = gaps
+    if normalized.get("visual_relevance_warning"):
+        warnings = list(mpt_spec.get("warnings") or [])
+        warning = normalized["visual_relevance_warning"]
+        if warning not in warnings:
+            warnings.append(warning)
+        mpt_spec["warnings"] = warnings
     metadata = mpt_spec.setdefault("kurukin_metadata", {})
     metadata["job_intent_status"] = status
     metadata["job_intent_reasons"] = list(reasons)

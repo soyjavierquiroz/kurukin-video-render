@@ -217,6 +217,55 @@ class TestKurukinJobIntent(unittest.TestCase):
         self.assertEqual(picked["path"], "storage/local_videos/casa-usada-9x16.mp4")
         self.assertEqual(picked["source"], "local_picker_v1")
 
+    def test_local_visual_picker_reports_relevance_confidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            visual = root / "storage" / "local_videos" / "casa-usada-vertical.mp4"
+            visual.parent.mkdir(parents=True)
+            visual.write_bytes(b"video")
+
+            picked = pick_local_visual_for_intent(
+                {
+                    "topic": "5 errores al comprar una casa usada",
+                    "topic_plan": {
+                        "visual_keywords": [
+                            "5 errores al comprar una casa usada",
+                            "checklist",
+                        ]
+                    },
+                    "format": "vertical",
+                },
+                project_root=root,
+            )
+
+        self.assertEqual(picked["visual_relevance_confidence"], "high")
+        self.assertGreaterEqual(picked["visual_relevance_score"], 60)
+        self.assertIn("casa", picked["visual_relevance_matches"])
+
+    def test_local_visual_picker_reports_low_relevance_without_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            visual = root / "storage" / "local_videos" / "workspace-mistico.mp4"
+            visual.parent.mkdir(parents=True)
+            visual.write_bytes(b"video")
+
+            picked = pick_local_visual_for_intent(
+                {
+                    "topic": "5 errores al comprar una casa usada",
+                    "topic_plan": {
+                        "visual_keywords": [
+                            "5 errores al comprar una casa usada",
+                            "checklist",
+                        ]
+                    },
+                },
+                project_root=root,
+            )
+
+        self.assertEqual(picked["visual_relevance_confidence"], "low")
+        self.assertLess(picked["visual_relevance_score"], 0)
+        self.assertIn("no_topic_keyword_match", picked["visual_relevance_reason"])
+
     def test_visual_path_alias_can_supply_audio_to_video_visual(self):
         result = compile_job_intent_to_mpt_spec(
             {
@@ -295,6 +344,8 @@ class TestKurukinJobIntent(unittest.TestCase):
             "storage/local_videos/casa-usada-vertical.mp4",
         )
         self.assertEqual(result["intent"]["visual_autofill_source"], "local_picker_v1")
+        self.assertEqual(result["intent"]["visual_relevance_confidence"], "high")
+        self.assertGreaterEqual(result["intent"]["visual_relevance_score"], 60)
         self.assertEqual(
             result["mpt_spec"]["mpt_params"]["custom_audio_file"],
             "storage/local_audios/audio.mp3",
@@ -316,7 +367,7 @@ class TestKurukinJobIntent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             visual_dir = Path(tmp) / "storage" / "local_videos"
             visual_dir.mkdir(parents=True)
-            (visual_dir / "propio-vertical.mp4").write_bytes(b"visual")
+            (visual_dir / "casa-usada-propio-vertical.mp4").write_bytes(b"visual")
 
             result = compile_job_intent_to_mpt_spec(
                 {
@@ -336,6 +387,56 @@ class TestKurukinJobIntent(unittest.TestCase):
             result["mpt_spec"]["mpt_params"]["video_script"],
             provided_script,
         )
+
+    def test_topic_to_video_low_relevance_visual_needs_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            visual_dir = Path(tmp) / "storage" / "local_videos"
+            visual_dir.mkdir(parents=True)
+            (visual_dir / "workspace-mistico-velas.mp4").write_bytes(b"visual")
+
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_TOPIC_TO_VIDEO,
+                    "topic": "5 errores al comprar una casa usada",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "duration_seconds": 4,
+                    "preset": "educational",
+                },
+                project_root=tmp,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], STATUS_NEEDS_INPUT)
+        self.assertIn("needs_relevant_local_visual_asset", result["reasons"])
+        self.assertEqual(result["intent"]["visual_relevance_confidence"], "low")
+        self.assertIn("visual_relevance_score", result["intent"])
+
+    def test_topic_to_video_low_relevance_visual_can_be_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            visual_dir = Path(tmp) / "storage" / "local_videos"
+            visual_dir.mkdir(parents=True)
+            (visual_dir / "workspace-mistico-velas.mp4").write_bytes(b"visual")
+
+            result = compile_job_intent_to_mpt_spec(
+                {
+                    "mode": MODE_TOPIC_TO_VIDEO,
+                    "topic": "5 errores al comprar una casa usada",
+                    "audio_path": "storage/local_audios/audio.mp3",
+                    "allow_low_relevance_visual": True,
+                    "duration_seconds": 4,
+                    "preset": "educational",
+                },
+                project_root=tmp,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], STATUS_READY_TO_SUBMIT)
+        self.assertEqual(result["intent"]["visual_relevance_confidence"], "low")
+        self.assertEqual(
+            result["intent"]["visual_relevance_warning"],
+            "low_relevance_visual_allowed",
+        )
+        self.assertIn("low_relevance_visual_allowed", result["mpt_spec"]["warnings"])
 
     def test_topic_to_video_local_picker_uses_topic_plan_keywords(self):
         with tempfile.TemporaryDirectory() as tmp:
