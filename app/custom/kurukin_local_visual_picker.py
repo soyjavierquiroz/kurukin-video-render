@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -31,9 +32,61 @@ VERTICAL_NAME_HINTS = (
     "9x16",
 )
 
+_STOPWORDS = {
+    "a",
+    "al",
+    "and",
+    "como",
+    "con",
+    "de",
+    "del",
+    "el",
+    "en",
+    "for",
+    "la",
+    "las",
+    "lo",
+    "los",
+    "para",
+    "por",
+    "que",
+    "the",
+    "una",
+    "un",
+    "used",
+    "y",
+}
+
+_STRONG_TOPIC_TOKENS = {
+    "casa",
+    "casas",
+    "comprar",
+    "compra",
+    "errores",
+    "error",
+    "inmobiliaria",
+    "inmobiliario",
+    "propiedad",
+    "propiedades",
+    "usada",
+    "usadas",
+    "vivienda",
+    "viviendas",
+    "checklist",
+}
+
+LOW_RELEVANCE_CONFIDENCE = "low"
+MEDIUM_RELEVANCE_CONFIDENCE = "medium"
+HIGH_RELEVANCE_CONFIDENCE = "high"
+
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _normalize_for_match(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", _clean_text(value).lower())
+    return "".join(char for char in text if not unicodedata.combining(char))
 
 
 def _allowed_dirs(extra_dirs: list[str] | None = None) -> tuple[Path, ...]:
@@ -104,6 +157,15 @@ def _keyword_values(value: Any) -> list[str]:
     return [_clean_text(value)] if _clean_text(value) else []
 
 
+def _tokens_from_text(value: Any) -> set[str]:
+    text = _normalize_for_match(value)
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text)
+        if len(token) >= 3 and token not in _STOPWORDS
+    }
+
+
 def _keyword_tokens(intent: dict[str, Any]) -> set[str]:
     values = [
         _clean_text(intent.get(key))
@@ -114,11 +176,69 @@ def _keyword_tokens(intent: dict[str, Any]) -> set[str]:
     if isinstance(topic_plan, dict):
         values.extend(_keyword_values(topic_plan.get("visual_keywords")))
 
-    text = " ".join(value for value in values if value).lower()
+    return _tokens_from_text(" ".join(value for value in values if value))
+
+
+def _topic_tokens(intent: dict[str, Any]) -> set[str]:
+    values = [_clean_text(intent.get("topic"))]
+    topic_plan = intent.get("topic_plan")
+    if isinstance(topic_plan, dict):
+        values.extend(_keyword_values(topic_plan.get("visual_keywords")))
+    values.extend(_keyword_values(intent.get("visual_keywords")))
+    return _tokens_from_text(" ".join(value for value in values if value))
+
+
+def _relevance_for_candidate(
+    candidate: dict[str, Any],
+    *,
+    intent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_intent = intent or {}
+    topic_tokens = sorted(_topic_tokens(source_intent))
+    path_text = _normalize_for_match(candidate.get("path", ""))
+    path_tokens = _tokens_from_text(path_text)
+    matched_tokens = sorted(token for token in topic_tokens if token in path_tokens)
+    strong_tokens = sorted(token for token in topic_tokens if token in _STRONG_TOPIC_TOKENS)
+    strong_matches = sorted(token for token in matched_tokens if token in _STRONG_TOPIC_TOKENS)
+
+    score = 0
+    reasons: list[str] = []
+    if matched_tokens:
+        score += 18 * len(matched_tokens)
+        reasons.append("filename_matches_topic_keywords")
+    if strong_matches:
+        score += 18 * len(strong_matches)
+        reasons.append("filename_matches_strong_topic_keywords")
+
+    if any(hint in path_text for hint in VERTICAL_NAME_HINTS):
+        score += 8
+        reasons.append("vertical_name_hint")
+
+    if topic_tokens and not matched_tokens:
+        score -= 25
+        reasons.append("no_topic_keyword_match")
+    if strong_tokens and not strong_matches:
+        score -= 20
+        reasons.append("no_strong_topic_keyword_match")
+
+    if score >= 60:
+        confidence = HIGH_RELEVANCE_CONFIDENCE
+    elif score >= 25 or matched_tokens:
+        confidence = MEDIUM_RELEVANCE_CONFIDENCE
+    else:
+        confidence = LOW_RELEVANCE_CONFIDENCE
+
+    if not topic_tokens:
+        confidence = MEDIUM_RELEVANCE_CONFIDENCE
+        reasons.append("no_topic_keywords_available")
+
     return {
-        token
-        for token in re.split(r"[^a-z0-9]+", text)
-        if len(token) >= 3
+        "visual_relevance_score": score,
+        "visual_relevance_confidence": confidence,
+        "visual_relevance_reason": ", ".join(reasons) or "topic_keyword_check",
+        "visual_relevance_matches": matched_tokens,
+        "visual_relevance_strong_matches": strong_matches,
+        "visual_relevance_topic_tokens": topic_tokens,
     }
 
 
@@ -131,7 +251,7 @@ def _candidate_score(
     reasons = candidate.setdefault("score_reasons", [])
 
     if candidate.get("type") == "video":
-        score += 100
+        score += 170
         reasons.append("video")
     else:
         score += 30
@@ -143,6 +263,9 @@ def _candidate_score(
     if matches:
         score += 20 * len(matches)
         reasons.append("name_matches_intent")
+
+    relevance = _relevance_for_candidate(candidate, intent=intent)
+    score += int(relevance["visual_relevance_score"])
 
     if any(hint in name for hint in VERTICAL_NAME_HINTS):
         score += 15
@@ -232,6 +355,7 @@ def pick_local_visual_for_intent(
     for candidate in candidates:
         item = dict(candidate)
         item["score"] = _candidate_score(item, intent=intent)
+        item.update(_relevance_for_candidate(item, intent=intent))
         scored.append(item)
 
     scored.sort(

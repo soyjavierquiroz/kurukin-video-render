@@ -477,6 +477,7 @@ def _initialize_form_state():
     st.session_state.setdefault("job_intent_duration_seconds", 45)
     st.session_state.setdefault("job_intent_format", "vertical")
     st.session_state.setdefault("job_intent_preset", "educational")
+    st.session_state.setdefault("job_intent_allow_low_relevance_visual", False)
     st.session_state.setdefault("batch_audio_folder", "")
     st.session_state.setdefault("batch_audio_paths", "")
     st.session_state.setdefault("batch_audio_topic", "")
@@ -1068,6 +1069,9 @@ def _build_job_intent_from_state():
         ),
         "format": st.session_state.get("job_intent_format", "vertical"),
         "preset": st.session_state.get("job_intent_preset", "educational"),
+        "allow_low_relevance_visual": bool(
+            st.session_state.get("job_intent_allow_low_relevance_visual", False)
+        ),
     }
 
 
@@ -1162,6 +1166,10 @@ def render_job_intent_step():
         st.caption(
             "Si no pasas video_path, Kurukin intentará usar un visual local automático."
         )
+        st.checkbox(
+            "Permitir visual local de baja relevancia",
+            key="job_intent_allow_low_relevance_visual",
+        )
         st.text_input("language", key="job_intent_language")
         st.number_input(
             "duration_seconds",
@@ -1252,6 +1260,22 @@ def render_job_intent_step():
         visual_source = compiled_intent.get("visual_autofill_source", "")
         if visual_source:
             st.caption(f"Source visual: {visual_source}")
+        relevance_confidence = compiled_intent.get("visual_relevance_confidence", "")
+        if relevance_confidence:
+            st.caption(
+                "Visual relevance: "
+                f"{compiled_intent.get('visual_relevance_score', 0)} "
+                f"({relevance_confidence})"
+            )
+            st.caption(
+                "Visual relevance reason: "
+                f"{compiled_intent.get('visual_relevance_reason', '-')}"
+            )
+        if "needs_relevant_local_visual_asset" in (compiled.get("reasons") or []):
+            st.warning(
+                "No encontré un visual local suficientemente relacionado. "
+                "Agrega video_path/visual_path o permite fallback."
+            )
         with st.expander("Spec MPT preparada por intención", expanded=False):
             st.json(compiled.get("mpt_spec") or {})
         if ready_to_submit and not submit_enabled:
