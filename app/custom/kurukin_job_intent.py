@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import re
 from typing import Any
 
 from app.custom.kurukin_local_visual_picker import (
@@ -44,6 +45,12 @@ MAX_DURATION_SECONDS = 300
 VISUAL_AUTOFILL_REASON = "needs_local_visual_asset"
 VISUAL_RELEVANCE_REASON = "needs_relevant_local_visual_asset"
 LOW_RELEVANCE_ALLOWED_WARNING = "low_relevance_visual_allowed"
+STOCK_VISUAL_WARNING = "mpt_stock_visuals_allowed_provider_on_render"
+VISUAL_SOURCE_MODE_LOCAL_ONLY = "local_only"
+VISUAL_SOURCE_MODE_LOCAL_FIRST = "local_first"
+VISUAL_SOURCE_MODE_MPT_STOCK = "mpt_stock"
+DEFAULT_PREFERRED_STOCK_SOURCE = "pexels"
+ALLOWED_PREFERRED_STOCK_SOURCES = {"pexels", "pixabay", "local_first"}
 AUDIO_STRONG_VISUAL_TOPIC_TOKENS = {
     "casa",
     "casas",
@@ -100,6 +107,64 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return _clean_text(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _clean_visual_source_mode(value: Any) -> str:
+    mode = _clean_text(value).lower()
+    if mode in {
+        VISUAL_SOURCE_MODE_LOCAL_ONLY,
+        VISUAL_SOURCE_MODE_LOCAL_FIRST,
+        VISUAL_SOURCE_MODE_MPT_STOCK,
+    }:
+        return mode
+    return VISUAL_SOURCE_MODE_LOCAL_ONLY
+
+
+def _clean_preferred_stock_source(value: Any) -> str:
+    source = _clean_text(value).lower()
+    return (
+        source
+        if source in ALLOWED_PREFERRED_STOCK_SOURCES
+        else DEFAULT_PREFERRED_STOCK_SOURCE
+    )
+
+
+def _stock_source_for_intent(intent: dict[str, Any]) -> str:
+    preferred = _clean_preferred_stock_source(intent.get("preferred_stock_source"))
+    return (
+        preferred
+        if preferred in {"pexels", "pixabay"}
+        else DEFAULT_PREFERRED_STOCK_SOURCE
+    )
+
+
+def _manual_stock_terms(value: Any) -> list[str]:
+    if isinstance(value, str):
+        items = [item.strip() for item in re.split(r"[\n,;]+", value) if item.strip()]
+    else:
+        items = _as_list(value)
+    terms: list[str] = []
+    for item in items:
+        term = _clean_text(item)
+        if term and term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _derived_stock_terms(intent: dict[str, Any]) -> list[str]:
+    terms = _manual_stock_terms(intent.get("stock_terms"))
+    for value in _as_list(_as_dict(intent.get("topic_plan")).get("visual_keywords")):
+        term = _clean_text(value)
+        if term and term not in terms:
+            terms.append(term)
+    topic = _clean_text(intent.get("topic"))
+    if topic and topic not in terms:
+        terms.append(topic)
+    for value in _as_list(intent.get("visual_keywords")):
+        term = _clean_text(value)
+        if term and term not in terms:
+            terms.append(term)
+    return terms[:10]
 
 
 def _error(field: str, message: str, error_type: str = "intent_validation") -> dict[str, str]:
@@ -220,6 +285,31 @@ def _autofill_audio_to_video_visual(
     return normalized
 
 
+def _apply_mpt_stock_visual_mode(intent: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(intent)
+    if normalized.get("mode") != MODE_TOPIC_TO_VIDEO:
+        return normalized
+    if not normalized.get("audio_path"):
+        return normalized
+    if not normalized.get("allow_mpt_stock_visuals"):
+        return normalized
+
+    visual_paths = _local_visual_paths(normalized)
+    low_relevance_autofill = (
+        normalized.get("visual_autofill_source") == LOCAL_PICKER_SOURCE
+        and normalized.get("visual_relevance_confidence") == LOW_RELEVANCE_CONFIDENCE
+    )
+    if visual_paths and not low_relevance_autofill:
+        normalized["visual_source_mode"] = VISUAL_SOURCE_MODE_LOCAL_FIRST
+        return normalized
+
+    normalized["visual_source_mode"] = VISUAL_SOURCE_MODE_MPT_STOCK
+    normalized["stock_source"] = _stock_source_for_intent(normalized)
+    normalized["stock_terms"] = _derived_stock_terms(normalized)
+    normalized["visual_relevance_warning"] = STOCK_VISUAL_WARNING
+    return normalized
+
+
 def _enrich_topic_to_video_plan(intent: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(intent)
     if normalized.get("mode") != MODE_TOPIC_TO_VIDEO:
@@ -275,6 +365,17 @@ def normalize_job_intent(intent: dict[str, Any]) -> dict[str, Any]:
     normalized["allow_low_relevance_visual"] = _as_bool(
         source.get("allow_low_relevance_visual")
     )
+    normalized["allow_mpt_stock_visuals"] = _as_bool(
+        source.get("allow_mpt_stock_visuals")
+    )
+    normalized["preferred_stock_source"] = _clean_preferred_stock_source(
+        source.get("preferred_stock_source")
+    )
+    normalized["visual_source_mode"] = _clean_visual_source_mode(
+        source.get("visual_source_mode")
+    )
+    normalized["stock_terms"] = _manual_stock_terms(source.get("stock_terms"))
+    normalized["stock_source"] = _clean_text(source.get("stock_source"))
     normalized["video_path"] = _clean_text(source.get("video_path")) or normalized[
         "visual_path"
     ] or normalized["resolved_visual_path"]
@@ -361,10 +462,16 @@ def _readiness_for_intent(intent: dict[str, Any]) -> tuple[str, list[str]]:
         and intent.get("visual_relevance_confidence") == LOW_RELEVANCE_CONFIDENCE
         and not intent.get("allow_low_relevance_visual")
     )
+    uses_mpt_stock_visuals = (
+        intent.get("visual_source_mode") == VISUAL_SOURCE_MODE_MPT_STOCK
+        and bool(intent.get("stock_terms"))
+    )
 
     if mode == MODE_TOPIC_TO_VIDEO:
         if not intent.get("audio_path"):
             reasons.append("needs_audio_or_tts")
+        elif uses_mpt_stock_visuals:
+            pass
         elif not visual_paths:
             reasons.append("needs_local_visual_asset")
         elif low_relevance_autofill:
@@ -409,13 +516,21 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
         if _clean_text(item)
     ]
     mode = intent["mode"]
-    visual_paths = _local_visual_paths(intent)
+    visual_source_mode = intent.get("visual_source_mode") or VISUAL_SOURCE_MODE_LOCAL_ONLY
+    use_mpt_stock_visuals = visual_source_mode == VISUAL_SOURCE_MODE_MPT_STOCK
+    visual_paths = [] if use_mpt_stock_visuals else _local_visual_paths(intent)
+    stock_source = _stock_source_for_intent(intent)
+    stock_terms = _derived_stock_terms(intent)
     job: dict[str, Any] = {
         "job_id": intent.get("task_id") or "",
         "task_id": intent.get("task_id") or "",
         "video_subject": subject,
         "video_script": script,
-        "video_terms": visual_keywords or ([intent["topic"]] if intent.get("topic") else []),
+        "video_terms": (
+            stock_terms
+            if use_mpt_stock_visuals
+            else visual_keywords or ([intent["topic"]] if intent.get("topic") else [])
+        ),
         "video_aspect": FORMAT_TO_MPT_ASPECT.get(intent["format"], "9:16"),
         "video_resolution": "1080p",
         "video_clip_duration": min(10, max(1, int(intent["duration_seconds"]))),
@@ -424,11 +539,12 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
         "custom_audio_file": intent.get("audio_path") or "",
         "subtitle_enabled": False,
         "subtitle_provider": "none",
-        "video_source": "local",
+        "video_source": stock_source if use_mpt_stock_visuals else "local",
+        "stock_source": stock_source if use_mpt_stock_visuals else "",
         "video_materials": _mpt_materials(visual_paths),
         "asset_policy": {
-            "mode": "local_only",
-            "allowed_sources": ["local"],
+            "mode": "open_sources" if use_mpt_stock_visuals else "local_only",
+            "allowed_sources": [stock_source] if use_mpt_stock_visuals else ["local"],
         },
         "metadata": {
             "job_intent": {
@@ -448,6 +564,13 @@ def _build_kurukin_job(intent: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "visual_relevance_reason": intent.get("visual_relevance_reason", ""),
                 "visual_relevance_warning": intent.get("visual_relevance_warning", ""),
+                "allow_mpt_stock_visuals": bool(
+                    intent.get("allow_mpt_stock_visuals")
+                ),
+                "preferred_stock_source": intent.get("preferred_stock_source", ""),
+                "visual_source_mode": visual_source_mode,
+                "stock_source": stock_source if use_mpt_stock_visuals else "",
+                "stock_terms": list(stock_terms) if use_mpt_stock_visuals else [],
                 "visual_autofill": deepcopy(intent.get("visual_autofill", {})),
                 "topic_plan": deepcopy(intent.get("topic_plan", {})),
                 "topic_plan_summary": {
@@ -490,6 +613,7 @@ def compile_job_intent_to_mpt_spec(
         validation["intent"],
         project_root=project_root,
     )
+    normalized = _apply_mpt_stock_visual_mode(normalized)
     if not validation["ok"]:
         return {
             "ok": False,

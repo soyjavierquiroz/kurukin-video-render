@@ -195,6 +195,14 @@ JOB_INTENT_MODE_LABELS = {
     "Presentador a video mejorado": MODE_SPEAKER_VIDEO_TO_ENHANCED_VIDEO,
 }
 JOB_INTENT_FORMATS = ["vertical", "horizontal", "square"]
+JOB_INTENT_STOCK_SOURCE_LABELS = {
+    "Pexels": "pexels",
+    "Pixabay": "pixabay",
+    "Local primero": "local_first",
+}
+JOB_INTENT_STOCK_SOURCE_LABEL_BY_VALUE = {
+    value: key for key, value in JOB_INTENT_STOCK_SOURCE_LABELS.items()
+}
 
 
 def _default_job_id() -> str:
@@ -478,6 +486,9 @@ def _initialize_form_state():
     st.session_state.setdefault("job_intent_format", "vertical")
     st.session_state.setdefault("job_intent_preset", "educational")
     st.session_state.setdefault("job_intent_allow_low_relevance_visual", False)
+    st.session_state.setdefault("job_intent_allow_mpt_stock_visuals", False)
+    st.session_state.setdefault("job_intent_preferred_stock_source", "pexels")
+    st.session_state.setdefault("job_intent_stock_terms", "")
     st.session_state.setdefault("batch_audio_folder", "")
     st.session_state.setdefault("batch_audio_paths", "")
     st.session_state.setdefault("batch_audio_topic", "")
@@ -1072,6 +1083,13 @@ def _build_job_intent_from_state():
         "allow_low_relevance_visual": bool(
             st.session_state.get("job_intent_allow_low_relevance_visual", False)
         ),
+        "allow_mpt_stock_visuals": bool(
+            st.session_state.get("job_intent_allow_mpt_stock_visuals", False)
+        ),
+        "preferred_stock_source": st.session_state.get(
+            "job_intent_preferred_stock_source", "pexels"
+        ),
+        "stock_terms": st.session_state.get("job_intent_stock_terms", ""),
     }
 
 
@@ -1170,6 +1188,24 @@ def render_job_intent_step():
             "Permitir visual local de baja relevancia",
             key="job_intent_allow_low_relevance_visual",
         )
+        st.checkbox(
+            "Permitir stock nativo MPT si no hay visual local relevante",
+            key="job_intent_allow_mpt_stock_visuals",
+        )
+        stock_source_label = st.selectbox(
+            "Fuente stock preferida",
+            list(JOB_INTENT_STOCK_SOURCE_LABELS),
+            index=_index_for_value(
+                JOB_INTENT_STOCK_SOURCE_LABELS,
+                st.session_state.get("job_intent_preferred_stock_source", "pexels"),
+                "pexels",
+            ),
+            key="job_intent_preferred_stock_source_label",
+        )
+        st.session_state["job_intent_preferred_stock_source"] = (
+            JOB_INTENT_STOCK_SOURCE_LABELS[stock_source_label]
+        )
+        st.text_input("Términos stock", key="job_intent_stock_terms")
         st.text_input("language", key="job_intent_language")
         st.number_input(
             "duration_seconds",
@@ -1276,6 +1312,18 @@ def render_job_intent_step():
                 "No encontré un visual local suficientemente relacionado. "
                 "Agrega video_path/visual_path o permite fallback."
             )
+        if compiled_intent.get("visual_source_mode") == "mpt_stock":
+            st.warning(
+                "Spec preparada para stock nativo MPT. Al renderizar puede usar "
+                "proveedor externo según la fuente elegida."
+            )
+            st.caption(f"stock_source: {compiled_intent.get('stock_source', '-')}")
+            stock_terms = compiled_intent.get("stock_terms") or []
+            if stock_terms:
+                st.caption(
+                    "stock_terms: "
+                    + ", ".join(str(term) for term in stock_terms)
+                )
         with st.expander("Spec MPT preparada por intención", expanded=False):
             st.json(compiled.get("mpt_spec") or {})
         if ready_to_submit and not submit_enabled:
