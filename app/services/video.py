@@ -1210,6 +1210,11 @@ def generate_video(
         # 较大的安全边距，避免历史配置中的长字幕贴边或被裁切。
         padding_ratio = 0.4 if rounded_bg_enabled else 0.6
         pad_x = int(params.font_size * padding_ratio) if has_subtitle_background else 0
+        text_margin_x = 0
+        text_margin_y = 0
+        if has_subtitle_background:
+            text_margin_x = max(8, int(video_width * 0.02))
+            text_margin_y = max(4, int(video_height * 0.006))
         # 字幕背景需要给文字左右留出明确内边距。先从可用宽度中扣除
         # padding 再换行，避免长英文或大字号刚好撑满 90% 视频宽度后，
         # 文字贴到背景框边缘，看起来像被裁切。普通矩形背景和圆角背景
