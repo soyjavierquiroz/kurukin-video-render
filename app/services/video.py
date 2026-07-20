@@ -6,10 +6,10 @@ import math
 import os
 import random
 import gc
-import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from contextlib import redirect_stdout
 from functools import lru_cache
 from typing import List
@@ -510,7 +510,11 @@ def _format_ffmpeg_concat_path(file_path: str) -> str:
 
 
 def concat_video_clips_with_ffmpeg(
-    clip_files: List[str], output_file: str, threads: int, output_dir: str
+    clip_files: List[str],
+    output_file: str,
+    threads: int,
+    output_dir: str,
+    max_duration: float | None = None,
 ):
     concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
     with open(concat_list_file, "w", encoding="utf-8") as fp:
@@ -518,7 +522,7 @@ def concat_video_clips_with_ffmpeg(
             fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
 
     def build_command(codec: str) -> list[str]:
-        return [
+        command = [
             utils.get_ffmpeg_binary(),
             "-y",
             "-f",
@@ -533,8 +537,11 @@ def concat_video_clips_with_ffmpeg(
             str(threads or 2),
             "-pix_fmt",
             "yuv420p",
-            output_file,
         ]
+        if max_duration is not None and max_duration > 0:
+            command.extend(["-t", f"{max_duration:.3f}"])
+        command.append(output_file)
+        return command
 
     def run_concat(codec: str):
         command = build_command(codec)
@@ -920,14 +927,6 @@ def combine_videos(
         logger.warning("no clips available for merging")
         return combined_video_path
     
-    # if there is only one clip, use it directly
-    if len(processed_clips) == 1:
-        logger.info("using single clip directly")
-        shutil.copy(processed_clips[0].file_path, combined_video_path)
-        delete_files([processed_clips[0].file_path])
-        logger.info("video combining completed")
-        return combined_video_path
-
     clip_files = [clip.file_path for clip in processed_clips]
     logger.info(f"concatenating {len(clip_files)} clips with ffmpeg")
     concat_video_clips_with_ffmpeg(
@@ -935,6 +934,7 @@ def combine_videos(
         output_file=combined_video_path,
         threads=threads,
         output_dir=output_dir,
+        max_duration=audio_duration,
     )
     
     # clean temp files
@@ -1094,10 +1094,60 @@ def _get_visible_center_position(
     return x, y
 
 
-def _subtitle_text_margin(font_size: int, stroke_width: int) -> tuple[int, int]:
-    horizontal = max(8, int(stroke_width) * 4)
-    vertical = max(12, int(stroke_width) * 6)
-    return horizontal, vertical
+def subtitle_colors_are_indistinguishable(params: VideoParams) -> bool:
+    """判断字幕文字和背景是否同色，提醒用户可能无法看清字幕。"""
+    if not params.subtitle_enabled or not params.text_background_color:
+        return False
+
+    def normalize_color(value):
+        if isinstance(value, bool):
+            return "#000000" if value else ""
+        return str(value or "").strip().lower()
+
+    text_color = normalize_color(params.text_fore_color)
+    background_color = normalize_color(params.text_background_color)
+    return bool(text_color and text_color == background_color)
+
+
+@lru_cache(maxsize=64)
+def _subtitle_font_supports_sample(font_path: str, sample: str) -> bool:
+    """检查字体是否包含样本文字需要的字形，并缓存重复检查结果。"""
+    try:
+        font = ImageFont.truetype(font_path, 30)
+        missing_mask = font.getmask("\U0010ffff")
+        missing_signature = (
+            missing_mask.size,
+            missing_mask.getbbox(),
+            bytes(missing_mask),
+        )
+        for char in sample:
+            char_mask = font.getmask(char)
+            char_signature = (
+                char_mask.size,
+                char_mask.getbbox(),
+                bytes(char_mask),
+            )
+            if char_mask.getbbox() is None or char_signature == missing_signature:
+                return False
+        return True
+    except Exception as e:
+        # 字体探测失败不应阻止用户生成；保留日志供环境兼容问题排查。
+        logger.warning(f"failed to inspect subtitle font glyphs: {font_path}, {e}")
+        return True
+
+
+def subtitle_font_supports_text(font_path: str, text: str) -> bool:
+    """检查字体能否绘制文本中的字母和数字，忽略空白及标点符号。"""
+    sample = "".join(
+        dict.fromkeys(
+            char
+            for char in str(text or "")
+            if unicodedata.category(char)[0] in {"L", "N"}
+        )
+    )[:64]
+    if not sample:
+        return True
+    return _subtitle_font_supports_sample(font_path, sample)
 
 
 def generate_video(
@@ -1156,10 +1206,10 @@ def generate_video(
             getattr(params, "rounded_subtitle_background", False) and bg_color
         )
         has_subtitle_background = bool(bg_color)
-        text_margin_x, text_margin_y = _subtitle_text_margin(
-            params.font_size, params.stroke_width
-        )
-        pad_x = int(params.font_size * 0.6) if has_subtitle_background else text_margin_x
+        # 圆角背景按文字真实宽度生成，左右留白应更克制；旧矩形背景仍保留
+        # 较大的安全边距，避免历史配置中的长字幕贴边或被裁切。
+        padding_ratio = 0.4 if rounded_bg_enabled else 0.6
+        pad_x = int(params.font_size * padding_ratio) if has_subtitle_background else 0
         # 字幕背景需要给文字左右留出明确内边距。先从可用宽度中扣除
         # padding 再换行，避免长英文或大字号刚好撑满 90% 视频宽度后，
         # 文字贴到背景框边缘，看起来像被裁切。普通矩形背景和圆角背景
@@ -1177,7 +1227,7 @@ def generate_video(
         text_clip_margin_y = (
             max(int(params.font_size * 0.3), int(params.stroke_width * 2))
             if has_subtitle_background
-            else text_margin_y
+            else max(12, int(params.stroke_width) * 6)
         )
         # MoviePy 在 `method=label` 下会自动收缩文本框高度，遇到多行字幕、
         # 描边或背景色时，容易把最后一行的下半部分裁掉。这里显式传入

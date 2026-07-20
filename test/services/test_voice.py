@@ -100,6 +100,24 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
         self.assertGreater(vs.get_audio_duration(sub_maker), 0)
 
+    def test_get_audio_duration_accepts_non_mp3_files(self):
+        """
+        自定义音频（custom_audio_file）常见为 m4a/wav/aac 等非 mp3 格式。
+        get_audio_duration 不应因扩展名不是 .mp3 就报 "Invalid target type" 并返回 0，
+        而应交给 moviepy(ffmpeg) 读取真实时长。
+        """
+        for path in ("custom-audio.m4a", "voice.wav", "clip.aac"):
+            with patch.object(vs.os.path, "exists", return_value=True), \
+                    patch.object(vs, "AudioFileClip") as mock_afc:
+                mock_afc.return_value.__enter__.return_value.duration = 28.89
+                self.assertEqual(vs.get_audio_duration(path), 28.89)
+                mock_afc.assert_called_once_with(path)
+
+    def test_get_audio_duration_missing_file_returns_zero(self):
+        """音频文件不存在时安全返回 0，而不是抛异常或读取失败。"""
+        with patch.object(vs.os.path, "exists", return_value=False):
+            self.assertEqual(vs.get_audio_duration("does-not-exist.m4a"), 0.0)
+
     def test_no_voice_alias_none_is_supported_temporarily(self):
         """
         兼容 PR #981 曾使用过的 none sentinel，避免少量直接调用 API 的用户
@@ -335,7 +353,10 @@ class TestVoiceService(unittest.TestCase):
             voice_file = f"{temp_dir}/tts-azure-v2-{voice_name}.mp3"
             subtitle_file = f"{temp_dir}/tts-azure-v2-{voice_name}.srt"
             sub_maker = vs.azure_tts_v2(
-                text=text_zh, voice_name=voice_name, voice_file=voice_file
+                text=text_zh,
+                voice_name=voice_name,
+                voice_file=voice_file,
+                voice_rate=1.0,
             )
             if not sub_maker:
                 self.fail("azure tts v2 failed")
@@ -345,7 +366,38 @@ class TestVoiceService(unittest.TestCase):
 
         self.loop.run_until_complete(_do())
 
-    def test_gemini_tts_uses_legacy_submaker_fields(self):
+    def test_azure_tts_v2_ssml_applies_rate_and_escapes_text(self):
+        """Azure V2 必须通过 SSML 应用语速，并避免用户文案破坏 XML。"""
+        ssml = vs._build_azure_v2_ssml(
+            text='A < B & "quoted"',
+            voice_name="zh-CN-XiaoxiaoMultilingualNeural",
+            voice_rate=1.8,
+        )
+
+        self.assertIn('xml:lang="zh-CN"', ssml)
+        self.assertIn('rate="1.8"', ssml)
+        self.assertIn("A &lt; B &amp; \"quoted\"", ssml)
+
+    def test_tts_forwards_rate_to_azure_v2(self):
+        """统一 TTS 入口不能在分发 Azure V2 时丢失 voice_rate。"""
+        voice_name = "zh-CN-XiaoxiaoMultilingualNeural-V2-Female"
+        with patch.object(vs, "azure_tts_v2", return_value=object()) as mock_tts:
+            result = vs.tts(
+                text="语速测试",
+                voice_name=voice_name,
+                voice_rate=1.8,
+                voice_file="/tmp/azure-v2-rate.mp3",
+            )
+
+        self.assertIsNotNone(result)
+        mock_tts.assert_called_once_with(
+            "语速测试",
+            voice_name,
+            "/tmp/azure-v2-rate.mp3",
+            voice_rate=1.8,
+        )
+
+    def test_gemini_tts_uses_google_genai_and_compatible_submaker_fields(self):
         """
         验证 Gemini TTS 在 edge_tts 7.x 环境下仍会返回项目兼容的字幕结构，
         并且可以被 `subtitle_provider=edge` 的字幕生成链路直接消费，
@@ -372,11 +424,11 @@ class TestVoiceService(unittest.TestCase):
             def __init__(self, data):
                 self.candidates = [_Candidate(data)]
 
-        class _FakeModel:
-            def __init__(self, name):
-                self.name = name
+        captured = {}
 
-            def generate_content(self, contents, generation_config):
+        class _FakeModels:
+            def generate_content(self, **kwargs):
+                captured.update(kwargs)
                 tone = (
                     AudioSegment.silent(duration=1800)
                     .set_frame_rate(24000)
@@ -385,13 +437,26 @@ class TestVoiceService(unittest.TestCase):
                 )
                 return _Response(tone.raw_data)
 
+        class _FakeClient:
+            def __init__(self, **kwargs):
+                captured["client_kwargs"] = kwargs
+                self.models = _FakeModels()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                captured["closed"] = True
+
         voice_file = f"{temp_dir}/tts-gemini-Zephyr.mp3"
         subtitle_file = f"{temp_dir}/tts-gemini-Zephyr.srt"
         text = "Gemini subtitle generation should work now. Testing multiple lines."
 
-        with patch("google.generativeai.configure"), patch(
-            "google.generativeai.GenerativeModel", _FakeModel
-        ), patch.object(vs.config, "app", dict(vs.config.app, gemini_api_key="test-key")):
+        with patch("google.genai.Client", _FakeClient), patch.object(
+            vs.config,
+            "app",
+            dict(vs.config.app, gemini_api_key="test-key"),
+        ):
             sub_maker = vs.gemini_tts(
                 text=text,
                 voice_name="Zephyr",
@@ -407,6 +472,16 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
         self.assertEqual(sub_maker.offset[0][0], 0)
         self.assertLess(sub_maker.offset[0][1], sub_maker.offset[1][1])
+        self.assertEqual(captured["client_kwargs"], {"api_key": "test-key"})
+        self.assertEqual(captured["model"], "gemini-2.5-flash-preview-tts")
+        self.assertEqual(captured["contents"], text)
+        self.assertEqual(captured["config"].response_modalities, ["AUDIO"])
+        voice_config = captured["config"].speech_config.voice_config
+        self.assertEqual(
+            voice_config.prebuilt_voice_config.voice_name,
+            "Zephyr",
+        )
+        self.assertTrue(captured["closed"])
 
         vs.create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
         subtitle_content = Path(subtitle_file).read_text(encoding="utf-8")

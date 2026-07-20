@@ -211,6 +211,24 @@ class TestVideoService(unittest.TestCase):
         with patch.object(vd, "_ffmpeg_encoder_exists", return_value=False):
             self.assertEqual(vd._get_effective_video_codec(), "libx264")
 
+    def test_get_configured_video_codec_uses_stable_default_when_unset(self):
+        """
+        WebUI 的“默认”模式不会持久化 video_codec。后端必须在配置缺失时继续
+        明确返回 libx264，不能把空值直接交给 MoviePy 或 FFmpeg 自行决定。
+        """
+        config.app.pop("video_codec", None)
+
+        self.assertEqual(vd._get_configured_video_codec(), "libx264")
+
+    def test_get_configured_video_codec_preserves_explicit_libx264(self):
+        """
+        用户明确选择 libx264 时需要保持固定选择。它与“跟随项目默认策略”当前
+        结果相同，但配置语义不同，未来调整默认值时不能影响显式选择。
+        """
+        config.app["video_codec"] = "libx264"
+
+        self.assertEqual(vd._get_configured_video_codec(), "libx264")
+
     def test_ffmpeg_encoder_exists_falls_back_when_probe_fails(self):
         """
         Windows 上用户配置的 ffmpeg 可能因为路径损坏、权限或杀软拦截而无法
@@ -280,10 +298,16 @@ class TestVideoService(unittest.TestCase):
         concat demuxer 的文件列表对 Windows 反斜杠较敏感，写入 list 前统一
         转成正斜杠，并继续保留单引号转义。
         """
-        with patch.object(vd.os.path, "abspath", return_value=r"C:\Users\Harry's Videos\clip.mp4"):
+        with patch.object(
+            vd.os.path,
+            "abspath",
+            return_value=r"C:\Users\Test User's Videos\clip.mp4",
+        ):
             self.assertEqual(
-                vd._format_ffmpeg_concat_path(r"C:\Users\Harry's Videos\clip.mp4"),
-                "C:/Users/Harry'\\''s Videos/clip.mp4",
+                vd._format_ffmpeg_concat_path(
+                    r"C:\Users\Test User's Videos\clip.mp4"
+                ),
+                "C:/Users/Test User'\\''s Videos/clip.mp4",
             )
 
     def test_concat_video_clips_falls_back_after_runtime_encoder_failure(self):
@@ -485,7 +509,7 @@ class TestVideoService(unittest.TestCase):
                     with patch.object(
                         vd, "_write_videofile_with_codec_fallback"
                     ) as write_mock:
-                        with patch.object(vd, "concat_video_clips_with_ffmpeg"):
+                        with patch.object(vd, "concat_video_clips_with_ffmpeg") as concat_mock:
                             with patch.object(vd, "delete_files"):
                                 result = vd.combine_videos(
                                     combined_video_path=combined_video_path,
@@ -499,6 +523,31 @@ class TestVideoService(unittest.TestCase):
 
         self.assertEqual(result, combined_video_path)
         self.assertEqual(write_mock.call_count, 4)
+        self.assertEqual(concat_mock.call_args.kwargs["max_duration"], 10.0)
+
+    def test_concat_video_clips_limits_output_to_audio_duration(self):
+        """最终拼接时应裁到音频时长，避免安全余量带来明显静音尾巴。"""
+
+        def fake_run(command, capture_output, text, check):
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+
+            with patch.object(vd.subprocess, "run", side_effect=fake_run) as run:
+                vd.concat_video_clips_with_ffmpeg(
+                    clip_files=[clip_file],
+                    output_file=output_file,
+                    threads=1,
+                    output_dir=temp_dir,
+                    max_duration=10.0,
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-t") + 1], "10.000")
+        self.assertLess(command.index("-t"), command.index(output_file))
 
     def test_prioritize_unique_source_clips_uses_each_source_before_reuse(self):
         """
