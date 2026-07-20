@@ -1,6 +1,8 @@
+import json
 import os
 import random
 import threading
+from datetime import datetime, timezone
 from typing import List
 from urllib.parse import urlencode
 
@@ -15,6 +17,11 @@ from app.utils import utils
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+ASSET_USAGE_HISTORY_FILE = utils.storage_dir(
+    os.path.join("asset_usage", "external_assets_used.jsonl")
+)
+_ASSET_USAGE_RECENT_LIMIT = 200
+_EXTERNAL_ASSET_PROVIDERS = {"pexels", "pixabay", "coverr"}
 
 
 def _get_tls_verify() -> bool:
@@ -32,6 +39,143 @@ def _get_tls_verify() -> bool:
         )
 
     return bool(tls_verify)
+
+
+def _asset_provider(item) -> str:
+    provider = (getattr(item, "provider", "") or "").strip().lower()
+    return provider if provider in _EXTERNAL_ASSET_PROVIDERS else "unknown"
+
+
+def _asset_id(item) -> str:
+    for attr_name in (
+        "asset_id",
+        "video_id",
+        "pexels_video_id",
+        "pixabay_video_id",
+        "coverr_video_id",
+        "id",
+    ):
+        value = getattr(item, attr_name, "")
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _asset_url(item) -> str:
+    return str(getattr(item, "url", "") or "")
+
+
+def external_asset_identity(item) -> tuple[str, str, str]:
+    provider = _asset_provider(item)
+    asset_id = _asset_id(item)
+    url = _asset_url(item)
+    if asset_id:
+        return provider, "id", asset_id
+    if url:
+        return provider, "url", url
+    return provider, "path", str(getattr(item, "path", "") or "")
+
+
+def _external_asset_identity_key(item) -> str:
+    provider, identity_type, identity_value = external_asset_identity(item)
+    if not identity_value:
+        return ""
+    return f"{provider}:{identity_type}:{identity_value}"
+
+
+def _recent_external_asset_keys(history_file: str = ASSET_USAGE_HISTORY_FILE) -> set[str]:
+    if not os.path.exists(history_file):
+        return set()
+
+    entries = []
+    try:
+        with open(history_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as exc:
+        logger.warning(f"failed to read external asset usage history: {str(exc)}")
+        return set()
+
+    recent_entries = entries[-_ASSET_USAGE_RECENT_LIMIT:]
+    keys = set()
+    for entry in recent_entries:
+        provider = (entry.get("provider") or "unknown").strip().lower()
+        asset_id = str(entry.get("asset_id") or "")
+        url = str(entry.get("url") or "")
+        path_value = str(entry.get("path") or "")
+        if asset_id:
+            keys.add(f"{provider}:id:{asset_id}")
+        if url:
+            keys.add(f"{provider}:url:{url}")
+        if path_value:
+            keys.add(f"{provider}:path:{path_value}")
+    return keys
+
+
+def is_recent_external_asset(item, history_file: str = ASSET_USAGE_HISTORY_FILE) -> bool:
+    identity_key = _external_asset_identity_key(item)
+    if not identity_key:
+        return False
+    return identity_key in _recent_external_asset_keys(history_file)
+
+
+def filter_recent_external_assets(
+    items: List[MaterialInfo],
+    history_file: str = ASSET_USAGE_HISTORY_FILE,
+) -> tuple[List[MaterialInfo], bool]:
+    if not items:
+        return [], False
+    recent_keys = _recent_external_asset_keys(history_file)
+    fresh_items = [
+        item
+        for item in items
+        if _external_asset_identity_key(item) not in recent_keys
+    ]
+    if fresh_items:
+        return fresh_items, False
+    return items, True
+
+
+def record_external_asset_usage(
+    item,
+    task_id: str,
+    subject: str = "",
+    dedup_fallback: bool = False,
+    history_file: str = ASSET_USAGE_HISTORY_FILE,
+) -> None:
+    provider = _asset_provider(item)
+    if provider not in _EXTERNAL_ASSET_PROVIDERS:
+        return
+
+    asset_id = _asset_id(item)
+    url = _asset_url(item)
+    if not asset_id and not url and not getattr(item, "path", ""):
+        return
+
+    payload = {
+        "provider": provider,
+        "asset_id": asset_id,
+        "url": url,
+        "task_id": str(task_id or ""),
+        "subject": str(subject or ""),
+        "used_at": datetime.now(timezone.utc).isoformat(),
+        "transform": "none",
+    }
+    if dedup_fallback:
+        payload["dedup_fallback"] = True
+
+    try:
+        os.makedirs(os.path.dirname(history_file), exist_ok=True)
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning(f"failed to write external asset usage history: {str(exc)}")
 
 
 def get_api_key(cfg_key: str):
@@ -98,6 +242,7 @@ def search_videos_pexels(
                 if w == video_width and h == video_height:
                     item = MaterialInfo()
                     item.provider = "pexels"
+                    item.asset_id = str(v.get("id") or "")
                     item.url = video["link"]
                     item.duration = duration
                     video_items.append(item)
@@ -154,6 +299,7 @@ def search_videos_pixabay(
                 if w >= video_width:
                     item = MaterialInfo()
                     item.provider = "pixabay"
+                    item.asset_id = str(v.get("id") or "")
                     item.url = video["url"]
                     item.duration = duration
                     video_items.append(item)
@@ -231,6 +377,7 @@ def search_videos_coverr(
 
             item = MaterialInfo()
             item.provider = "coverr"
+            item.asset_id = str(video_id)
             item.url = mp4_download_url
             item.duration = duration
             video_items.append(item)
@@ -360,7 +507,14 @@ def download_videos(
     if concat_mode_value == VideoConcatMode.random.value:
         random.shuffle(valid_video_items)
 
+    valid_video_items, dedup_fallback = filter_recent_external_assets(
+        valid_video_items
+    )
+    if dedup_fallback:
+        logger.warning("external asset dedup fallback: all candidates were recent")
+
     total_duration = 0.0
+    subject = ", ".join(str(term) for term in search_terms)
     for item in valid_video_items:
         try:
             logger.info(f"downloading video: {item.url}")
@@ -370,6 +524,12 @@ def download_videos(
             if saved_video_path:
                 logger.info(f"video saved: {saved_video_path}")
                 video_paths.append(saved_video_path)
+                record_external_asset_usage(
+                    item,
+                    task_id=task_id,
+                    subject=subject,
+                    dedup_fallback=dedup_fallback,
+                )
                 seconds = min(max_clip_duration, item.duration)
                 total_duration += seconds
                 if total_duration > audio_duration:
@@ -423,6 +583,13 @@ def _download_videos_by_script_order(
             found_duration += item.duration
 
         if term_items:
+            term_items, dedup_fallback = filter_recent_external_assets(term_items)
+            if dedup_fallback:
+                logger.warning(
+                    f"external asset dedup fallback for '{search_term}': all candidates were recent"
+                )
+                for item in term_items:
+                    item.dedup_fallback = True
             candidate_groups.append((search_term, term_items))
 
     logger.info(
@@ -451,6 +618,12 @@ def _download_videos_by_script_order(
                 if saved_video_path:
                     logger.info(f"video saved: {saved_video_path}")
                     video_paths.append(saved_video_path)
+                    record_external_asset_usage(
+                        item,
+                        task_id=task_id,
+                        subject=search_term,
+                        dedup_fallback=bool(getattr(item, "dedup_fallback", False)),
+                    )
                     total_duration += min(max_clip_duration, item.duration)
                     if total_duration > audio_duration:
                         logger.info(
