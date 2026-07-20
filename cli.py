@@ -210,8 +210,10 @@ Output and exit status:
     material_group.add_argument(
         "--video-source",
         default="pexels",
-        choices=["pexels", "pixabay", "coverr", "local"],
-        help="video material provider; online providers require matching API keys in config.toml",
+        help=(
+            "video material provider; use pexels, pixabay, coverr, mixed, "
+            "a comma list such as pexels,pixabay,coverr, or local"
+        ),
     )
     material_group.add_argument(
         "--video-materials",
@@ -442,6 +444,26 @@ Output and exit status:
 
     if not args.video_subject.strip() and not args.video_script.strip():
         parser.error("one of --video-subject or --video-script is required")
+
+    video_source = (args.video_source or "").strip().lower()
+    if video_source == "local":
+        args.video_source = "local"
+    else:
+        online_sources = [
+            item.strip()
+            for item in video_source.split(",")
+            if item.strip()
+        ]
+        if video_source == "mixed":
+            online_sources = ["mixed"]
+        valid_sources = {"pexels", "pixabay", "coverr", "mixed"}
+        invalid_sources = [item for item in online_sources if item not in valid_sources]
+        if not online_sources or invalid_sources:
+            parser.error(
+                "--video-source must be pexels, pixabay, coverr, mixed, "
+                "a comma-list of online providers, or local"
+            )
+        args.video_source = video_source
 
     if args.video_source == "local" and args.stop_at == "terms":
         parser.error(

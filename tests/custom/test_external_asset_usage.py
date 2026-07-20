@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.models.schema import MaterialInfo
 from app.services import material
@@ -120,6 +121,54 @@ class ExternalAssetUsageTest(unittest.TestCase):
             )
 
             self.assertFalse(Path(history_file).exists())
+
+    def test_parse_material_sources_accepts_mixed_and_comma_list(self):
+        self.assertEqual(
+            material.parse_material_sources("mixed"),
+            ("pexels", "pixabay", "coverr"),
+        )
+        self.assertEqual(
+            material.parse_material_sources("pexels,pixabay,coverr"),
+            ("pexels", "pixabay", "coverr"),
+        )
+
+    def test_rotated_material_sources_uses_expected_order(self):
+        self.assertEqual(
+            material.rotated_material_sources("mixed", 0),
+            ("pexels", "pixabay", "coverr"),
+        )
+        self.assertEqual(
+            material.rotated_material_sources("mixed", 1),
+            ("pixabay", "coverr", "pexels"),
+        )
+        self.assertEqual(
+            material.rotated_material_sources("mixed", 2),
+            ("coverr", "pexels", "pixabay"),
+        )
+
+    def test_search_videos_with_fallback_tries_next_source(self):
+        calls = []
+
+        def fake_search(provider):
+            def _search(**kwargs):
+                calls.append(provider)
+                if provider == "pixabay":
+                    return [make_material(provider="pixabay", asset_id="202")]
+                return []
+
+            return _search
+
+        with patch.object(material, "_search_videos_for_source", side_effect=fake_search):
+            items, provider = material.search_videos_with_fallback(
+                search_term="city",
+                minimum_duration=5,
+                source="mixed",
+                index=0,
+            )
+
+        self.assertEqual(calls, ["pexels", "pixabay"])
+        self.assertEqual(provider, "pixabay")
+        self.assertEqual(items[0].provider, "pixabay")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ ASSET_USAGE_HISTORY_FILE = utils.storage_dir(
 )
 _ASSET_USAGE_RECENT_LIMIT = 200
 _EXTERNAL_ASSET_PROVIDERS = {"pexels", "pixabay", "coverr"}
+_SOURCE_ROTATION = ("pexels", "pixabay", "coverr")
 
 
 def _get_tls_verify() -> bool:
@@ -39,6 +40,73 @@ def _get_tls_verify() -> bool:
         )
 
     return bool(tls_verify)
+
+
+def parse_material_sources(source: str) -> tuple[str, ...]:
+    source_value = (source or "pexels").strip().lower()
+    if source_value == "mixed":
+        return _SOURCE_ROTATION
+
+    sources = tuple(
+        item.strip().lower() for item in source_value.split(",") if item.strip()
+    )
+    if not sources:
+        return ("pexels",)
+
+    invalid_sources = [item for item in sources if item not in _SOURCE_ROTATION]
+    if invalid_sources:
+        raise ValueError(
+            f"unsupported video source: {', '.join(invalid_sources)}. "
+            f"Expected one or more of: {', '.join(_SOURCE_ROTATION)}, mixed, local."
+        )
+
+    deduped_sources = []
+    for item in sources:
+        if item not in deduped_sources:
+            deduped_sources.append(item)
+    return tuple(deduped_sources)
+
+
+def rotated_material_sources(source: str, index: int) -> tuple[str, ...]:
+    sources = parse_material_sources(source)
+    if len(sources) <= 1:
+        return sources
+
+    offset = index % len(sources)
+    return sources[offset:] + sources[:offset]
+
+
+def _search_videos_for_source(source: str):
+    if source == "pixabay":
+        return search_videos_pixabay
+    if source == "coverr":
+        return search_videos_coverr
+    return search_videos_pexels
+
+
+def search_videos_with_fallback(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    source: str = "pexels",
+    index: int = 0,
+) -> tuple[List[MaterialInfo], str]:
+    for provider in rotated_material_sources(source, index):
+        try:
+            video_items = _search_videos_for_source(provider)(
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"video source '{provider}' failed for '{search_term}', trying next source: {str(exc)}"
+            )
+            continue
+        if video_items:
+            return video_items, provider
+        logger.info(f"video source '{provider}' returned no videos for '{search_term}'")
+    return [], ""
 
 
 def _asset_provider(item) -> str:
@@ -458,11 +526,8 @@ def download_videos(
     max_clip_duration: int = 5,
     match_script_order: bool = False,
 ) -> List[str]:
-    search_videos = search_videos_pexels
-    if source == "pixabay":
-        search_videos = search_videos_pixabay
-    elif source == "coverr":
-        search_videos = search_videos_coverr
+    if source != "local":
+        parse_material_sources(source)
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
@@ -474,7 +539,7 @@ def download_videos(
         return _download_videos_by_script_order(
             task_id=task_id,
             search_terms=search_terms,
-            search_videos=search_videos,
+            source=source,
             video_aspect=video_aspect,
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
@@ -484,13 +549,18 @@ def download_videos(
     valid_video_items = []
     valid_video_urls = []
     found_duration = 0.0
-    for search_term in search_terms:
-        video_items = search_videos(
+    for term_index, search_term in enumerate(search_terms):
+        video_items, used_source = search_videos_with_fallback(
             search_term=search_term,
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
+            source=source,
+            index=term_index,
         )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
+        logger.info(
+            f"found {len(video_items)} videos for '{search_term}'"
+            + (f" from {used_source}" if used_source else "")
+        )
 
         for item in video_items:
             if item.url not in valid_video_urls:
@@ -546,7 +616,7 @@ def download_videos(
 def _download_videos_by_script_order(
     task_id: str,
     search_terms: List[str],
-    search_videos,
+    source: str,
     video_aspect: VideoAspect,
     audio_duration: float,
     max_clip_duration: int,
@@ -566,13 +636,18 @@ def _download_videos_by_script_order(
     valid_video_urls = set()
     found_duration = 0.0
 
-    for search_term in search_terms:
-        video_items = search_videos(
+    for term_index, search_term in enumerate(search_terms):
+        video_items, used_source = search_videos_with_fallback(
             search_term=search_term,
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
+            source=source,
+            index=term_index,
         )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
+        logger.info(
+            f"found {len(video_items)} videos for '{search_term}'"
+            + (f" from {used_source}" if used_source else "")
+        )
 
         term_items = []
         for item in video_items:

@@ -1020,7 +1020,11 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
             lines[index] = candidate
             lines[index - 1] = lines[index - 1][:-1]
 
-    result = "\n".join(line.strip() for line in lines if line.strip()).strip()
+    lines = [line.strip() for line in lines if line.strip()]
+    if len(lines) > 2:
+        lines = [lines[0], " ".join(lines[1:])]
+
+    result = "\n".join(lines).strip()
     height = len(lines) * height
     return result, height
 
@@ -1200,7 +1204,8 @@ def generate_video(
         params.font_size = int(params.font_size)
         params.stroke_width = int(params.stroke_width)
         phrase = subtitle_item[1]
-        max_width = video_width * 0.9
+        safe_margin_x = max(24, int(video_width * (90 / 1080)))
+        max_width = max(1, video_width - (safe_margin_x * 2))
         bg_color = resolve_subtitle_background_color()
         rounded_bg_enabled = bool(
             getattr(params, "rounded_subtitle_background", False) and bg_color
@@ -1226,19 +1231,20 @@ def generate_video(
             font=font_path,
             fontsize=params.font_size,
         )
-        interline = int(params.font_size * 0.25)
+        interline = max(int(params.font_size * 0.28), int(params.stroke_width * 2))
         line_count = wrapped_txt.count("\n") + 1
-        vertical_padding = int(params.font_size * 0.35)
+        stroke_padding = max(8, int(params.stroke_width * 4))
+        vertical_padding = max(int(params.font_size * 0.55), stroke_padding * 2)
         text_clip_margin_y = (
-            max(int(params.font_size * 0.3), int(params.stroke_width * 2))
+            max(int(params.font_size * 0.35), stroke_padding)
             if has_subtitle_background
-            else max(12, int(params.stroke_width) * 6)
+            else max(int(params.font_size * 0.18), stroke_padding)
         )
         # MoviePy 在 `method=label` 下会自动收缩文本框高度，遇到多行字幕、
         # 描边或背景色时，容易把最后一行的下半部分裁掉。这里显式传入
         # 一个更保守的高度，把行间距和额外上下留白一并算进去，保证字幕
         # 背景框与文字本身都能完整渲染出来。
-        clip_h = int(txt_height + vertical_padding + (interline * line_count))
+        clip_h = int(txt_height + vertical_padding + (interline * max(0, line_count - 1)))
 
         if rounded_bg_enabled:
             # 圆角背景需要贴合文字宽度，而不是沿用 90% 视频宽度。这里先用
@@ -1324,7 +1330,7 @@ def generate_video(
                 stroke_color=params.stroke_color,
                 stroke_width=params.stroke_width,
                 interline=interline,
-                size=(text_max_width, None),
+                size=(text_max_width, clip_h),
                 margin=(text_margin_x, text_margin_y),
                 text_align="center",
             )
