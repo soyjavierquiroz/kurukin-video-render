@@ -46,15 +46,30 @@ from app.custom.kurukin_render_console import (
     ASSET_SOURCE_LOCAL,
     ASSET_SOURCE_ASSET_HUB,
     ASSET_SOURCE_STOCK,
+    ASSET_HUB_OPERATOR_SOURCE_BRAND,
+    ASSET_HUB_OPERATOR_SOURCE_BRAND_GENERIC,
+    ASSET_HUB_OPERATOR_SOURCE_GENERIC,
+    ASSET_HUB_OPERATOR_SOURCE_TITLE,
+    ASSET_HUB_OPERATOR_SOURCE_TITLE_GENERIC,
     MPT_ENGINE_SUBMIT_FLAG,
     PEXELS_SOURCE_FLAG,
     SOURCE_MODE_ASSET_HUB,
     SOURCE_MODE_LOCAL,
     SOURCE_MODE_STOCK,
+    apply_prepared_asset_hub_contract_to_spec,
+    asset_hub_safe_operator_error_message,
+    asset_hub_prepare_context_matches,
+    asset_hub_search_context_matches,
+    build_asset_hub_job_spec_fingerprint,
+    build_asset_hub_operator_source_policy,
+    build_asset_hub_prepare_context,
+    build_asset_hub_search_context,
     build_aroll_broll_payload_from_console,
+    build_moneyprinter_payload_with_prepared_asset_hub,
     build_operator_summary,
     build_render_console_spec,
     build_workflow_payload,
+    clear_asset_hub_selection_widget_state,
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
     enqueue_job_intent_from_console,
@@ -62,14 +77,18 @@ from app.custom.kurukin_render_console import (
     is_mpt_engine_submit_enabled,
     is_pexels_source_enabled,
     list_local_storage_files,
+    merge_asset_hub_search_result_with_context,
     normalize_aroll_broll_local_asset_paths,
     prepare_broll_assets_from_console,
     process_queued_intent_batch_with_mpt_native,
     process_queued_intent_with_mpt_native,
+    require_prepared_asset_hub_payload_for_queue,
     safe_relative_path,
     submit_mpt_native_local_job_from_console,
+    validate_asset_hub_scene_selections,
     validate_and_build_payload_from_console_spec,
 )
+from app.custom.kurukin_asset_hub import KurukinAssetHubError
 
 
 BUNDLE_UID = "jab_b28367fb22d44a40bae507c175f464c4"
@@ -254,6 +273,82 @@ class TestKurukinRenderConsole(unittest.TestCase):
             },
         }
 
+    def _asset_hub_intent(self) -> dict:
+        return {
+            "mode": "audio_to_video",
+            "task_id": "asset-hub-intent-001",
+            "audio_path": "storage/local_audios/audio.mp3",
+            "topic": "Asset Hub intent",
+            "script": "Scene one. Scene two.",
+            "scenes": [
+                {
+                    "scene_id": "scene-001",
+                    "scene_index": 1,
+                    "script_scene": "Modern kitchen",
+                    "visual_keywords": ["modern kitchen"],
+                },
+                {
+                    "scene_id": "scene-002",
+                    "scene_index": 2,
+                    "script_scene": "Brand product",
+                    "visual_keywords": ["brand product"],
+                },
+            ],
+        }
+
+    def _asset_hub_search_result(self) -> dict:
+        return {
+            "search_complete": True,
+            "asset_hub_selection": {
+                "scenes": [
+                    {
+                        "scene_id": "scene-001",
+                        "query": "modern kitchen",
+                        "candidates": [
+                            {
+                                "asset_uid": "drive-one",
+                                "filename": "one.mp4",
+                                "media_type": "video",
+                                "scope": "generic",
+                                "tags": ["kitchen"],
+                            }
+                        ],
+                    },
+                    {
+                        "scene_id": "scene-002",
+                        "query": "brand product",
+                        "candidates": [
+                            {
+                                "asset_uid": "drive-two",
+                                "filename": "two.mp4",
+                                "media_type": "video",
+                                "scope": "brand",
+                                "brand": "acme",
+                            },
+                            {
+                                "asset_uid": "drive-three",
+                                "filename": "three.mp4",
+                                "media_type": "video",
+                                "scope": "generic",
+                            },
+                        ],
+                    },
+                ]
+            },
+        }
+
+    def _asset_hub_prepare_result(self) -> dict:
+        return {
+            "asset_hub": {
+                "renderer_manifest_path": (
+                    "/data/job-assets/bundle-001/manifests/renderer-manifest.json"
+                ),
+                "bundle_uid": "bundle-001",
+                "scene_mode": "ordered",
+                "strict": True,
+            }
+        }
+
     def test_normalize_aroll_broll_local_asset_paths_accepts_storage_paths(self):
         paths = normalize_aroll_broll_local_asset_paths(
             "storage/local_videos/cutaway.mp4\nstorage/local_images/still.png"
@@ -266,6 +361,415 @@ class TestKurukinRenderConsole(unittest.TestCase):
                 "storage/local_images/still.png",
             ],
         )
+
+    def test_asset_hub_disabled_flow_still_uses_existing_intent_enqueue(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("job_intent_asset_hub_enabled", source)
+        self.assertIn("enqueue_job_intent_from_console(_build_job_intent_from_state())", source)
+
+    def test_asset_hub_generic_source_policy(self):
+        self.assertEqual(
+            build_asset_hub_operator_source_policy(ASSET_HUB_OPERATOR_SOURCE_GENERIC),
+            {"sources": [{"scope": "generic"}]},
+        )
+
+    def test_asset_hub_title_requires_slug(self):
+        with self.assertRaises(Exception):
+            build_asset_hub_operator_source_policy(ASSET_HUB_OPERATOR_SOURCE_TITLE)
+
+    def test_asset_hub_brand_requires_slug(self):
+        with self.assertRaises(Exception):
+            build_asset_hub_operator_source_policy(ASSET_HUB_OPERATOR_SOURCE_BRAND)
+
+    def test_asset_hub_title_generic_preserves_or_order(self):
+        self.assertEqual(
+            build_asset_hub_operator_source_policy(
+                ASSET_HUB_OPERATOR_SOURCE_TITLE_GENERIC,
+                title_slug="kurukin-title",
+            ),
+            {
+                "sources": [
+                    {"scope": "title", "title": "kurukin-title"},
+                    {"scope": "generic"},
+                ]
+            },
+        )
+
+    def test_asset_hub_brand_generic_preserves_or_order(self):
+        self.assertEqual(
+            build_asset_hub_operator_source_policy(
+                ASSET_HUB_OPERATOR_SOURCE_BRAND_GENERIC,
+                brand_slug="kurukin-brand",
+            ),
+            {
+                "sources": [
+                    {"scope": "brand", "brand": "kurukin-brand"},
+                    {"scope": "generic"},
+                ]
+            },
+        )
+
+    def test_asset_hub_context_changes_when_source_policy_changes(self):
+        intent = self._asset_hub_intent()
+        generic = build_asset_hub_search_context(
+            intent,
+            {"sources": [{"scope": "generic"}]},
+        )
+        title = build_asset_hub_search_context(
+            intent,
+            {"sources": [{"scope": "title", "title": "kurukin-title"}]},
+        )
+        self.assertFalse(asset_hub_search_context_matches(generic, title))
+
+    def test_asset_hub_context_changes_when_intent_scenes_change(self):
+        intent = self._asset_hub_intent()
+        first = build_asset_hub_search_context(
+            intent,
+            {"sources": [{"scope": "generic"}]},
+        )
+        intent["scenes"][0]["script_scene"] = "Changed scene text"
+        second = build_asset_hub_search_context(
+            intent,
+            {"sources": [{"scope": "generic"}]},
+        )
+        self.assertFalse(asset_hub_search_context_matches(first, second))
+
+    def test_asset_hub_cached_last_compile_old_intent_does_not_make_current_context_fresh(self):
+        intent_a = self._asset_hub_intent()
+        intent_b = self._asset_hub_intent()
+        intent_b["scenes"][0]["script_scene"] = "Fresh form scene"
+        source_policy = {"sources": [{"scope": "generic"}]}
+        stored_from_search = build_asset_hub_search_context(intent_a, source_policy)
+        cached_last_compile = {"intent": intent_a}
+        current_from_form = build_asset_hub_search_context(intent_b, source_policy)
+
+        self.assertEqual(cached_last_compile["intent"]["scenes"][0]["script_scene"], "Modern kitchen")
+        self.assertFalse(
+            asset_hub_search_context_matches(stored_from_search, current_from_form)
+        )
+
+    def test_asset_hub_prepare_context_preserves_selection_order(self):
+        search_context = build_asset_hub_search_context(
+            self._asset_hub_intent(),
+            {"sources": [{"scope": "generic"}]},
+        )
+        first = build_asset_hub_prepare_context(
+            search_context,
+            {"scene-001": ["drive-one", "drive-two"]},
+        )
+        second = build_asset_hub_prepare_context(
+            search_context,
+            {"scene-001": ["drive-two", "drive-one"]},
+        )
+        self.assertFalse(asset_hub_prepare_context_matches(first, second))
+
+    def test_asset_hub_prepare_context_changes_when_scene_changes(self):
+        source_policy = {"sources": [{"scope": "generic"}]}
+        intent_a = self._asset_hub_intent()
+        intent_b = self._asset_hub_intent()
+        intent_b["scenes"][1]["script_scene"] = "Changed scene"
+        spec = {"mpt_params": {"video_subject": "same"}}
+        first = build_asset_hub_prepare_context(
+            build_asset_hub_search_context(intent_a, source_policy),
+            {"scene-001": ["drive-one"], "scene-002": ["drive-two"]},
+            mpt_spec=spec,
+        )
+        second = build_asset_hub_prepare_context(
+            build_asset_hub_search_context(intent_b, source_policy),
+            {"scene-001": ["drive-one"], "scene-002": ["drive-two"]},
+            mpt_spec=spec,
+        )
+        self.assertFalse(asset_hub_prepare_context_matches(first, second))
+
+    def test_asset_hub_prepare_context_changes_when_format_render_spec_changes(self):
+        search_context = build_asset_hub_search_context(
+            self._asset_hub_intent(),
+            {"sources": [{"scope": "generic"}]},
+        )
+        selection = {"scene-001": ["drive-one"], "scene-002": ["drive-two"]}
+        vertical_spec = {
+            "mpt_params": {
+                "video_subject": "Asset Hub",
+                "video_aspect": "9:16",
+                "video_clip_duration": 4,
+            }
+        }
+        horizontal_spec = {
+            "mpt_params": {
+                "video_subject": "Asset Hub",
+                "video_aspect": "16:9",
+                "video_clip_duration": 4,
+            }
+        }
+        first = build_asset_hub_prepare_context(
+            search_context,
+            selection,
+            mpt_spec=vertical_spec,
+        )
+        second = build_asset_hub_prepare_context(
+            search_context,
+            selection,
+            mpt_spec=horizontal_spec,
+        )
+        self.assertNotEqual(
+            build_asset_hub_job_spec_fingerprint(vertical_spec),
+            build_asset_hub_job_spec_fingerprint(horizontal_spec),
+        )
+        self.assertFalse(asset_hub_prepare_context_matches(first, second))
+
+    def test_asset_hub_search_result_does_not_autoselect(self):
+        result = self._asset_hub_search_result()
+        self.assertNotIn("selected_asset_uids", result["asset_hub_selection"]["scenes"][0])
+
+    def test_asset_hub_zero_candidates_blocks_needs_input(self):
+        result = self._asset_hub_search_result()
+        result["asset_hub_selection"]["scenes"][1]["candidates"] = []
+        status = validate_asset_hub_scene_selections(
+            result,
+            {"scene-001": ["drive-one"], "scene-002": ["drive-two"]},
+        )
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["empty_candidate_scene_ids"], ["scene-002"])
+
+    def test_asset_hub_selected_asset_not_in_scene_candidates_blocks(self):
+        status = validate_asset_hub_scene_selections(
+            self._asset_hub_search_result(),
+            {"scene-001": ["drive-x"], "scene-002": ["drive-two"]},
+        )
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["unknown_asset_uids_by_scene"], {"scene-001": ["drive-x"]})
+
+    def test_asset_hub_selected_asset_in_scene_candidates_is_valid(self):
+        status = validate_asset_hub_scene_selections(
+            self._asset_hub_search_result(),
+            {"scene-001": ["drive-one"], "scene-002": ["drive-two", "drive-three"]},
+        )
+        self.assertTrue(status["ok"], status)
+        self.assertEqual(
+            status["selected_asset_uids_by_scene"]["scene-002"],
+            ["drive-two", "drive-three"],
+        )
+
+    def test_asset_hub_search_result_adds_unsearched_context_scene_as_empty(self):
+        context = {
+            "scenes": [
+                {"scene_id": "scene-001", "scene_index": 1, "query": "one"},
+                {"scene_id": "scene-002", "scene_index": 2, "query": ""},
+            ]
+        }
+        result = merge_asset_hub_search_result_with_context(
+            {
+                "asset_hub_selection": {
+                    "scenes": [
+                        {
+                            "scene_id": "scene-001",
+                            "query": "one",
+                            "candidates": [{"asset_uid": "drive-one"}],
+                        }
+                    ]
+                }
+            },
+            context,
+        )
+        status = validate_asset_hub_scene_selections(
+            result,
+            {"scene-001": ["drive-one"], "scene-002": ["drive-two"]},
+        )
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["empty_candidate_scene_ids"], ["scene-002"])
+
+    def test_asset_hub_selected_asset_uids_must_be_strings(self):
+        with self.assertRaises(Exception):
+            validate_asset_hub_scene_selections(
+                self._asset_hub_search_result(),
+                {"scene-001": [123], "scene-002": ["drive-two"]},
+            )
+
+    def test_asset_hub_integer_asset_id_rejected(self):
+        search_context = build_asset_hub_search_context(
+            self._asset_hub_intent(),
+            {"sources": [{"scope": "generic"}]},
+        )
+        with self.assertRaises(Exception):
+            build_asset_hub_prepare_context(search_context, {"scene-001": [42]})
+
+    def test_asset_hub_scene_without_selection_blocks_prepare(self):
+        status = validate_asset_hub_scene_selections(
+            self._asset_hub_search_result(),
+            {"scene-001": ["drive-one"], "scene-002": []},
+        )
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["missing_scene_ids"], ["scene-002"])
+
+    def test_asset_hub_apply_prepare_result_produces_spec_contract(self):
+        spec = {"job_id": "asset-hub-intent-001", "video": {"video_subject": "x"}}
+        updated = apply_prepared_asset_hub_contract_to_spec(
+            spec,
+            self._asset_hub_prepare_result(),
+        )
+        self.assertEqual(
+            updated["asset_hub"]["renderer_manifest_path"],
+            "/data/job-assets/bundle-001/manifests/renderer-manifest.json",
+        )
+        self.assertNotIn("asset_hub", spec)
+
+    def test_asset_hub_payload_contains_renderer_manifest_path(self):
+        spec = {
+            "job_id": "asset-hub-payload-001",
+            "video": {
+                "video_subject": "Asset Hub payload",
+                "video_script": "Script",
+                "video_aspect": "9:16",
+                "video_concat_mode": "sequential",
+                "video_transition_mode": "None",
+                "video_clip_duration": 4,
+                "video_count": 1,
+                "voice_name": "es-MX-DaliaNeural-Female",
+                "voice_volume": 1.0,
+                "voice_rate": 1.0,
+                "bgm_type": "none",
+                "subtitle_enabled": False,
+                "n_threads": 1,
+                "paragraph_number": 1,
+            },
+        }
+        _prepared_spec, payload, _summary = build_moneyprinter_payload_with_prepared_asset_hub(
+            spec,
+            self._asset_hub_prepare_result(),
+        )
+        self.assertEqual(
+            payload["asset_hub_renderer_manifest_path"],
+            "/data/job-assets/bundle-001/manifests/renderer-manifest.json",
+        )
+        self.assertEqual(payload["asset_hub_bundle_uid"], "bundle-001")
+        self.assertEqual(payload["asset_hub_scene_mode"], "ordered")
+        self.assertTrue(payload["asset_hub_strict"])
+        self.assertNotIn("asset_hub_selection", payload)
+
+    def test_asset_hub_queue_helper_returns_exact_prepared_payload(self):
+        search_context = build_asset_hub_search_context(
+            self._asset_hub_intent(),
+            {"sources": [{"scope": "generic"}]},
+        )
+        prepare_context = build_asset_hub_prepare_context(
+            search_context,
+            {"scene-001": ["drive-one"], "scene-002": ["drive-two"]},
+            mpt_spec={"mpt_params": {"video_subject": "prepared"}},
+        )
+        payload = {"job_id": "prepared-job", "asset_hub_bundle_uid": "bundle-001"}
+
+        result = require_prepared_asset_hub_payload_for_queue(
+            stored_prepare_context=prepare_context,
+            current_prepare_context=prepare_context,
+            prepared_payload=payload,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertIs(result["payload"], payload)
+
+    def test_asset_hub_queue_helper_blocks_when_prepared_payload_missing(self):
+        context = build_asset_hub_prepare_context(
+            build_asset_hub_search_context(
+                self._asset_hub_intent(),
+                {"sources": [{"scope": "generic"}]},
+            ),
+            {"scene-001": ["drive-one"], "scene-002": ["drive-two"]},
+            mpt_spec={"mpt_params": {"video_subject": "prepared"}},
+        )
+
+        result = require_prepared_asset_hub_payload_for_queue(
+            stored_prepare_context=context,
+            current_prepare_context=context,
+            prepared_payload={},
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "NEEDS_INPUT")
+        self.assertEqual(result["reason"], "asset_hub_prepared_payload_missing")
+
+    def test_asset_hub_new_search_clears_previous_and_new_widget_selection_keys(self):
+        state = {
+            "asset_hub_select_scene-001": ["drive-old"],
+            "asset_hub_select_scene-002": ["drive-new"],
+            "job_intent_topic": "keep",
+        }
+        previous = {
+            "asset_hub_selection": {
+                "scenes": [{"scene_id": "scene-001", "candidates": []}]
+            }
+        }
+        new = {
+            "asset_hub_selection": {
+                "scenes": [{"scene_id": "scene-002", "candidates": []}]
+            }
+        }
+
+        cleared = clear_asset_hub_selection_widget_state(
+            state,
+            previous_search_result=previous,
+            new_search_result=new,
+        )
+
+        self.assertEqual(cleared, ["asset_hub_select_scene-001", "asset_hub_select_scene-002"])
+        self.assertEqual(state, {"job_intent_topic": "keep"})
+
+    def test_asset_hub_base_error_message_is_safe(self):
+        self.assertEqual(
+            asset_hub_safe_operator_error_message(
+                KurukinAssetHubError("token=secret response body")
+            ),
+            "Kurukin Asset Hub operation failed",
+        )
+
+    def test_asset_hub_search_and_prepare_only_use_explicit_buttons(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        search_index = source.index('st.button("Search Assets"')
+        prepare_index = source.index('st.button(\n        "Prepare Selected Assets"')
+        self.assertGreater(source.index("search_asset_hub_candidates", search_index), search_index)
+        self.assertGreater(source.index("wire_explicit_asset_hub_bundle", prepare_index), prepare_index)
+
+    def test_asset_hub_queue_does_not_call_provider_methods(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        queue_index = source.index('if st.button("Agregar a cola"')
+        queue_source = source[queue_index : source.index("compiled = st.session_state", queue_index)]
+        self.assertNotIn("search_asset_hub_candidates", queue_source)
+        self.assertNotIn("wire_explicit_asset_hub_bundle", queue_source)
+        self.assertNotIn("KurukinAssetProvider()", queue_source)
+        self.assertNotIn("_current_job_intent_compile_for_asset_hub", queue_source)
+        self.assertNotIn("build_moneyprinter_payload_with_prepared_asset_hub", queue_source)
+        self.assertIn("require_prepared_asset_hub_payload_for_queue", queue_source)
+        self.assertIn("job_intent_asset_hub_payload", queue_source)
+
+    def test_asset_hub_disabled_does_not_require_env(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        import_index = source.index("from app.custom.kurukin_asset_hub")
+        self.assertGreater(source.index("KurukinAssetProvider()", import_index), import_index)
+        self.assertNotIn("KurukinAssetProvider()", source[:import_index])
+
+    def test_asset_hub_safe_candidate_metadata_excludes_drive_and_rclone_paths(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        render_index = source.index("def _render_asset_hub_candidates")
+        render_source = source[render_index : source.index("def _render_job_intent_asset_hub_block", render_index)]
+        self.assertNotIn("drive_file_id", render_source)
+        self.assertNotIn("remote_path", render_source)
+        self.assertNotIn("rclone_remote", render_source)
+
+    def test_asset_hub_api_key_not_written_to_session_or_ui(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn('st.session_state["ASSET_HUB_API_KEY"]', source)
+        self.assertNotIn("api_key", source.lower())
 
     def test_normalize_aroll_broll_local_asset_paths_rejects_traversal(self):
         with self.assertRaises(ValueError):

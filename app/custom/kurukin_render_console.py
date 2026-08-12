@@ -36,7 +36,19 @@ from app.custom.kurukin_job_adapter import (
     validate_asset_filename,
     validate_local_filename,
 )
-from app.custom.kurukin_asset_hub_wiring import resolve_renderer_manifest_path
+from app.custom.kurukin_asset_hub import (
+    KurukinAssetHubAuthError,
+    KurukinAssetHubError,
+    KurukinAssetHubUnavailableError,
+    KurukinAssetHubValidationError,
+    validate_asset_uid,
+)
+from app.custom.kurukin_asset_hub_wiring import (
+    KurukinAssetHubMaterializationNotReady,
+    KurukinAssetHubSelectionRequired,
+    KurukinAssetHubWiringError,
+    resolve_renderer_manifest_path,
+)
 from app.custom.kurukin_job_queue import (
     enqueue_job_intent,
     enqueue_moneyprinter_payload,
@@ -60,10 +72,373 @@ AROLL_BROLL_LOCAL_BROLL_ROOTS = (
     ("storage", "local_assets"),
     ("storage", "local_images"),
 )
+ASSET_HUB_OPERATOR_SOURCE_GENERIC = "Generic"
+ASSET_HUB_OPERATOR_SOURCE_TITLE = "Title"
+ASSET_HUB_OPERATOR_SOURCE_BRAND = "Brand"
+ASSET_HUB_OPERATOR_SOURCE_TITLE_GENERIC = "Title + Generic"
+ASSET_HUB_OPERATOR_SOURCE_BRAND_GENERIC = "Brand + Generic"
+ASSET_HUB_OPERATOR_SOURCE_OPTIONS = (
+    ASSET_HUB_OPERATOR_SOURCE_GENERIC,
+    ASSET_HUB_OPERATOR_SOURCE_TITLE,
+    ASSET_HUB_OPERATOR_SOURCE_BRAND,
+    ASSET_HUB_OPERATOR_SOURCE_TITLE_GENERIC,
+    ASSET_HUB_OPERATOR_SOURCE_BRAND_GENERIC,
+)
 
 
 def _clean_text(value: str) -> str:
     return str(value or "").strip()
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def asset_hub_safe_operator_error_message(exc: Exception) -> str:
+    """Return a safe Asset Hub UI message without response bodies or secrets."""
+
+    if isinstance(exc, KurukinAssetHubAuthError):
+        return "Kurukin Asset Hub authorization failed"
+    if isinstance(exc, KurukinAssetHubValidationError):
+        return str(exc) or "Kurukin Asset Hub validation failed"
+    if isinstance(exc, KurukinAssetHubUnavailableError):
+        return "Kurukin Asset Hub is temporarily unavailable"
+    if isinstance(exc, KurukinAssetHubSelectionRequired):
+        return str(exc) or "Kurukin Asset Hub selection is required"
+    if isinstance(exc, KurukinAssetHubMaterializationNotReady):
+        return "Kurukin Asset Hub bundle is not ready yet"
+    if isinstance(exc, KurukinAssetHubWiringError):
+        return str(exc) or "Kurukin Asset Hub wiring contract failed"
+    if isinstance(exc, KurukinAssetHubError):
+        return "Kurukin Asset Hub operation failed"
+    return "Kurukin Asset Hub operation failed"
+
+
+def build_asset_hub_operator_source_policy(
+    option: str,
+    *,
+    title_slug: str = "",
+    brand_slug: str = "",
+) -> dict[str, Any]:
+    """Build the only source_policy variants exposed to the operator UI."""
+
+    label = _clean_text(option) or ASSET_HUB_OPERATOR_SOURCE_GENERIC
+    if label not in ASSET_HUB_OPERATOR_SOURCE_OPTIONS:
+        raise KurukinAssetHubValidationError("Asset Hub source policy is not supported")
+
+    title = _clean_text(title_slug)
+    brand = _clean_text(brand_slug)
+    if label in {ASSET_HUB_OPERATOR_SOURCE_TITLE, ASSET_HUB_OPERATOR_SOURCE_TITLE_GENERIC}:
+        if not title:
+            raise KurukinAssetHubValidationError("Title source requires slug")
+        sources = [{"scope": "title", "title": title}]
+        if label == ASSET_HUB_OPERATOR_SOURCE_TITLE_GENERIC:
+            sources.append({"scope": "generic"})
+        return {"sources": sources}
+
+    if label in {ASSET_HUB_OPERATOR_SOURCE_BRAND, ASSET_HUB_OPERATOR_SOURCE_BRAND_GENERIC}:
+        if not brand:
+            raise KurukinAssetHubValidationError("Brand source requires slug")
+        sources = [{"scope": "brand", "brand": brand}]
+        if label == ASSET_HUB_OPERATOR_SOURCE_BRAND_GENERIC:
+            sources.append({"scope": "generic"})
+        return {"sources": sources}
+
+    return {"sources": [{"scope": "generic"}]}
+
+
+def build_asset_hub_search_context(
+    intent: dict[str, Any],
+    source_policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a deterministic, secret-free context for Asset Hub searches."""
+
+    from app.custom.kurukin_asset_hub_wiring import build_asset_hub_search_requests
+
+    request_by_scene_id = {}
+    for request in build_asset_hub_search_requests(intent, source_policy):
+        request_by_scene_id[_clean_text(request.get("scene_id"))] = request
+
+    scenes = []
+    raw_scenes = intent.get("scenes") if isinstance(intent, dict) else []
+    if not isinstance(raw_scenes, list):
+        raw_scenes = []
+    for fallback, scene in enumerate(raw_scenes, start=1):
+        if not isinstance(scene, dict):
+            continue
+        raw_index = scene.get("scene_index", scene.get("index", fallback))
+        try:
+            scene_index = int(raw_index)
+        except (TypeError, ValueError):
+            scene_index = fallback
+        scene_id = _clean_text(scene.get("scene_id")) or f"scene-{scene_index:03d}"
+        request = request_by_scene_id.get(scene_id, {})
+        scenes.append(
+            {
+                "scene_id": scene_id,
+                "scene_index": scene_index,
+                "script_scene": _clean_text(
+                    scene.get("script_scene")
+                    or scene.get("text")
+                    or scene.get("caption")
+                    or scene.get("description")
+                    or request.get("script_scene")
+                ),
+                "query": _clean_text(request.get("query")),
+            }
+        )
+    return {
+        "source_policy": json.loads(_canonical_json(source_policy or {})),
+        "scenes": scenes,
+        "fingerprint": _canonical_json(
+            {
+                "source_policy": source_policy or {},
+                "scenes": scenes,
+            }
+        ),
+    }
+
+
+def merge_asset_hub_search_result_with_context(
+    search_result: dict[str, Any],
+    search_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Ensure every context scene is represented in a safe search result."""
+
+    result = json.loads(_canonical_json(search_result or {}))
+    selection = result.setdefault("asset_hub_selection", {})
+    scenes = selection.setdefault("scenes", [])
+    if not isinstance(scenes, list):
+        scenes = []
+        selection["scenes"] = scenes
+    seen = {
+        _clean_text(scene.get("scene_id"))
+        for scene in scenes
+        if isinstance(scene, dict)
+    }
+    for scene in (search_context or {}).get("scenes") or []:
+        if not isinstance(scene, dict):
+            continue
+        scene_id = _clean_text(scene.get("scene_id"))
+        if not scene_id or scene_id in seen:
+            continue
+        scenes.append(
+            {
+                "scene_id": scene_id,
+                "scene_index": scene.get("scene_index"),
+                "script_scene": _clean_text(scene.get("script_scene")),
+                "query": _clean_text(scene.get("query")),
+                "candidates": [],
+            }
+        )
+        seen.add(scene_id)
+    return result
+
+
+def clear_asset_hub_selection_widget_state(
+    session_state: dict[str, Any],
+    *,
+    previous_search_result: dict[str, Any] | None = None,
+    new_search_result: dict[str, Any] | None = None,
+) -> list[str]:
+    """Remove only Asset Hub scene multiselect widget keys from session state."""
+
+    cleared: list[str] = []
+    scene_ids = set()
+    for result in (previous_search_result or {}, new_search_result or {}):
+        scenes = (
+            (result or {})
+            .get("asset_hub_selection", {})
+            .get("scenes", [])
+        )
+        for scene in scenes if isinstance(scenes, list) else []:
+            if isinstance(scene, dict) and _clean_text(scene.get("scene_id")):
+                scene_ids.add(_clean_text(scene.get("scene_id")))
+    for scene_id in sorted(scene_ids):
+        key = f"asset_hub_select_{scene_id}"
+        if key in session_state:
+            session_state.pop(key, None)
+            cleared.append(key)
+    return cleared
+
+
+def build_asset_hub_prepare_context(
+    search_context: dict[str, Any],
+    selected_asset_uids_by_scene: dict[str, Any],
+    *,
+    job_context_fingerprint: str = "",
+    mpt_spec: dict[str, Any] | None = None,
+    mpt_spec_fingerprint: str = "",
+) -> dict[str, Any]:
+    """Return a deterministic context for a prepared explicit selection."""
+
+    selected: dict[str, list[str]] = {}
+    for scene_id in sorted((selected_asset_uids_by_scene or {}).keys()):
+        clean_scene_id = _clean_text(scene_id)
+        values = selected_asset_uids_by_scene.get(scene_id)
+        if not isinstance(values, list):
+            raise KurukinAssetHubValidationError(
+                "selected_asset_uids must be a list per scene"
+            )
+        selected[clean_scene_id] = [
+            validate_asset_uid(
+                asset_uid,
+                field_name=f"{clean_scene_id}.selected_asset_uids",
+            )
+            for asset_uid in values
+        ]
+    context = {
+        "search_context_fingerprint": _clean_text(
+            (search_context or {}).get("fingerprint")
+        ),
+        "selected_asset_uids_by_scene": selected,
+        "job_context_fingerprint": _clean_text(job_context_fingerprint)
+        or _clean_text(mpt_spec_fingerprint)
+        or build_asset_hub_job_spec_fingerprint(mpt_spec or {}),
+    }
+    context["fingerprint"] = _canonical_json(context)
+    return context
+
+
+def build_asset_hub_job_spec_fingerprint(mpt_spec: dict[str, Any]) -> str:
+    """Return a deterministic, secret-free fingerprint for the MPT spec context."""
+
+    if not isinstance(mpt_spec, dict):
+        raise KurukinAssetHubValidationError("mpt_spec must be a JSON object")
+    normalized = json.loads(_canonical_json(mpt_spec))
+    normalized.pop("asset_hub", None)
+    return _canonical_json(normalized)
+
+
+def asset_hub_search_context_matches(
+    stored_context: dict[str, Any] | None,
+    current_context: dict[str, Any] | None,
+) -> bool:
+    return bool(
+        stored_context
+        and current_context
+        and stored_context.get("fingerprint") == current_context.get("fingerprint")
+    )
+
+
+def asset_hub_prepare_context_matches(
+    stored_context: dict[str, Any] | None,
+    current_context: dict[str, Any] | None,
+) -> bool:
+    return asset_hub_search_context_matches(stored_context, current_context)
+
+
+def validate_asset_hub_scene_selections(
+    search_result: dict[str, Any],
+    selected_asset_uids_by_scene: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate explicit string asset_uid selections against search scenes."""
+
+    selection = (
+        (search_result or {})
+        .get("asset_hub_selection", {})
+        .get("scenes", [])
+    )
+    missing: list[str] = []
+    empty_candidate_scenes: list[str] = []
+    unknown: dict[str, list[str]] = {}
+    normalized: dict[str, list[str]] = {}
+    for scene in selection if isinstance(selection, list) else []:
+        if not isinstance(scene, dict):
+            continue
+        scene_id = _clean_text(scene.get("scene_id"))
+        if not scene_id:
+            continue
+        candidates = scene.get("candidates") if isinstance(scene.get("candidates"), list) else []
+        candidate_asset_uids = {
+            _clean_text(candidate.get("asset_uid"))
+            for candidate in candidates
+            if isinstance(candidate, dict) and _clean_text(candidate.get("asset_uid"))
+        }
+        if not candidates:
+            empty_candidate_scenes.append(scene_id)
+        raw_values = (selected_asset_uids_by_scene or {}).get(scene_id) or []
+        if not isinstance(raw_values, list):
+            raise KurukinAssetHubValidationError(
+                f"{scene_id}.selected_asset_uids must be a list"
+            )
+        clean_values = [
+            validate_asset_uid(asset_uid, field_name=f"{scene_id}.selected_asset_uids")
+            for asset_uid in raw_values
+        ]
+        if not clean_values:
+            missing.append(scene_id)
+        unknown_values = [
+            asset_uid for asset_uid in clean_values if asset_uid not in candidate_asset_uids
+        ]
+        if unknown_values:
+            unknown[scene_id] = unknown_values
+        normalized[scene_id] = clean_values
+    return {
+        "ok": not missing and not empty_candidate_scenes and not unknown and bool(normalized),
+        "missing_scene_ids": missing,
+        "empty_candidate_scene_ids": empty_candidate_scenes,
+        "unknown_asset_uids_by_scene": unknown,
+        "selected_asset_uids_by_scene": normalized,
+    }
+
+
+def apply_prepared_asset_hub_contract_to_spec(
+    spec: dict[str, Any],
+    prepare_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Copy the prepared Asset Hub renderer contract into an MPT spec."""
+
+    asset_hub = (prepare_result or {}).get("asset_hub")
+    if not isinstance(asset_hub, dict) or not asset_hub.get("renderer_manifest_path"):
+        raise KurukinAssetHubValidationError("Prepared Asset Hub contract is required")
+    updated = json.loads(_canonical_json(spec or {}))
+    updated["asset_hub"] = dict(asset_hub)
+    return updated
+
+
+def build_moneyprinter_payload_with_prepared_asset_hub(
+    spec: dict[str, Any],
+    prepare_result: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Insert the prepared Asset Hub contract before building the MPT payload."""
+
+    prepared_spec = apply_prepared_asset_hub_contract_to_spec(spec, prepare_result)
+    payload, summary = validate_and_build_payload_from_console_spec(prepared_spec)
+    return prepared_spec, payload, summary
+
+
+def require_prepared_asset_hub_payload_for_queue(
+    *,
+    stored_prepare_context: dict[str, Any] | None,
+    current_prepare_context: dict[str, Any] | None,
+    prepared_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the exact prepared payload Queue may enqueue, or a NEEDS_INPUT result."""
+
+    if not asset_hub_prepare_context_matches(
+        stored_prepare_context,
+        current_prepare_context,
+    ):
+        return {
+            "ok": False,
+            "status": "NEEDS_INPUT",
+            "reason": "asset_hub_prepare_required",
+            "payload": {},
+        }
+    if not isinstance(prepared_payload, dict) or not prepared_payload:
+        return {
+            "ok": False,
+            "status": "NEEDS_INPUT",
+            "reason": "asset_hub_prepared_payload_missing",
+            "payload": {},
+        }
+    return {
+        "ok": True,
+        "status": "READY_TO_SUBMIT",
+        "reason": "",
+        "payload": prepared_payload,
+    }
 
 
 def _validate_safe_bundle_uid(bundle_uid: str) -> str:
