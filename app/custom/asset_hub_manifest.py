@@ -11,11 +11,16 @@ ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 def get_asset_hub_job_assets_dir() -> Path:
     return Path(
-        os.environ.get(
-            "ASSET_HUB_JOB_ASSETS_DIR",
-            DEFAULT_ASSET_HUB_JOB_ASSETS_DIR,
-        )
+        os.environ.get("ASSET_HUB_MATERIALIZED_ROOT")
+        or os.environ.get("ASSET_HUB_JOB_ASSETS_DIR")
+        or DEFAULT_ASSET_HUB_JOB_ASSETS_DIR
     )
+
+
+def is_asset_hub_asset_ready(asset: dict[str, Any]) -> bool:
+    if "materialization_status" in asset:
+        return asset.get("materialization_status") == "ready"
+    return asset.get("status") == "ready"
 
 
 def _resolve_base_dir(base_dir: Path | None = None) -> Path:
@@ -103,6 +108,10 @@ def validate_asset_hub_renderer_manifest(manifest: dict[str, Any]) -> None:
                 raise ValueError(
                     f"asset hub scene {scene_index} asset {asset_index} must be an object"
                 )
+            if not isinstance(asset.get("asset_uid"), str) or not asset["asset_uid"].strip():
+                raise ValueError(
+                    f"asset hub scene {scene_index} asset {asset_index} asset_uid is required"
+                )
             if not isinstance(asset.get("type"), str) or not asset["type"]:
                 raise ValueError(
                     f"asset hub scene {scene_index} asset {asset_index} type is required"
@@ -161,6 +170,9 @@ def extract_asset_hub_local_assets(
     for scene in scenes:
         for asset in _asset_order(scene.get("assets", [])):
             try:
+                if not is_asset_hub_asset_ready(asset):
+                    continue
+
                 asset_type = asset.get("type")
                 if asset_type not in allowed:
                     raise ValueError(f"unsupported asset hub asset type: {asset_type}")

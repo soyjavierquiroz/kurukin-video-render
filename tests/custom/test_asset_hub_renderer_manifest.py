@@ -209,7 +209,9 @@ class AssetHubFixtureMixin:
                     "scene_index": 1,
                     "assets": [
                         {
+                            "asset_uid": "image-a",
                             "asset_id": "image-a",
+                            "status": "ready",
                             "type": "image",
                             "filename": "still-a.png",
                             "local_path": str(self.image_a),
@@ -217,7 +219,9 @@ class AssetHubFixtureMixin:
                             "safe_for_subtitles": False,
                         },
                         {
+                            "asset_uid": "video-b",
                             "asset_id": "video-b",
+                            "status": "ready",
                             "type": "video",
                             "filename": "clip-b.mp4",
                             "local_path": str(self.video_b),
@@ -231,7 +235,9 @@ class AssetHubFixtureMixin:
                     "scene_index": 0,
                     "assets": [
                         {
+                            "asset_uid": "video-a",
                             "asset_id": "video-a",
+                            "status": "ready",
                             "type": "video",
                             "filename": "clip-a.mp4",
                             "local_path": str(self.video_a),
@@ -306,6 +312,36 @@ class TestAssetHubRendererManifest(AssetHubFixtureMixin, unittest.TestCase):
             self.make_manifest()
         )
         self.assertEqual([asset["type"] for asset in assets], ["video", "image", "video"])
+
+    def test_local_path_without_status_is_not_consumed(self):
+        manifest = self.make_manifest(
+            scenes=[
+                {
+                    "scene_id": "scene-0",
+                    "scene_index": 0,
+                    "assets": [
+                        {
+                            "asset_uid": "video-a",
+                            "asset_id": "video-a",
+                            "type": "video",
+                            "filename": "clip-a.mp4",
+                            "local_path": str(self.video_a),
+                        }
+                    ],
+                }
+            ]
+        )
+
+        with self.assertRaises(ValueError):
+            asset_hub_manifest.extract_asset_hub_local_assets(manifest)
+
+    def test_manifest_asset_without_asset_uid_fails(self):
+        manifest = self.make_manifest()
+        manifest["scenes"][0]["assets"][0].pop("asset_uid")
+        manifest["scenes"][0]["assets"][0]["asset_id"] = "123"
+
+        with self.assertRaises(ValueError):
+            asset_hub_manifest.extract_asset_hub_local_assets(manifest)
 
     def test_unsupported_type_fails_or_skips_by_strict(self):
         manifest = self.make_manifest()

@@ -1584,6 +1584,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
                                 "needs_human_review": True,
                                 "assets": [
                                     {
+                                        "asset_uid": "still-a",
                                         "type": "image",
                                         "filename": "still-a.png",
                                         "local_path": str(image_path),
@@ -1591,6 +1592,7 @@ class TestKurukinRenderConsole(unittest.TestCase):
                                         "safe_for_subtitles": False,
                                     },
                                     {
+                                        "asset_uid": "clip-a",
                                         "type": "video",
                                         "filename": "clip-a.mp4",
                                         "local_path": str(video_path),
