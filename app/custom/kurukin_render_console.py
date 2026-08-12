@@ -36,6 +36,7 @@ from app.custom.kurukin_job_adapter import (
     validate_asset_filename,
     validate_local_filename,
 )
+from app.custom.kurukin_asset_hub_wiring import resolve_renderer_manifest_path
 from app.custom.kurukin_job_queue import (
     enqueue_job_intent,
     enqueue_moneyprinter_payload,
@@ -81,7 +82,7 @@ def default_asset_hub_manifest_path(bundle_uid: str) -> str:
     safe_bundle_uid = _validate_safe_bundle_uid(bundle_uid)
     if not safe_bundle_uid:
         return ""
-    return f"/data/job-assets/{safe_bundle_uid}/manifests/renderer-manifest.json"
+    return resolve_renderer_manifest_path(safe_bundle_uid)
 
 
 derive_manifest_path = default_asset_hub_manifest_path
