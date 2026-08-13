@@ -21,6 +21,7 @@ from app.custom.material_source_policy import (
     PROVIDER_LOCAL,
     build_discovery_plan,
 )
+from app.custom.kurukin_local_visual_picker import pick_local_visual_for_intent
 from app.services import material
 
 
@@ -255,7 +256,26 @@ def discover_material_candidates(
     for provider in policy.providers.enabled:
         attempted.append(provider)
         if provider == PROVIDER_LOCAL:
-            diagnostics.append(DiscoveryDiagnostic(provider, None, "pending_adapter", "local semantic discovery adapter is not available", None))
+            local_count = 0
+            for rank, term in enumerate(normalized_stock_terms, start=1):
+                # The existing picker only searches its explicit allow-list and
+                # applies its tested semantic ranking; do not crawl arbitrary paths.
+                picked = pick_local_visual_for_intent({"topic": term, "visual_keywords": [term]})
+                if not picked:
+                    continue
+                path = _safe_text(picked.get("path"))
+                if not path:
+                    continue
+                candidates.append(MaterialCandidate(
+                    provider=PROVIDER_LOCAL, canonical_id=f"local:{path}", dedupe_key=f"local:{path}",
+                    search_term=term, rank=rank, url=path, filename=path.rsplit("/", 1)[-1],
+                    source_info=_sanitize_source_info({"source": picked.get("source"), "type": picked.get("type")})))
+                local_count += 1
+            diagnostics.append(DiscoveryDiagnostic(
+                provider, None, "success" if local_count else "pending_adapter",
+                "local safe picker searched" if local_count else "local safe picker found no usable visual", local_count))
+            if local_count:
+                succeeded.append(provider)
             continue
         terms = normalized_hub_terms if provider == PROVIDER_ASSET_HUB else normalized_stock_terms
         if provider == PROVIDER_ASSET_HUB:

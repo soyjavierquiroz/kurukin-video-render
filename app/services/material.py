@@ -904,6 +904,19 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     return ""
 
 
+def download_material_candidate(candidate: Any, destination_dir: str) -> str:
+    """Download one already-selected stock candidate using the shared downloader.
+
+    Selection/acquisition callers deliberately do not implement another HTTP
+    client or permanent cache. ``destination_dir`` is supplied by the task
+    acquisition boundary and is normally its materials directory.
+    """
+    url = str(getattr(candidate, "url", "") or "").strip()
+    if not url:
+        raise ValueError("selected stock candidate has no download URL")
+    return save_video(url, save_dir=destination_dir)
+
+
 def _search_videos_with_cache(
     provider: str,
     search_videos: Callable[..., List[MaterialInfo]],
