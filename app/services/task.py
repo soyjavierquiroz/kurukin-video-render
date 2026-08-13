@@ -16,6 +16,10 @@ from loguru import logger
 
 from app.config import config
 from app.custom import asset_hub_manifest
+from app.custom.material_acquisition import acquire_selected_materials
+from app.custom.material_discovery import discover_material_candidates
+from app.custom.material_selection import select_material_candidates
+from app.custom.material_source_policy import material_source_policy_from_dict
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
@@ -1002,6 +1006,48 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return downloaded_videos
 
 
+def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) -> str | None:
+    """Materialize policy-selected assets into the normal local-material path."""
+    policy = material_source_policy_from_dict(params.material_source_policy)
+    discovery = discover_material_candidates(
+        policy=policy,
+        stock_terms=video_terms,
+        asset_hub_terms=params.asset_hub_terms or None,
+        video_aspect=params.video_aspect,
+        minimum_duration=params.video_clip_duration,
+    )
+    if not discovery.candidates:
+        return "No usable visual materials found"
+
+    target_duration = audio_duration
+    if target_duration <= 0:
+        target_duration = max(
+            params.video_clip_duration,
+            len(video_terms) * params.video_clip_duration,
+        )
+    selection = select_material_candidates(
+        discovery_result=discovery,
+        video_aspect=params.video_aspect,
+        target_duration=target_duration,
+        clip_duration=params.video_clip_duration,
+        recent_dedupe_keys=material.recent_external_asset_keys(),
+    )
+    if not selection.decisions:
+        return "No usable visual materials found"
+    if selection.shortfall > 0:
+        logger.warning(
+            "autonomous material selection shortfall: "
+            f"selected={selection.selected_count}, shortfall={selection.shortfall}"
+        )
+    acquisition = acquire_selected_materials(
+        selection_result=selection,
+        task_id=task_id,
+    )
+    params.video_source = "local"
+    params.video_materials = list(acquisition.materials)
+    return None
+
+
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
 ):
@@ -1569,6 +1615,18 @@ def _run_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
+    explicit_asset_hub_manifest = bool(
+        (getattr(params, "asset_hub_renderer_manifest_path", "") or "").strip()
+    )
+    if params.material_source_policy is not None and not explicit_asset_hub_manifest:
+        try:
+            autonomous_error = _prepare_autonomous_materials(
+                task_id, params, video_terms, audio_duration
+            )
+        except Exception as exc:
+            return _mark_task_failed(task_id, "materials", str(exc))
+        if autonomous_error:
+            return _mark_task_failed(task_id, "materials", autonomous_error)
     downloaded_videos = get_video_materials(
         task_id, params, video_terms, audio_duration
     )

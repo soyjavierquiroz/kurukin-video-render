@@ -8,6 +8,9 @@ from unittest.mock import patch
 from app.custom.material_discovery import MaterialCandidate
 from app.custom.material_acquisition import MaterialAcquisitionUnavailable, acquire_selected_materials
 from app.models.schema import MaterialInfo
+from app.services import material as material_service
+
+download_material_candidate = getattr(material_service, "download_material_candidate", None)
 
 
 def decision(candidate): return SimpleNamespace(candidate=candidate)
@@ -45,6 +48,14 @@ class TestMaterialAcquisition(unittest.TestCase):
         with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle", side_effect=error):
             with self.assertRaises(MaterialAcquisitionUnavailable): acquire_selected_materials(selection_result=SimpleNamespace(decisions=(decision(hub),)), task_id="t1", asset_hub_provider=object())
         with self.assertRaises(ValueError): acquire_selected_materials(selection_result=SimpleNamespace(decisions=()), task_id="../bad")
+
+    def test_stock_download_records_existing_external_history(self):
+        if download_material_candidate is None:
+            self.skipTest("material service is replaced by an isolated test fixture")
+        candidate = MaterialCandidate("pexels", "pexels:1", "pexels:1", "cat", url="https://download/1")
+        with patch.object(material_service, "save_video", return_value="/tmp/a.mp4", create=True), patch.object(material_service, "record_external_asset_usage") as record:
+            self.assertEqual(download_material_candidate(candidate, "/tmp"), "/tmp/a.mp4")
+        record.assert_called_once()
 
 
 if __name__ == "__main__": unittest.main()

@@ -99,6 +99,8 @@ class VideoParams(BaseModel):
     asset_hub_bundle_uid: str = ""
     asset_hub_scene_mode: str = "ordered"
     asset_hub_strict: bool = True
+    material_source_policy: dict | None = None
+    asset_hub_terms: list[str] = Field(default_factory=list)
 
     image_motion_enabled: bool = False
     image_motion_preset: str = ""

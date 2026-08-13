@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.custom.asset_hub_manifest import convert_asset_hub_manifest_to_materials
+from app.custom.kurukin_asset_hub import KurukinAssetProvider
 from app.custom.kurukin_asset_hub_wiring import wire_explicit_asset_hub_bundle
 from app.models.schema import MaterialInfo
 from app.services import material
@@ -107,7 +108,7 @@ def acquire_selected_materials(*, selection_result: Any, task_id: str,
     decisions = list(getattr(selection_result, "decisions", ()) or ())
     hub = [decision for decision in decisions if getattr(decision.candidate, "provider", "") == "asset_hub"]
     if hub and asset_hub_provider is None:
-        raise ValueError("asset_hub_provider is required for selected Asset Hub materials")
+        asset_hub_provider = KurukinAssetProvider()
     hub_infos, bundle_uid = ([], None)
     if hub: hub_infos, bundle_uid = _asset_hub_materials(hub, task_id, asset_hub_provider)
     hub_by_key = {decision.candidate.dedupe_key: info for decision, info in zip(hub, hub_infos)}
@@ -123,7 +124,9 @@ def acquire_selected_materials(*, selection_result: Any, task_id: str,
                                 duration=int(float(getattr(candidate, "duration", 0) or 0)),
                                 source_info=_safe({"dedupe_key": candidate.dedupe_key, "search_term": candidate.search_term}))
         else:
-            local_path = material.download_material_candidate(candidate, str(materials_dir))
+            local_path = material.download_material_candidate(
+                candidate, str(materials_dir), task_id=task_id
+            )
             if not local_path:
                 raise MaterialAcquisitionError(f"download failed for {provider}:{getattr(candidate, 'canonical_id', '')}")
             info = MaterialInfo(provider=provider, url=local_path, duration=int(float(getattr(candidate, "duration", 0) or 0)),

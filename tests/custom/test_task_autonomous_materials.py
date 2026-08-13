@@ -1,0 +1,54 @@
+import importlib.util
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+if importlib.util.find_spec("openai") is None:
+    raise unittest.SkipTest("task service optional dependencies are not installed")
+
+from app.models.schema import MaterialInfo, VideoParams
+from app.services import task
+
+
+class TestAutonomousMaterialPreparation(unittest.TestCase):
+    def policy(self):
+        return {"providers": {"enabled": ["pexels"]}}
+
+    def test_policy_runs_discover_select_acquire_and_uses_audio_duration(self):
+        params = VideoParams(video_subject="cat", material_source_policy=self.policy(), asset_hub_terms=["hub cat"])
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        acquired = [MaterialInfo(provider="pexels", url="/tmp/cat.mp4")]
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, patch.object(task, "select_material_candidates", return_value=selection) as select, patch.object(task, "acquire_selected_materials", return_value=SimpleNamespace(materials=acquired)) as acquire, patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            error = task._prepare_autonomous_materials("t1", params, ["stock cat"], 17)
+        self.assertIsNone(error)
+        self.assertEqual(params.video_source, "local")
+        self.assertEqual(params.video_materials, acquired)
+        self.assertEqual(discover.call_args.kwargs["asset_hub_terms"], ["hub cat"])
+        self.assertEqual(select.call_args.kwargs["target_duration"], 17)
+        acquire.assert_called_once_with(selection_result=selection, task_id="t1")
+
+    def test_shortfall_warns_and_continues(self):
+        params = VideoParams(video_subject="cat", material_source_policy=self.policy())
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=2, selected_count=1)
+        with patch.object(task, "discover_material_candidates", return_value=SimpleNamespace(candidates=(SimpleNamespace(),))), patch.object(task, "select_material_candidates", return_value=selection), patch.object(task, "acquire_selected_materials", return_value=SimpleNamespace(materials=[])), patch.object(task.material, "recent_external_asset_keys", return_value=set()), patch.object(task.logger, "warning") as warning:
+            self.assertIsNone(task._prepare_autonomous_materials("t1", params, ["cat"], 5))
+        self.assertTrue(warning.called)
+
+    def test_no_candidates_has_clear_error(self):
+        params = VideoParams(video_subject="cat", material_source_policy=self.policy())
+        with patch.object(task, "discover_material_candidates", return_value=SimpleNamespace(candidates=())):
+            self.assertEqual(task._prepare_autonomous_materials("t1", params, ["cat"], 5), "No usable visual materials found")
+
+    def test_pipeline_skips_discovery_without_policy_and_with_explicit_manifest(self):
+        for policy, manifest in ((None, ""), (self.policy(), "/explicit.json")):
+            with self.subTest(policy=policy, manifest=manifest):
+                params = VideoParams(video_subject="cat", material_source_policy=policy, asset_hub_renderer_manifest_path=manifest)
+                with patch.object(task, "generate_script", return_value="script"), patch.object(task, "apply_asset_hub_renderer_manifest"), patch.object(task, "generate_terms", return_value=["cat"]), patch.object(task, "save_script_data"), patch.object(task, "generate_audio", return_value=("audio.mp3", 5, None)), patch.object(task, "generate_subtitle", return_value=""), patch.object(task, "get_video_materials", return_value=["cat.mp4"]), patch.object(task, "discover_material_candidates") as discover, patch.object(task.sm.state, "update_task"):
+                    result = task._run_pipeline("t1", params, stop_at="materials")
+                discover.assert_not_called()
+                self.assertEqual(result["materials"], ["cat.mp4"])
+
+
+if __name__ == "__main__":
+    unittest.main()

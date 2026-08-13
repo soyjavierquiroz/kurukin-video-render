@@ -160,6 +160,25 @@ class MaterialSourcePolicy:
         return asdict(self)
 
 
+def material_source_policy_from_dict(value: MaterialSourcePolicy | dict[str, Any]) -> MaterialSourcePolicy:
+    """Parse the JSON-safe job form into the existing policy value object."""
+    if isinstance(value, MaterialSourcePolicy):
+        return value
+    if not isinstance(value, dict):
+        raise ValueError("material_source_policy must be an object")
+
+    providers = value.get("providers")
+    if isinstance(providers, dict):
+        providers = providers.get("enabled")
+    asset_hub = value.get("asset_hub", {})
+    if not isinstance(asset_hub, dict):
+        raise ValueError("material_source_policy.asset_hub must be an object")
+    return MaterialSourcePolicy(
+        providers=MaterialProviderPolicy(providers),
+        asset_hub=AssetHubCatalogPolicy(**asset_hub),
+    )
+
+
 def build_asset_hub_source_policy(policy: MaterialSourcePolicy) -> dict[str, list[dict[str, str]]]:
     """Compile explicit scopes to the current Asset Hub search contract.
 

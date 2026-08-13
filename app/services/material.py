@@ -200,6 +200,11 @@ def _recent_external_asset_keys(history_file: str = ASSET_USAGE_HISTORY_FILE) ->
     return keys
 
 
+def recent_external_asset_keys() -> set[str]:
+    """Expose the existing external-asset history keys to selection callers."""
+    return _recent_external_asset_keys()
+
+
 def is_recent_external_asset(item, history_file: str = ASSET_USAGE_HISTORY_FILE) -> bool:
     identity_key = _external_asset_identity_key(item)
     if not identity_key:
@@ -904,7 +909,7 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     return ""
 
 
-def download_material_candidate(candidate: Any, destination_dir: str) -> str:
+def download_material_candidate(candidate: Any, destination_dir: str, task_id: str = "") -> str:
     """Download one already-selected stock candidate using the shared downloader.
 
     Selection/acquisition callers deliberately do not implement another HTTP
@@ -914,7 +919,14 @@ def download_material_candidate(candidate: Any, destination_dir: str) -> str:
     url = str(getattr(candidate, "url", "") or "").strip()
     if not url:
         raise ValueError("selected stock candidate has no download URL")
-    return save_video(url, save_dir=destination_dir)
+    saved_path = save_video(url, save_dir=destination_dir)
+    if saved_path:
+        record_external_asset_usage(
+            candidate,
+            task_id=task_id,
+            subject=str(getattr(candidate, "search_term", "") or ""),
+        )
+    return saved_path
 
 
 def _search_videos_with_cache(

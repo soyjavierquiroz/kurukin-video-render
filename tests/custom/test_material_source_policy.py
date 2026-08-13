@@ -9,7 +9,8 @@ from app.custom.material_source_policy import (
     PROVIDER_PIXABAY, AssetHubCatalogPolicy, AssetHubExcludePolicy,
     AssetHubIncludePolicy, CatalogExpansionRequired, MaterialProviderPolicy,
     MaterialSourcePolicy, asset_hub_only_policy, build_asset_hub_source_policy,
-    build_discovery_plan, external_only_policy, local_only_policy, open_sources_policy,
+    build_discovery_plan, external_only_policy, local_only_policy,
+    material_source_policy_from_dict, open_sources_policy,
 )
 
 
@@ -90,6 +91,13 @@ class TestMaterialSourcePolicy(unittest.TestCase):
         serialized = str(policy.to_dict())
         for forbidden in ("drive_file_id", "remote_path", "rclone_remote", "credentials", "target_path"):
             self.assertNotIn(forbidden, serialized)
+
+    def test_parses_json_job_policy(self):
+        policy = material_source_policy_from_dict({
+            "providers": {"enabled": ["pexels", "asset_hub"]},
+            "asset_hub": {"include": {"generic": True}},
+        })
+        self.assertEqual(policy.providers.enabled, (PROVIDER_ASSET_HUB, PROVIDER_PEXELS))
 
 
 if __name__ == "__main__":
