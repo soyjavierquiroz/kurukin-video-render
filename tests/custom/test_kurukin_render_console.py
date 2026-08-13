@@ -70,6 +70,7 @@ from app.custom.kurukin_render_console import (
     build_render_console_spec,
     build_workflow_payload,
     clear_asset_hub_selection_widget_state,
+    content_is_valid_for_asset_selection,
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
     enqueue_job_intent_from_console,
@@ -82,6 +83,7 @@ from app.custom.kurukin_render_console import (
     prepare_broll_assets_from_console,
     process_queued_intent_batch_with_mpt_native,
     process_queued_intent_with_mpt_native,
+    rank_asset_hub_candidates_for_format,
     require_prepared_asset_hub_payload_for_queue,
     safe_relative_path,
     submit_mpt_native_local_job_from_console,
@@ -89,6 +91,11 @@ from app.custom.kurukin_render_console import (
     validate_and_build_payload_from_console_spec,
 )
 from app.custom.kurukin_asset_hub import KurukinAssetHubError
+from app.custom.kurukin_job_intent import compile_job_intent_to_mpt_spec
+from app.custom.kurukin_asset_hub_wiring import (
+    build_asset_hub_search_requests,
+    search_asset_hub_candidates,
+)
 
 
 BUNDLE_UID = "jab_b28367fb22d44a40bae507c175f464c4"
@@ -128,6 +135,31 @@ def make_spec(**overrides):
     }
     values.update(overrides)
     return build_render_console_spec(**values)
+
+
+def function_source(source: str, name: str) -> str:
+    start = source.index(f"def {name}")
+    next_start = source.find("\ndef ", start + 1)
+    if next_start == -1:
+        return source[start:]
+    return source[start:next_start]
+
+
+def simple_mode_source(source: str) -> str:
+    names = (
+        "_render_simple_asset_hub_block",
+        "_simple_format_label",
+        "_simple_format_value",
+        "_simple_asset_label",
+        "_simple_scene_count",
+        "_simple_content_missing_message",
+        "_render_simple_content_step",
+        "_render_simple_assets_step",
+        "_render_simple_video_options_step",
+        "_render_simple_create_step",
+        "_simple_render_view",
+    )
+    return "\n".join(function_source(source, name) for name in names)
 
 
 class TestKurukinRenderConsole(unittest.TestCase):
@@ -436,6 +468,76 @@ class TestKurukinRenderConsole(unittest.TestCase):
         )
         self.assertFalse(asset_hub_search_context_matches(first, second))
 
+    def test_asset_hub_query_override_changes_search_fingerprint(self):
+        intent = self._asset_hub_intent()
+        source_policy = {"sources": [{"scope": "generic"}]}
+        original = build_asset_hub_search_context(intent, source_policy)
+        overridden = build_asset_hub_search_context(
+            intent,
+            source_policy,
+            {"scene-001": "mujer laptop oficina"},
+        )
+
+        self.assertEqual(overridden["scenes"][0]["query"], "mujer laptop oficina")
+        self.assertFalse(asset_hub_search_context_matches(original, overridden))
+
+    def test_asset_hub_query_override_makes_prepare_context_stale(self):
+        intent = self._asset_hub_intent()
+        source_policy = {"sources": [{"scope": "generic"}]}
+        selection = {"scene-001": ["drive-one"], "scene-002": ["drive-two"]}
+        original_prepare = build_asset_hub_prepare_context(
+            build_asset_hub_search_context(intent, source_policy),
+            selection,
+        )
+        override_prepare = build_asset_hub_prepare_context(
+            build_asset_hub_search_context(
+                intent,
+                source_policy,
+                {"scene-001": "mujer laptop oficina"},
+            ),
+            selection,
+        )
+
+        self.assertFalse(
+            asset_hub_prepare_context_matches(original_prepare, override_prepare)
+        )
+
+    def test_asset_hub_provider_receives_exact_query_override(self):
+        intent = {
+            "scenes": [
+                {
+                    "scene_id": "scene-001",
+                    "scene_index": 1,
+                    "script_scene": (
+                        "Una mujer revisa información en su laptop mientras trabaja en una oficina"
+                    ),
+                }
+            ]
+        }
+        source_policy = {"sources": [{"scope": "generic"}]}
+        requests = []
+        for request in build_asset_hub_search_requests(intent, source_policy):
+            request = dict(request)
+            request["query"] = {"scene-001": "mujer laptop oficina"}[request["scene_id"]]
+            requests.append(request)
+
+        class Provider:
+            def __init__(self):
+                self.queries = []
+
+            def search(self, *, query, source_policy):
+                self.queries.append(query)
+                return [{"asset_uid": "drive-one"}]
+
+        provider = Provider()
+        result = search_asset_hub_candidates(provider, requests)
+
+        self.assertEqual(provider.queries, ["mujer laptop oficina"])
+        self.assertEqual(
+            result["asset_hub_selection"]["scenes"][0]["query"],
+            "mujer laptop oficina",
+        )
+
     def test_asset_hub_cached_last_compile_old_intent_does_not_make_current_context_fresh(self):
         intent_a = self._asset_hub_intent()
         intent_b = self._asset_hub_intent()
@@ -518,6 +620,61 @@ class TestKurukinRenderConsole(unittest.TestCase):
             build_asset_hub_job_spec_fingerprint(horizontal_spec),
         )
         self.assertFalse(asset_hub_prepare_context_matches(first, second))
+
+    def test_asset_hub_rank_vertical_puts_9x16_before_4x5(self):
+        ranked = rank_asset_hub_candidates_for_format(
+            [
+                {"asset_uid": "four-five", "orientation": "vertical-4x5"},
+                {"asset_uid": "nine-sixteen", "orientation": "vertical-9x16"},
+            ],
+            "vertical",
+        )
+
+        self.assertEqual([item["asset_uid"] for item in ranked], ["nine-sixteen", "four-five"])
+
+    def test_asset_hub_rank_vertical_puts_4x5_before_16x9(self):
+        ranked = rank_asset_hub_candidates_for_format(
+            [
+                {"asset_uid": "horizontal", "orientation": "horizontal-16x9"},
+                {"asset_uid": "four-five", "orientation": "vertical-4x5"},
+            ],
+            "vertical",
+        )
+
+        self.assertEqual([item["asset_uid"] for item in ranked], ["four-five", "horizontal"])
+
+    def test_asset_hub_rank_horizontal_puts_16x9_first(self):
+        ranked = rank_asset_hub_candidates_for_format(
+            [
+                {"asset_uid": "vertical", "orientation": "vertical-9x16"},
+                {"asset_uid": "horizontal", "orientation": "horizontal-16x9"},
+            ],
+            "horizontal",
+        )
+
+        self.assertEqual([item["asset_uid"] for item in ranked], ["horizontal", "vertical"])
+
+    def test_asset_hub_rank_is_stable_within_same_orientation(self):
+        ranked = rank_asset_hub_candidates_for_format(
+            [
+                {"asset_uid": "first", "orientation": "vertical-9x16"},
+                {"asset_uid": "second", "orientation": "vertical-9x16"},
+            ],
+            "vertical",
+        )
+
+        self.assertEqual([item["asset_uid"] for item in ranked], ["first", "second"])
+
+    def test_asset_hub_rank_missing_orientation_goes_last(self):
+        ranked = rank_asset_hub_candidates_for_format(
+            [
+                {"asset_uid": "missing"},
+                {"asset_uid": "horizontal", "orientation": "horizontal-16x9"},
+            ],
+            "horizontal",
+        )
+
+        self.assertEqual([item["asset_uid"] for item in ranked], ["horizontal", "missing"])
 
     def test_asset_hub_search_result_does_not_autoselect(self):
         result = self._asset_hub_search_result()
@@ -689,6 +846,45 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertEqual(result["status"], "NEEDS_INPUT")
         self.assertEqual(result["reason"], "asset_hub_prepared_payload_missing")
 
+    def test_asset_hub_content_valid_with_scenes_even_when_audio_is_missing(self):
+        result = compile_job_intent_to_mpt_spec(
+            {
+                "mode": "topic_to_video",
+                "topic": "Asset Hub topic without audio",
+                "script": "Scene one explains the product clearly.",
+                "language": "es",
+                "duration_seconds": 20,
+                "format": "vertical",
+                "preset": "educational",
+            }
+        )
+
+        self.assertEqual(result["status"], "NEEDS_INPUT")
+        self.assertEqual(result["reasons"], ["needs_audio_or_tts"])
+        self.assertTrue(content_is_valid_for_asset_selection(result))
+        requests = build_asset_hub_search_requests(
+            result["intent"],
+            {"sources": [{"scope": "generic"}]},
+        )
+        self.assertTrue(requests)
+        self.assertFalse(result["ok"])
+
+    def test_asset_hub_content_invalid_without_scenes(self):
+        result = {
+            "ok": True,
+            "status": "NEEDS_INPUT",
+            "intent": {
+                "mode": "topic_to_video",
+                "topic": "No scenes yet",
+                "topic_plan": {"scenes": []},
+                "scenes": [],
+            },
+            "reasons": ["needs_audio_or_tts"],
+            "errors": [],
+        }
+
+        self.assertFalse(content_is_valid_for_asset_selection(result))
+
     def test_asset_hub_new_search_clears_previous_and_new_widget_selection_keys(self):
         state = {
             "asset_hub_select_scene-001": ["drive-old"],
@@ -727,10 +923,104 @@ class TestKurukinRenderConsole(unittest.TestCase):
         source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
             encoding="utf-8"
         )
-        search_index = source.index('st.button("Search Assets"')
-        prepare_index = source.index('st.button(\n        "Prepare Selected Assets"')
+        search_index = source.index('st.button("Buscar assets"')
+        prepare_index = source.index('st.button(\n        "Preparar assets seleccionados"')
         self.assertGreater(source.index("search_asset_hub_candidates", search_index), search_index)
         self.assertGreater(source.index("wire_explicit_asset_hub_bundle", prepare_index), prepare_index)
+        self.assertNotIn('st.button("Search Assets"', source)
+        self.assertNotIn('"Prepare Selected Assets"', source)
+
+    def test_asset_hub_ui_shows_editable_effective_query(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("def _render_asset_hub_query_inputs", source)
+        self.assertIn('st.text_input("Buscar como:", key=key)', source)
+        self.assertIn('return f"asset_hub_query_{scene_id}"', source)
+        self.assertIn("_asset_hub_search_requests_with_effective_queries", source)
+
+    def test_asset_hub_ui_uses_query_override_in_context_and_search(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        context_source = source[
+            source.index("def _current_asset_hub_context") :
+            source.index("def _asset_hub_context_is_current")
+        ]
+        search_source = source[
+            source.index('if st.button("Buscar assets"') :
+            source.index("search_result = st.session_state.get", source.index('if st.button("Buscar assets"'))
+        ]
+        self.assertIn("_asset_hub_query_overrides_by_scene_id", context_source)
+        self.assertIn("_asset_hub_search_requests_with_effective_queries", search_source)
+        self.assertNotIn("requests = build_asset_hub_search_requests(intent, source_policy)", search_source)
+
+    def test_asset_hub_zero_candidates_has_single_human_message_in_main_block(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        block = source[
+            source.index("def _render_asset_hub_candidates") :
+            source.index("def _render_job_intent_asset_hub_block")
+        ]
+        self.assertIn(
+            "No encontré assets para esta escena. Prueba otra búsqueda.",
+            block,
+        )
+        self.assertNotIn("Scenes sin candidatos", block)
+        self.assertNotIn("Scenes sin selección", block)
+        self.assertNotIn("no hay candidatos", block)
+
+    def test_asset_hub_main_status_messages_are_human(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        block = source[
+            source.index("def _asset_hub_status_message") :
+            source.index("def _render_asset_hub_diagnostic")
+        ]
+        self.assertIn("Busca assets para tus escenas.", block)
+        self.assertIn("Elige al menos un asset por escena.", block)
+        self.assertIn("Selección lista. Ahora prepara los assets.", block)
+        self.assertIn("Assets listos para render.", block)
+        self.assertNotIn("NEEDS_INPUT", block)
+
+    def test_asset_hub_ui_keeps_asset_uid_as_multiselect_value(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        render_index = source.index("def _render_asset_hub_candidates")
+        render_source = source[render_index : source.index("def _render_job_intent_asset_hub_block", render_index)]
+        self.assertIn('candidate.get("asset_uid")', render_source)
+        self.assertIn("format_func=", render_source)
+        self.assertNotIn('default=options', render_source)
+
+    def test_asset_hub_ui_has_no_autoselection_defaults(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        render_index = source.index("def _render_asset_hub_candidates")
+        render_source = source[render_index : source.index("def _render_job_intent_asset_hub_block", render_index)]
+        self.assertIn("default=current", render_source)
+        self.assertNotIn("selected_by_scene[scene_id] = options", render_source)
+        self.assertNotIn("options[:1]", render_source)
+
+    def test_asset_hub_ui_moves_raw_candidate_json_to_diagnostic(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        region_start = source.index("def _asset_hub_safe_error_message")
+        region_end = source.index("def render_job_intent_step")
+        diagnostic_index = source.index("def _render_asset_hub_diagnostic")
+        diagnostic_source = source[
+            diagnostic_index : source.index("def _render_asset_hub_candidates", diagnostic_index)
+        ]
+        main_source = source[region_start:region_end].replace(diagnostic_source, "")
+        self.assertIn('st.expander("Diagnóstico Asset Hub", expanded=False)', source)
+        self.assertNotIn("st.json(source_policy)", main_source)
+        self.assertNotIn("st.json(search_result)", main_source)
+        self.assertNotIn("st.json(prepare_result", main_source)
+        self.assertNotIn("st.dataframe(safe_rows", main_source)
 
     def test_asset_hub_queue_does_not_call_provider_methods(self):
         source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
@@ -745,6 +1035,108 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertNotIn("build_moneyprinter_payload_with_prepared_asset_hub", queue_source)
         self.assertIn("require_prepared_asset_hub_payload_for_queue", queue_source)
         self.assertIn("job_intent_asset_hub_payload", queue_source)
+
+    def test_simple_mode_is_default_entrypoint(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        entrypoint = source[source.index("st.set_page_config") :]
+
+        self.assertIn(
+            'advanced_mode = st.checkbox("Mostrar modo avanzado", key="show_advanced_mode")',
+            entrypoint,
+        )
+        self.assertLess(entrypoint.index("if advanced_mode:"), entrypoint.index("else:"))
+        self.assertIn("_simple_render_view()", entrypoint[entrypoint.index("else:") :])
+
+    def test_simple_mode_source_contains_only_simple_sections(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        simple_source = simple_mode_source(source)
+
+        for expected in (
+            "Crear video Kurukin",
+            "### 1. Contenido",
+            "### 2. Assets",
+            "### 3. Opciones de video",
+            "### 4. Crear",
+            "Usar Kurukin Asset Hub",
+            "Se usarán las fuentes visuales configuradas actualmente.",
+            "Preparar assets",
+        ):
+            self.assertIn(expected, simple_source)
+
+    def test_legacy_sections_do_not_render_in_simple_mode_source(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        simple_source = simple_mode_source(source)
+
+        for forbidden in (
+            "Flujo completo",
+            "Crear lote desde audios",
+            "Motor MPT nativo",
+            "Modo recomendado para prueba",
+            "Detalles JSON",
+            "Spec MPT preparada por intención",
+            "Resultado cola por intención",
+            "Resultado MPT nativo",
+        ):
+            self.assertNotIn(forbidden, simple_source)
+
+    def test_raw_json_and_tables_do_not_render_in_simple_mode_source(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        simple_source = simple_mode_source(source)
+
+        for forbidden in (
+            "st.json(",
+            "st.code(",
+            "st.dataframe(",
+            "Diagnóstico Asset Hub",
+            "NEEDS_INPUT",
+            "st.write(raw",
+        ):
+            self.assertNotIn(forbidden, simple_source)
+
+    def test_advanced_mode_preserves_legacy_sections(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        advanced_source = source[
+            source.index("def _new_render_view") :
+            source.index("def _status_label")
+        ]
+        entrypoint = source[source.index("if advanced_mode:") :]
+
+        for expected in (
+            "_end_to_end_flow_block()",
+            "render_batch_audio_intent_step()",
+            "render_mpt_native_local_submit_step()",
+            "_recommended_test_mode_block()",
+            "render_validate_enqueue_step(manifest_summary)",
+            "_queue_storage_view()",
+            "_diagnostics_expander()",
+        ):
+            self.assertIn(expected, advanced_source + entrypoint)
+
+    def test_simple_asset_hub_queue_uses_prepared_payload_contract(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        queue_source = source[
+            source.index("def _render_simple_create_step") :
+            source.index("def _simple_render_view")
+        ]
+
+        self.assertIn("require_prepared_asset_hub_payload_for_queue", queue_source)
+        self.assertIn("job_intent_asset_hub_payload", queue_source)
+        self.assertIn("enqueue_moneyprinter_payload(payload)", queue_source)
+        self.assertNotIn("search_asset_hub_candidates", queue_source)
+        self.assertNotIn("wire_explicit_asset_hub_bundle", queue_source)
+        self.assertNotIn("KurukinAssetProvider()", queue_source)
 
     def test_asset_hub_disabled_does_not_require_env(self):
         source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
@@ -763,6 +1155,40 @@ class TestKurukinRenderConsole(unittest.TestCase):
         self.assertNotIn("drive_file_id", render_source)
         self.assertNotIn("remote_path", render_source)
         self.assertNotIn("rclone_remote", render_source)
+
+    def test_asset_hub_diagnostic_filters_drive_and_rclone_paths(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        safe_index = source.index("def _safe_asset_hub_diagnostic")
+        safe_source = source[safe_index : source.index("def _asset_hub_status_message", safe_index)]
+        self.assertIn('"drive_file_id"', safe_source)
+        self.assertIn('"remote_path"', safe_source)
+        self.assertIn('"rclone_remote"', safe_source)
+
+    def test_job_intent_advanced_fields_are_outside_main_flow(self):
+        source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
+            encoding="utf-8"
+        )
+        render_source = source[source.index("def render_job_intent_step") :]
+        advanced_source = render_source[
+            render_source.index('st.expander("Opciones avanzadas", expanded=False)') :
+        ]
+        main_source = render_source[: render_source.index('st.expander("Opciones avanzadas", expanded=False)')]
+        for text in (
+            'st.text_input("task_id"',
+            'st.text_input(\n            "video_path"',
+            'st.checkbox(\n            "Permitir visual local de baja relevancia"',
+            'st.checkbox(\n            "stock nativo MPT"',
+            'st.selectbox(\n            "fuente stock"',
+            'st.text_input("términos stock"',
+            'st.button("Preparar spec MPT"',
+            'st.button(\n            "Enviar a MPT nativo"',
+        ):
+            self.assertIn(text, advanced_source)
+            self.assertNotIn(text, main_source)
+        self.assertIn('"Validar contenido"', main_source)
+        self.assertIn('"Agregar a cola"', main_source)
 
     def test_asset_hub_api_key_not_written_to_session_or_ui(self):
         source = Path("webui/pages/Kurukin_Render_Console.py").read_text(
@@ -1697,22 +2123,21 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "MPT_ENGINE_SUBMIT_FLAG",
             "Submit real MPT desactivado. Activa",
             "Crear por intención",
-            "Validar intención",
+            "Validar contenido",
             "Preparar spec MPT",
             "Agregar a cola",
             "job_intent_enqueue",
             "Resultado cola por intención",
-            "audio_path local",
-            "Tema a video acepta audio_path local; no se genera TTS.",
-            "video_path (opcional para topic_to_video/audio_to_video)",
-            "Si no pasas video_path, Kurukin intentará usar un visual local automático.",
+            "Audio path",
+            "Opciones avanzadas",
+            "video_path",
             "Permitir visual local de baja relevancia",
             "job_intent_allow_low_relevance_visual",
-            "Permitir stock nativo MPT si no hay visual local relevante",
+            "stock nativo MPT",
             "job_intent_allow_mpt_stock_visuals",
-            "Fuente stock preferida",
+            "fuente stock",
             "JOB_INTENT_STOCK_SOURCE_LABELS",
-            "Términos stock",
+            "términos stock",
             "job_intent_stock_terms",
             "puede quedar READY_TO_SUBMIT sin TTS.",
             "script generado",

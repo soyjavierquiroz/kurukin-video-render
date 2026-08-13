@@ -150,14 +150,24 @@ def build_asset_hub_operator_source_policy(
 def build_asset_hub_search_context(
     intent: dict[str, Any],
     source_policy: dict[str, Any],
+    query_overrides_by_scene_id: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a deterministic, secret-free context for Asset Hub searches."""
 
     from app.custom.kurukin_asset_hub_wiring import build_asset_hub_search_requests
 
+    overrides = {
+        _clean_text(scene_id): _clean_text(query)
+        for scene_id, query in (query_overrides_by_scene_id or {}).items()
+        if _clean_text(scene_id)
+    }
     request_by_scene_id = {}
     for request in build_asset_hub_search_requests(intent, source_policy):
-        request_by_scene_id[_clean_text(request.get("scene_id"))] = request
+        clean_scene_id = _clean_text(request.get("scene_id"))
+        if clean_scene_id in overrides:
+            request = dict(request)
+            request["query"] = overrides[clean_scene_id]
+        request_by_scene_id[clean_scene_id] = request
 
     scenes = []
     raw_scenes = intent.get("scenes") if isinstance(intent, dict) else []
@@ -233,6 +243,66 @@ def merge_asset_hub_search_result_with_context(
         )
         seen.add(scene_id)
     return result
+
+
+def _valid_asset_selection_scene(scene: Any) -> bool:
+    if not isinstance(scene, dict):
+        return False
+    return bool(
+        _clean_text(scene.get("scene_id"))
+        or _clean_text(scene.get("script_scene"))
+        or _clean_text(scene.get("text"))
+        or _clean_text(scene.get("caption"))
+        or _clean_text(scene.get("description"))
+        or _clean_text(scene.get("query"))
+    )
+
+
+def content_is_valid_for_asset_selection(result: dict[str, Any]) -> bool:
+    """Return whether normalized content is enough to search/prepare assets."""
+
+    if not isinstance(result, dict) or result.get("errors"):
+        return False
+    intent = result.get("intent")
+    if not isinstance(intent, dict):
+        return False
+    topic_plan = intent.get("topic_plan")
+    if not isinstance(topic_plan, dict):
+        return False
+    scenes = topic_plan.get("scenes") or intent.get("scenes") or []
+    return any(_valid_asset_selection_scene(scene) for scene in scenes)
+
+
+def rank_asset_hub_candidates_for_format(
+    candidates: list[dict[str, Any]],
+    target_format: str,
+) -> list[dict[str, Any]]:
+    """Return candidates ordered for UI presentation without changing provider data."""
+
+    target = _clean_text(target_format).lower()
+    if target == "vertical":
+        priority_by_orientation = {
+            "vertical-9x16": 0,
+            "vertical-4x5": 1,
+            "horizontal-16x9": 2,
+        }
+    elif target == "horizontal":
+        priority_by_orientation = {"horizontal-16x9": 0}
+    else:
+        priority_by_orientation = {}
+
+    def sort_key(indexed_candidate: tuple[int, dict[str, Any]]) -> tuple[int, int]:
+        index, candidate = indexed_candidate
+        orientation = _clean_text(candidate.get("orientation")).lower()
+        priority = priority_by_orientation.get(orientation, 1 if target == "horizontal" else 3)
+        return priority, index
+
+    indexed = [
+        (index, candidate)
+        for index, candidate in enumerate(candidates or [])
+        if isinstance(candidate, dict)
+    ]
+    return [candidate for _, candidate in sorted(indexed, key=sort_key)]
 
 
 def clear_asset_hub_selection_widget_state(

@@ -95,6 +95,7 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     build_operator_summary,
     build_render_console_spec,
     clear_asset_hub_selection_widget_state as clear_asset_hub_selection_widget_state_mapping,
+    content_is_valid_for_asset_selection,
     default_asset_hub_manifest_path,
     enqueue_aroll_broll_from_console,
     enqueue_job_intent_from_console,
@@ -107,6 +108,7 @@ from app.custom.kurukin_render_console import (  # noqa: E402
     prepare_broll_assets_from_console,
     process_queued_intent_batch_with_mpt_native,
     process_queued_intent_with_mpt_native,
+    rank_asset_hub_candidates_for_format,
     require_prepared_asset_hub_payload_for_queue,
     safe_relative_path,
     submit_mpt_native_local_job_from_console,
@@ -511,9 +513,9 @@ def _initialize_form_state():
     st.session_state.setdefault("job_intent_audio_path", "")
     st.session_state.setdefault("job_intent_video_path", "")
     st.session_state.setdefault("job_intent_language", "es")
-    st.session_state.setdefault("job_intent_duration_seconds", 45)
+    st.session_state.setdefault("job_intent_duration_seconds", 20)
     st.session_state.setdefault("job_intent_format", "vertical")
-    st.session_state.setdefault("job_intent_preset", "educational")
+    st.session_state.setdefault("job_intent_preset", "Editorial")
     st.session_state.setdefault("job_intent_allow_low_relevance_visual", False)
     st.session_state.setdefault("job_intent_allow_mpt_stock_visuals", False)
     st.session_state.setdefault("job_intent_preferred_stock_source", "pexels")
@@ -1217,7 +1219,39 @@ def _current_asset_hub_context(compiled=None):
         if compiled is not None
         else _current_job_intent_for_asset_hub_context()
     )
-    return build_asset_hub_search_context(intent, source_policy)
+    return build_asset_hub_search_context(
+        intent,
+        source_policy,
+        _asset_hub_query_overrides_by_scene_id(intent, source_policy),
+    )
+
+
+def _asset_hub_query_widget_key(scene_id):
+    return f"asset_hub_query_{scene_id}"
+
+
+def _asset_hub_query_overrides_by_scene_id(intent, source_policy):
+    overrides = {}
+    for request in build_asset_hub_search_requests(intent or {}, source_policy or {}):
+        scene_id = str(request.get("scene_id") or "").strip()
+        if not scene_id:
+            continue
+        key = _asset_hub_query_widget_key(scene_id)
+        if key in st.session_state:
+            overrides[scene_id] = str(st.session_state.get(key) or "").strip()
+    return overrides
+
+
+def _asset_hub_search_requests_with_effective_queries(intent, source_policy):
+    overrides = _asset_hub_query_overrides_by_scene_id(intent, source_policy)
+    requests = []
+    for request in build_asset_hub_search_requests(intent or {}, source_policy or {}):
+        clean_request = dict(request)
+        scene_id = str(clean_request.get("scene_id") or "").strip()
+        if scene_id in overrides:
+            clean_request["query"] = overrides[scene_id]
+        requests.append(clean_request)
+    return requests
 
 
 def _asset_hub_context_is_current():
@@ -1234,9 +1268,7 @@ def _asset_hub_context_is_current():
 
 
 def _current_job_context_fingerprint_for_asset_hub():
-    return build_asset_hub_job_spec_fingerprint(
-        {"intent": _current_job_intent_for_asset_hub_context()}
-    )
+    return (_current_asset_hub_context() or {}).get("fingerprint", "")
 
 
 def _current_asset_hub_prepare_context(*, compiled=None, job_context_fingerprint=""):
@@ -1295,18 +1327,127 @@ def clear_asset_hub_selection_widget_state(search_result=None):
 
 
 def _asset_hub_candidate_label(candidate):
-    parts = [
-        candidate.get("asset_uid", ""),
-        candidate.get("filename", ""),
-        candidate.get("media_type", ""),
-        candidate.get("scope", ""),
-        candidate.get("brand") or candidate.get("title") or "",
-        candidate.get("orientation", ""),
-    ]
-    return " | ".join(str(part) for part in parts if part)
+    name = str(candidate.get("filename") or candidate.get("title") or "asset").strip()
+    if "." in name:
+        name = ".".join(name.split(".")[:-1]) or name
+    name = name.replace("_", "-").strip("-") or "asset"
+    orientation_label = {
+        "vertical-9x16": "vertical 9:16",
+        "vertical-4x5": "vertical 4:5",
+        "horizontal-16x9": "horizontal 16:9",
+    }.get(str(candidate.get("orientation") or "").strip().lower(), "")
+    return " · ".join(part for part in (name, orientation_label) if part)
 
 
-def _render_asset_hub_candidates(search_result, *, search_current):
+def _asset_hub_scene_title(scene, fallback_index):
+    raw_index = scene.get("scene_index") or scene.get("index") or fallback_index
+    try:
+        index = int(raw_index)
+    except (TypeError, ValueError):
+        index = fallback_index
+    return f"Escena {index}"
+
+
+def _asset_hub_scene_text(scene):
+    return str(
+        scene.get("script_scene")
+        or scene.get("text")
+        or scene.get("caption")
+        or scene.get("description")
+        or scene.get("query")
+        or ""
+    ).strip()
+
+
+def _safe_asset_hub_diagnostic(value):
+    blocked_keys = {
+        "api" + "_key",
+        "drive_file_id",
+        "remote_path",
+        "rclone_remote",
+    }
+    if isinstance(value, dict):
+        return {
+            str(key): _safe_asset_hub_diagnostic(item)
+            for key, item in value.items()
+            if str(key).lower() not in blocked_keys
+        }
+    if isinstance(value, list):
+        return [_safe_asset_hub_diagnostic(item) for item in value]
+    return value
+
+
+def _asset_hub_status_message(*, search_current, selection_status, prepare_ready):
+    search_result = st.session_state.get("asset_hub_search_result") or {}
+    has_search = bool(search_result)
+    if (selection_status or {}).get("empty_candidate_scene_ids"):
+        return ""
+    selected = st.session_state.get("asset_hub_selected_asset_uids_by_scene") or {}
+    has_selection = any(selected.get(scene_id) for scene_id in selected)
+    if prepare_ready:
+        return "Assets listos para render."
+    if has_selection:
+        return "Selección lista. Ahora prepara los assets."
+    if has_search and search_current:
+        return "Elige al menos un asset por escena."
+    return "Busca assets para tus escenas."
+
+
+def _simple_asset_hub_status_message(*, search_current, selection_status, prepare_ready):
+    search_result = st.session_state.get("asset_hub_search_result") or {}
+    if (selection_status or {}).get("empty_candidate_scene_ids"):
+        return ""
+    selected = st.session_state.get("asset_hub_selected_asset_uids_by_scene") or {}
+    has_selection = any(selected.get(scene_id) for scene_id in selected)
+    if prepare_ready:
+        return "Assets listos."
+    if has_selection:
+        return "Selección lista."
+    if search_result and search_current:
+        return "Elige al menos un asset."
+    return ""
+
+
+def _render_asset_hub_diagnostic(
+    *,
+    source_policy,
+    current_context,
+    search_current,
+    prepare_current,
+    selection_status,
+):
+    search_result = st.session_state.get("asset_hub_search_result") or {}
+    prepare_result = st.session_state.get("asset_hub_prepare_result") or {}
+    asset_hub = prepare_result.get("asset_hub") if isinstance(prepare_result, dict) else {}
+    diagnostic = {
+        "status": {
+            "search_current": search_current,
+            "prepare_current": prepare_current,
+            "selection_ok": bool((selection_status or {}).get("ok")),
+        },
+        "reason": {
+            "missing_scene_ids": (selection_status or {}).get("missing_scene_ids") or [],
+            "empty_candidate_scene_ids": (
+                (selection_status or {}).get("empty_candidate_scene_ids") or []
+            ),
+            "unknown_asset_uids_by_scene": (
+                (selection_status or {}).get("unknown_asset_uids_by_scene") or {}
+            ),
+        },
+        "source_policy": source_policy,
+        "bundle_uid": (asset_hub or {}).get("bundle_uid", ""),
+        "renderer_manifest_path": (asset_hub or {}).get("renderer_manifest_path", ""),
+        "search_context": current_context,
+        "stored_search_context": st.session_state.get("asset_hub_search_context") or {},
+        "prepare_context": st.session_state.get("asset_hub_prepare_context") or {},
+        "search_result": search_result,
+        "prepare_result": prepare_result,
+    }
+    with st.expander("Diagnóstico Asset Hub", expanded=False):
+        st.json(_safe_asset_hub_diagnostic(diagnostic))
+
+
+def _render_asset_hub_candidates(search_result, *, search_current, target_format):
     scenes = (
         (search_result or {})
         .get("asset_hub_selection", {})
@@ -1315,27 +1456,30 @@ def _render_asset_hub_candidates(search_result, *, search_current):
     if not scenes:
         return
     if not search_current:
-        st.warning("Search Assets está stale. Ejecuta Search Assets nuevamente.")
+        st.warning("La búsqueda no está vigente. Pulsa Buscar assets nuevamente.")
         return
 
     selected_by_scene = dict(
         st.session_state.get("asset_hub_selected_asset_uids_by_scene") or {}
     )
-    for scene in scenes:
+    for fallback_index, scene in enumerate(scenes, start=1):
         if not isinstance(scene, dict):
             continue
         scene_id = str(scene.get("scene_id") or "")
-        query = str(scene.get("query") or "")
-        st.markdown(f"**{scene_id}**")
-        if query:
-            st.caption(f"query: {query}")
+        if not scene_id:
+            continue
+        st.markdown(f"**{_asset_hub_scene_title(scene, fallback_index)}**")
+        scene_text = _asset_hub_scene_text(scene)
+        if scene_text:
+            st.write(f'"{scene_text}"')
         candidates = [
             item for item in scene.get("candidates") or [] if isinstance(item, dict)
         ]
         if not candidates:
-            st.warning(f"{scene_id}: no hay candidatos. NEEDS_INPUT.")
+            st.warning("No encontré assets para esta escena. Prueba otra búsqueda.")
             selected_by_scene[scene_id] = []
             continue
+        candidates = rank_asset_hub_candidates_for_format(candidates, target_format)
         options = [candidate.get("asset_uid") for candidate in candidates]
         options = [item for item in options if isinstance(item, str) and item.strip()]
         current = [
@@ -1344,7 +1488,7 @@ def _render_asset_hub_candidates(search_result, *, search_current):
             if isinstance(item, str) and item in options
         ]
         selected_by_scene[scene_id] = st.multiselect(
-            "asset_uid",
+            "Selecciona uno o más assets:",
             options=options,
             default=current,
             key=f"asset_hub_select_{scene_id}",
@@ -1357,22 +1501,28 @@ def _render_asset_hub_candidates(search_result, *, search_current):
                 value,
             ),
         )
-        safe_rows = []
-        for candidate in candidates:
-            safe_rows.append(
-                {
-                    "asset_uid": candidate.get("asset_uid", ""),
-                    "filename": candidate.get("filename", ""),
-                    "media_type": candidate.get("media_type", ""),
-                    "scope": candidate.get("scope", ""),
-                    "brand": candidate.get("brand", ""),
-                    "title": candidate.get("title", ""),
-                    "orientation": candidate.get("orientation", ""),
-                    "tags": ", ".join(candidate.get("tags") or []),
-                }
-            )
-        st.dataframe(safe_rows, use_container_width=True, hide_index=True)
     st.session_state["asset_hub_selected_asset_uids_by_scene"] = selected_by_scene
+
+
+def _render_asset_hub_query_inputs(search_context):
+    scenes = (search_context or {}).get("scenes") or []
+    if not scenes:
+        st.info("Busca assets para tus escenas.")
+        return
+    for fallback_index, scene in enumerate(scenes, start=1):
+        if not isinstance(scene, dict):
+            continue
+        scene_id = str(scene.get("scene_id") or "").strip()
+        if not scene_id:
+            continue
+        key = _asset_hub_query_widget_key(scene_id)
+        if key not in st.session_state:
+            st.session_state[key] = str(scene.get("query") or "").strip()
+        st.markdown(f"**{_asset_hub_scene_title(scene, fallback_index)}**")
+        scene_text = _asset_hub_scene_text(scene)
+        if scene_text:
+            st.write(f'"{scene_text}"')
+        st.text_input("Buscar como:", key=key)
 
 
 def _render_job_intent_asset_hub_block():
@@ -1382,23 +1532,25 @@ def _render_job_intent_asset_hub_block():
         st.caption("Asset Hub desactivado. El flujo actual queda sin cambios.")
         return
 
-    policy_cols = st.columns([1, 1, 1])
-    with policy_cols[0]:
-        st.selectbox(
-            "source_policy",
-            list(ASSET_HUB_OPERATOR_SOURCE_OPTIONS),
-            key="job_intent_asset_hub_source_option",
-        )
-    with policy_cols[1]:
-        st.text_input("title slug", key="job_intent_asset_hub_title_slug")
-    with policy_cols[2]:
-        st.text_input("brand slug", key="job_intent_asset_hub_brand_slug")
+    st.selectbox(
+        "Fuente",
+        list(ASSET_HUB_OPERATOR_SOURCE_OPTIONS),
+        key="job_intent_asset_hub_source_option",
+    )
+    source_option = st.session_state.get("job_intent_asset_hub_source_option", "Generic")
+    if "Title" in source_option:
+        st.text_input("Slug de title", key="job_intent_asset_hub_title_slug")
+    if "Brand" in source_option:
+        st.text_input("Slug de brand", key="job_intent_asset_hub_brand_slug")
 
     try:
         source_policy = _current_asset_hub_source_policy()
+        base_context = build_asset_hub_search_context(
+            _current_job_intent_for_asset_hub_context(),
+            source_policy,
+        )
+        _render_asset_hub_query_inputs(base_context)
         current_context = _current_asset_hub_context()
-        st.caption("source_policy vigente")
-        st.json(source_policy)
     except KurukinAssetHubValidationError as exc:
         st.error(_asset_hub_safe_error_message(exc))
         return
@@ -1409,74 +1561,59 @@ def _render_job_intent_asset_hub_block():
     )
     prepare_current = _asset_hub_prepare_is_current() if search_current else False
 
-    search_cols = st.columns([1, 1, 1])
-    with search_cols[0]:
-        if st.button("Search Assets", key="asset_hub_search_assets"):
-            try:
-                compiled = _current_job_intent_compile_for_asset_hub()
-                intent = compiled.get("intent") or {}
-                source_policy = _current_asset_hub_source_policy()
-                search_context = build_asset_hub_search_context(intent, source_policy)
-                requests = build_asset_hub_search_requests(intent, source_policy)
-                provider = KurukinAssetProvider()
-                search_result = search_asset_hub_candidates(provider, requests)
-                search_result = merge_asset_hub_search_result_with_context(
-                    search_result,
-                    search_context,
-                )
-                clear_asset_hub_selection_widget_state(search_result)
-                st.session_state["asset_hub_search_result"] = search_result
-                st.session_state["asset_hub_search_context"] = search_context
-                st.session_state["asset_hub_selected_asset_uids_by_scene"] = {}
-                st.session_state["asset_hub_prepare_result"] = {}
-                st.session_state["asset_hub_prepare_context"] = {}
-                st.session_state["job_intent_asset_hub_payload"] = {}
-                st.session_state["job_intent_asset_hub_spec"] = {}
-                search_current = True
-                prepare_current = False
-                st.success("Search Assets completo. Selecciona asset_uid por scene.")
-            except (
-                KurukinAssetHubAuthError,
-                KurukinAssetHubValidationError,
-                KurukinAssetHubUnavailableError,
-                KurukinAssetHubWiringError,
-                KurukinAssetHubError,
-            ) as exc:
-                st.error(_asset_hub_safe_error_message(exc))
-    with search_cols[1]:
-        if search_current:
-            st.info("ASSET_SEARCH_READY")
-        elif st.session_state.get("asset_hub_search_result"):
-            st.warning("Search stale")
-        else:
-            st.warning("NEEDS_INPUT")
-    with search_cols[2]:
-        if prepare_current and (st.session_state.get("asset_hub_prepare_result") or {}).get("asset_hub"):
-            st.success("READY_TO_SUBMIT")
-        else:
-            st.warning("NEEDS_INPUT")
+    if st.button("Buscar assets", key="asset_hub_search_assets"):
+        try:
+            compiled = _current_job_intent_compile_for_asset_hub()
+            intent = compiled.get("intent") or {}
+            source_policy = _current_asset_hub_source_policy()
+            search_context = build_asset_hub_search_context(
+                intent,
+                source_policy,
+                _asset_hub_query_overrides_by_scene_id(intent, source_policy),
+            )
+            requests = _asset_hub_search_requests_with_effective_queries(
+                intent,
+                source_policy,
+            )
+            provider = KurukinAssetProvider()
+            search_result = search_asset_hub_candidates(provider, requests)
+            search_result = merge_asset_hub_search_result_with_context(
+                search_result,
+                search_context,
+            )
+            clear_asset_hub_selection_widget_state(search_result)
+            st.session_state["asset_hub_search_result"] = search_result
+            st.session_state["asset_hub_search_context"] = search_context
+            st.session_state["asset_hub_selected_asset_uids_by_scene"] = {}
+            st.session_state["asset_hub_prepare_result"] = {}
+            st.session_state["asset_hub_prepare_context"] = {}
+            st.session_state["job_intent_asset_hub_payload"] = {}
+            st.session_state["job_intent_asset_hub_spec"] = {}
+            search_current = True
+            prepare_current = False
+        except (
+            KurukinAssetHubAuthError,
+            KurukinAssetHubValidationError,
+            KurukinAssetHubUnavailableError,
+            KurukinAssetHubWiringError,
+            KurukinAssetHubError,
+        ) as exc:
+            st.error(_asset_hub_safe_error_message(exc))
 
     search_result = st.session_state.get("asset_hub_search_result") or {}
-    _render_asset_hub_candidates(search_result, search_current=search_current)
+    _render_asset_hub_candidates(
+        search_result,
+        search_current=search_current,
+        target_format=st.session_state.get("job_intent_format", "vertical"),
+    )
     try:
         selection_status = _asset_hub_selection_status()
     except KurukinAssetHubValidationError as exc:
         st.error(_asset_hub_safe_error_message(exc))
         selection_status = {"ok": False}
-    if selection_status.get("empty_candidate_scene_ids"):
-        st.warning(
-            "Scenes sin candidatos: "
-            + ", ".join(selection_status.get("empty_candidate_scene_ids") or [])
-        )
-    if selection_status.get("missing_scene_ids"):
-        st.warning(
-            "Scenes sin selección: "
-            + ", ".join(selection_status.get("missing_scene_ids") or [])
-        )
-
     prepare_disabled = not (search_current and selection_status.get("ok"))
     if st.button(
-        "Prepare Selected Assets",
+        "Preparar assets seleccionados",
         key="asset_hub_prepare_selected_assets",
         disabled=prepare_disabled,
     ):
@@ -1510,7 +1647,7 @@ def _render_job_intent_asset_hub_block():
             )
             st.session_state["job_intent_asset_hub_spec"] = prepared_spec
             st.session_state["job_intent_asset_hub_payload"] = payload
-            st.success("Prepare Selected Assets listo.")
+            prepare_current = True
         except (
             KurukinAssetHubAuthError,
             KurukinAssetHubValidationError,
@@ -1523,23 +1660,307 @@ def _render_job_intent_asset_hub_block():
             st.error(_asset_hub_safe_error_message(exc))
 
     prepare_result = st.session_state.get("asset_hub_prepare_result") or {}
+    prepare_ready = bool(
+        prepare_current
+        and (prepare_result or {}).get("asset_hub")
+        and _asset_hub_prepare_result_is_ready()
+    )
+    status_message = _asset_hub_status_message(
+        search_current=search_current,
+        selection_status=selection_status,
+        prepare_ready=prepare_ready,
+    )
+    if status_message:
+        st.info(status_message)
     if prepare_result:
-        if _asset_hub_prepare_result_is_ready():
-            st.success("Asset Hub Ready")
-            st.json(prepare_result.get("asset_hub") or {})
-        else:
-            st.warning("Prepared Asset Hub stale. Ejecuta Prepare Selected Assets nuevamente.")
+        if not _asset_hub_prepare_result_is_ready():
+            st.warning("Assets preparados no vigentes. Pulsa Preparar assets seleccionados.")
+    _render_asset_hub_diagnostic(
+        source_policy=source_policy,
+        current_context=current_context,
+        search_current=search_current,
+        prepare_current=prepare_current,
+        selection_status=selection_status,
+    )
+
+
+def _render_simple_asset_hub_block():
+    st.checkbox("Usar Kurukin Asset Hub", key="job_intent_asset_hub_enabled")
+    if not st.session_state.get("job_intent_asset_hub_enabled"):
+        st.info("Se usarán las fuentes visuales configuradas actualmente.")
+        return
+
+    st.selectbox(
+        "Fuente",
+        list(ASSET_HUB_OPERATOR_SOURCE_OPTIONS),
+        key="job_intent_asset_hub_source_option",
+    )
+    source_option = st.session_state.get("job_intent_asset_hub_source_option", "Generic")
+    if "Title" in source_option:
+        st.text_input("Slug de title", key="job_intent_asset_hub_title_slug")
+    if "Brand" in source_option:
+        st.text_input("Slug de brand", key="job_intent_asset_hub_brand_slug")
+
+    try:
+        source_policy = _current_asset_hub_source_policy()
+        base_context = build_asset_hub_search_context(
+            _current_job_intent_for_asset_hub_context(),
+            source_policy,
+        )
+        _render_asset_hub_query_inputs(base_context)
+        current_context = _current_asset_hub_context()
+    except KurukinAssetHubValidationError as exc:
+        st.error(_asset_hub_safe_error_message(exc))
+        return
+
+    search_current = asset_hub_search_context_matches(
+        st.session_state.get("asset_hub_search_context"),
+        current_context,
+    )
+    prepare_current = _asset_hub_prepare_is_current() if search_current else False
+    asset_search_allowed = content_is_valid_for_asset_selection(
+        validate_job_intent(_build_job_intent_from_state())
+    )
+
+    if st.button(
+        "Buscar assets",
+        key="asset_hub_search_assets_simple",
+        disabled=not asset_search_allowed,
+    ):
+        try:
+            compiled = _current_job_intent_compile_for_asset_hub()
+            intent = compiled.get("intent") or {}
+            source_policy = _current_asset_hub_source_policy()
+            search_context = build_asset_hub_search_context(
+                intent,
+                source_policy,
+                _asset_hub_query_overrides_by_scene_id(intent, source_policy),
+            )
+            requests = _asset_hub_search_requests_with_effective_queries(
+                intent,
+                source_policy,
+            )
+            provider = KurukinAssetProvider()
+            search_result = search_asset_hub_candidates(provider, requests)
+            search_result = merge_asset_hub_search_result_with_context(
+                search_result,
+                search_context,
+            )
+            clear_asset_hub_selection_widget_state(search_result)
+            st.session_state["asset_hub_search_result"] = search_result
+            st.session_state["asset_hub_search_context"] = search_context
+            st.session_state["asset_hub_selected_asset_uids_by_scene"] = {}
+            st.session_state["asset_hub_prepare_result"] = {}
+            st.session_state["asset_hub_prepare_context"] = {}
+            st.session_state["job_intent_asset_hub_payload"] = {}
+            st.session_state["job_intent_asset_hub_spec"] = {}
+            search_current = True
+            prepare_current = False
+        except (
+            KurukinAssetHubAuthError,
+            KurukinAssetHubValidationError,
+            KurukinAssetHubUnavailableError,
+            KurukinAssetHubWiringError,
+            KurukinAssetHubError,
+        ) as exc:
+            st.error(_asset_hub_safe_error_message(exc))
+
+    search_result = st.session_state.get("asset_hub_search_result") or {}
+    _render_asset_hub_candidates(
+        search_result,
+        search_current=search_current,
+        target_format=st.session_state.get("job_intent_format", "vertical"),
+    )
+    try:
+        selection_status = _asset_hub_selection_status()
+    except KurukinAssetHubValidationError as exc:
+        st.error(_asset_hub_safe_error_message(exc))
+        selection_status = {"ok": False}
+    prepare_disabled = not (search_current and selection_status.get("ok"))
+    if st.button(
+        "Preparar assets",
+        key="asset_hub_prepare_selected_assets_simple",
+        disabled=prepare_disabled,
+    ):
+        try:
+            job_context_fingerprint = _current_job_context_fingerprint_for_asset_hub()
+            compiled = _current_job_intent_compile_for_asset_hub()
+            intent = compiled.get("intent") or {}
+            prepare_context = _current_asset_hub_prepare_context(
+                compiled=compiled,
+                job_context_fingerprint=job_context_fingerprint,
+            )
+            provider = KurukinAssetProvider()
+            prepare_result = wire_explicit_asset_hub_bundle(
+                intent=intent,
+                provider=provider,
+                selected_asset_uids_by_scene=selection_status[
+                    "selected_asset_uids_by_scene"
+                ],
+            )
+            prepared_spec = apply_prepared_asset_hub_contract_to_spec(
+                compiled.get("mpt_spec") or {},
+                prepare_result,
+            )
+            st.session_state["asset_hub_prepare_result"] = prepare_result
+            st.session_state["asset_hub_prepare_context"] = prepare_context
+            asset_hub = prepare_result.get("asset_hub") or {}
+            st.session_state["asset_hub_bundle_uid"] = asset_hub.get("bundle_uid", "")
+            st.session_state["asset_hub_renderer_manifest_path"] = asset_hub.get(
+                "renderer_manifest_path",
+                "",
+            )
+            st.session_state["job_intent_asset_hub_spec"] = prepared_spec
+            st.session_state["job_intent_asset_hub_payload"] = {}
+            prepare_current = True
+        except (
+            KurukinAssetHubAuthError,
+            KurukinAssetHubValidationError,
+            KurukinAssetHubUnavailableError,
+            KurukinAssetHubSelectionRequired,
+            KurukinAssetHubMaterializationNotReady,
+            KurukinAssetHubWiringError,
+            KurukinAssetHubError,
+        ) as exc:
+            st.error(_asset_hub_safe_error_message(exc))
+
+    prepare_result = st.session_state.get("asset_hub_prepare_result") or {}
+    prepare_ready = bool(
+        prepare_current
+        and (prepare_result or {}).get("asset_hub")
+        and _asset_hub_prepare_result_is_ready()
+    )
+    status_message = _simple_asset_hub_status_message(
+        search_current=search_current,
+        selection_status=selection_status,
+        prepare_ready=prepare_ready,
+    )
+    if status_message:
+        st.info(status_message)
 
 
 def render_job_intent_step():
     st.markdown("### Crear por intención")
-    st.caption(
-        "Convierte una intención simple a una spec MPT local-only; no llama OpenAI, "
-        "TTS, stock externo, Asset Hub API ni runner."
-    )
 
     left, right = st.columns([1, 1])
     with left:
+        st.text_input("Tema", key="job_intent_topic")
+        st.text_area("Guion opcional", key="job_intent_script", height=96)
+        st.text_input(
+            "Audio path",
+            key="job_intent_audio_path",
+            placeholder="storage/local_audios/audio.mp3",
+        )
+    with right:
+        st.text_input("Idioma", key="job_intent_language")
+        st.number_input(
+            "Duración",
+            min_value=4,
+            max_value=300,
+            step=1,
+            key="job_intent_duration_seconds",
+        )
+        st.selectbox("Formato", JOB_INTENT_FORMATS, key="job_intent_format")
+        st.text_input("Preset", key="job_intent_preset")
+
+    if st.button("Validar contenido", key="job_intent_validate"):
+        st.session_state["job_intent_last_validation"] = validate_job_intent(
+            _build_job_intent_from_state()
+        )
+
+    _render_job_intent_asset_hub_block()
+
+    if st.button("Agregar a cola", key="job_intent_enqueue"):
+        if st.session_state.get("job_intent_asset_hub_enabled"):
+            try:
+                queue_ready = require_prepared_asset_hub_payload_for_queue(
+                    stored_prepare_context=st.session_state.get(
+                        "asset_hub_prepare_context"
+                    ),
+                    current_prepare_context=_current_asset_hub_prepare_context(),
+                    prepared_payload=st.session_state.get(
+                        "job_intent_asset_hub_payload"
+                    ),
+                )
+            except KurukinAssetHubValidationError as exc:
+                queue_ready = {
+                    "ok": False,
+                    "status": "NEEDS_INPUT",
+                    "reason": "asset_hub_prepare_required",
+                    "error": _asset_hub_safe_error_message(exc),
+                }
+            if not queue_ready.get("ok"):
+                result = {
+                    "ok": False,
+                    "status": "NEEDS_INPUT",
+                    "reason": queue_ready.get(
+                        "reason",
+                        "asset_hub_prepare_required",
+                    ),
+                }
+                st.session_state["job_intent_last_queue_result"] = result
+                st.warning(
+                    "Asset Hub requiere Preparar assets seleccionados vigente antes de Queue."
+                )
+            else:
+                try:
+                    payload = queue_ready["payload"]
+                    path = enqueue_moneyprinter_payload(payload)
+                    result = {
+                        "ok": True,
+                        "status": STATUS_READY_TO_SUBMIT,
+                        "job_id": payload.get("job_id"),
+                        "task_id": payload.get("task_id") or payload.get("job_id"),
+                        "pending_path": path.as_posix(),
+                        "payload": payload,
+                    }
+                    st.session_state["job_intent_last_queue_result"] = result
+                    st.session_state["last_enqueued_job_id"] = str(
+                        result.get("job_id") or ""
+                    )
+                    st.session_state["last_enqueued_pending_path"] = str(
+                        result.get("pending_path") or ""
+                    )
+                    st.session_state["last_enqueued_at"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    st.success("Intención con Asset Hub agregada a cola.")
+                    st.caption(f"task_id: {result.get('task_id')}")
+                    st.caption(f"status: {result.get('status')}")
+                except (
+                    KurukinAssetHubValidationError,
+                    KurukinAssetHubWiringError,
+                    ValueError,
+                ) as exc:
+                    result = {
+                        "ok": False,
+                        "status": "NEEDS_INPUT",
+                        "reason": "asset_hub_queue_guardrail",
+                        "error": _asset_hub_safe_error_message(exc),
+                    }
+                    st.session_state["job_intent_last_queue_result"] = result
+                    st.error("Asset Hub no está listo para Queue.")
+        else:
+            result = enqueue_job_intent_from_console(_build_job_intent_from_state())
+            st.session_state["job_intent_last_queue_result"] = result
+            st.session_state["job_intent_last_compile"] = result.get("compiled") or {}
+            if result.get("ok"):
+                st.session_state["last_enqueued_job_id"] = str(result.get("job_id") or "")
+                st.session_state["last_enqueued_pending_path"] = str(
+                    result.get("pending_path") or ""
+                )
+                st.session_state["last_enqueued_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                st.success("Intención agregada a cola.")
+                st.caption(f"task_id: {result.get('task_id')}")
+                st.caption(f"status: {result.get('status')}")
+            else:
+                st.warning(f"No se encoló la intención: {result.get('status')}")
+                if result.get("reasons"):
+                    st.caption("Pendiente: " + ", ".join(result.get("reasons") or []))
+
+    with st.expander("Opciones avanzadas", expanded=False):
         mode_label = st.selectbox(
             "mode",
             list(JOB_INTENT_MODE_LABELS),
@@ -1551,34 +1972,22 @@ def render_job_intent_step():
             key="job_intent_mode_label",
         )
         st.session_state["job_intent_mode"] = JOB_INTENT_MODE_LABELS[mode_label]
-        st.text_input("task_id opcional", key="job_intent_task_id")
-        st.text_input("topic", key="job_intent_topic")
-        st.text_area("script opcional", key="job_intent_script", height=96)
+        st.text_input("task_id", key="job_intent_task_id")
         st.text_input(
-            "audio_path local",
-            key="job_intent_audio_path",
-            placeholder="storage/local_audios/audio.mp3",
-        )
-        st.caption("Tema a video acepta audio_path local; no se genera TTS.")
-    with right:
-        st.text_input(
-            "video_path (opcional para topic_to_video/audio_to_video)",
+            "video_path",
             key="job_intent_video_path",
             placeholder="storage/local_videos/visual.mp4",
-        )
-        st.caption(
-            "Si no pasas video_path, Kurukin intentará usar un visual local automático."
         )
         st.checkbox(
             "Permitir visual local de baja relevancia",
             key="job_intent_allow_low_relevance_visual",
         )
         st.checkbox(
-            "Permitir stock nativo MPT si no hay visual local relevante",
+            "stock nativo MPT",
             key="job_intent_allow_mpt_stock_visuals",
         )
         stock_source_label = st.selectbox(
-            "Fuente stock preferida",
+            "fuente stock",
             list(JOB_INTENT_STOCK_SOURCE_LABELS),
             index=_index_for_value(
                 JOB_INTENT_STOCK_SOURCE_LABELS,
@@ -1590,125 +1999,14 @@ def render_job_intent_step():
         st.session_state["job_intent_preferred_stock_source"] = (
             JOB_INTENT_STOCK_SOURCE_LABELS[stock_source_label]
         )
-        st.text_input("Términos stock", key="job_intent_stock_terms")
-        st.text_input("language", key="job_intent_language")
-        st.number_input(
-            "duration_seconds",
-            min_value=4,
-            max_value=300,
-            step=1,
-            key="job_intent_duration_seconds",
-        )
-        st.selectbox("format", JOB_INTENT_FORMATS, key="job_intent_format")
-        st.text_input("preset", key="job_intent_preset")
-
-    _render_job_intent_asset_hub_block()
-
-    action_cols = st.columns([1, 1, 1, 1])
-    with action_cols[0]:
-        if st.button("Validar intención", key="job_intent_validate"):
-            st.session_state["job_intent_last_validation"] = validate_job_intent(
-                _build_job_intent_from_state()
-            )
-    with action_cols[1]:
+        st.text_input("términos stock", key="job_intent_stock_terms")
         if st.button("Preparar spec MPT", key="job_intent_prepare_mpt_spec"):
             st.session_state["job_intent_last_compile"] = compile_job_intent_to_mpt_spec(
                 _build_job_intent_from_state()
             )
-    with action_cols[2]:
-        if st.button("Agregar a cola", key="job_intent_enqueue"):
-            if st.session_state.get("job_intent_asset_hub_enabled"):
-                try:
-                    queue_ready = require_prepared_asset_hub_payload_for_queue(
-                        stored_prepare_context=st.session_state.get(
-                            "asset_hub_prepare_context"
-                        ),
-                        current_prepare_context=_current_asset_hub_prepare_context(),
-                        prepared_payload=st.session_state.get(
-                            "job_intent_asset_hub_payload"
-                        ),
-                    )
-                except KurukinAssetHubValidationError as exc:
-                    queue_ready = {
-                        "ok": False,
-                        "status": "NEEDS_INPUT",
-                        "reason": "asset_hub_prepare_required",
-                        "error": _asset_hub_safe_error_message(exc),
-                    }
-                if not queue_ready.get("ok"):
-                    result = {
-                        "ok": False,
-                        "status": "NEEDS_INPUT",
-                        "reason": queue_ready.get(
-                            "reason",
-                            "asset_hub_prepare_required",
-                        ),
-                    }
-                    st.session_state["job_intent_last_queue_result"] = result
-                    st.warning(
-                        "Asset Hub requiere Prepare Selected Assets vigente antes de Queue."
-                    )
-                else:
-                    try:
-                        payload = queue_ready["payload"]
-                        path = enqueue_moneyprinter_payload(payload)
-                        result = {
-                            "ok": True,
-                            "status": STATUS_READY_TO_SUBMIT,
-                            "job_id": payload.get("job_id"),
-                            "task_id": payload.get("task_id") or payload.get("job_id"),
-                            "pending_path": path.as_posix(),
-                            "payload": payload,
-                        }
-                        st.session_state["job_intent_last_queue_result"] = result
-                        st.session_state["last_enqueued_job_id"] = str(
-                            result.get("job_id") or ""
-                        )
-                        st.session_state["last_enqueued_pending_path"] = str(
-                            result.get("pending_path") or ""
-                        )
-                        st.session_state["last_enqueued_at"] = datetime.now(
-                            timezone.utc
-                        ).isoformat()
-                        st.success("Intención con Asset Hub agregada a cola.")
-                        st.caption(f"task_id: {result.get('task_id')}")
-                        st.caption(f"status: {result.get('status')}")
-                    except (
-                        KurukinAssetHubValidationError,
-                        KurukinAssetHubWiringError,
-                        ValueError,
-                    ) as exc:
-                        result = {
-                            "ok": False,
-                            "status": "NEEDS_INPUT",
-                            "reason": "asset_hub_queue_guardrail",
-                            "error": _asset_hub_safe_error_message(exc),
-                        }
-                        st.session_state["job_intent_last_queue_result"] = result
-                        st.error("Asset Hub no está listo para Queue.")
-            else:
-                result = enqueue_job_intent_from_console(_build_job_intent_from_state())
-                st.session_state["job_intent_last_queue_result"] = result
-                st.session_state["job_intent_last_compile"] = result.get("compiled") or {}
-                if result.get("ok"):
-                    st.session_state["last_enqueued_job_id"] = str(result.get("job_id") or "")
-                    st.session_state["last_enqueued_pending_path"] = str(
-                        result.get("pending_path") or ""
-                    )
-                    st.session_state["last_enqueued_at"] = datetime.now(
-                        timezone.utc
-                    ).isoformat()
-                    st.success("Intención agregada a cola.")
-                    st.caption(f"task_id: {result.get('task_id')}")
-                    st.caption(f"status: {result.get('status')}")
-                else:
-                    st.warning(f"No se encoló la intención: {result.get('status')}")
-                    if result.get("reasons"):
-                        st.caption("Pendiente: " + ", ".join(result.get("reasons") or []))
-    compiled = st.session_state.get("job_intent_last_compile") or {}
-    ready_to_submit = compiled.get("status") == STATUS_READY_TO_SUBMIT
-    submit_enabled = is_mpt_engine_submit_enabled()
-    with action_cols[3]:
+        compiled = st.session_state.get("job_intent_last_compile") or {}
+        ready_to_submit = compiled.get("status") == STATUS_READY_TO_SUBMIT
+        submit_enabled = is_mpt_engine_submit_enabled()
         if st.button(
             "Enviar a MPT nativo",
             key="job_intent_submit_mpt_native",
@@ -1731,6 +2029,8 @@ def render_job_intent_step():
                 st.success("Intención enviada al motor MPT nativo.")
             else:
                 st.error("No se pudo enviar la intención al motor MPT nativo.")
+
+    compiled = st.session_state.get("job_intent_last_compile") or {}
 
     validation = st.session_state.get("job_intent_last_validation")
     if validation:
@@ -1893,6 +2193,214 @@ def render_batch_audio_intent_step():
         if batch_result.get("errors"):
             with st.expander("Errores lote", expanded=False):
                 st.json(batch_result.get("errors") or [])
+
+
+def _simple_format_label(value):
+    return {"vertical": "Vertical", "horizontal": "Horizontal"}.get(
+        str(value or "").lower(),
+        "Vertical",
+    )
+
+
+def _simple_format_value(label):
+    return {"Vertical": "vertical", "Horizontal": "horizontal"}[label]
+
+
+def _simple_asset_label():
+    if st.session_state.get("job_intent_asset_hub_enabled"):
+        return "Kurukin Asset Hub"
+    if st.session_state.get("asset_source_mode") == ASSET_SOURCE_LOCAL:
+        return "local"
+    return "stock"
+
+
+def _simple_scene_count():
+    validation = st.session_state.get("job_intent_last_validation") or {}
+    intent = validation.get("intent") or _current_job_intent_for_asset_hub_context()
+    return len((intent or {}).get("scenes") or [])
+
+
+def _simple_content_missing_message():
+    if not str(st.session_state.get("job_intent_topic") or "").strip():
+        return "Escribe un tema para crear el video."
+    if st.session_state.get("job_intent_asset_hub_enabled") and not _asset_hub_prepare_result_is_ready():
+        return "Prepara los assets seleccionados antes de agregar a cola."
+    return ""
+
+
+def _render_simple_content_step():
+    st.markdown("### 1. Contenido")
+    st.text_input("Tema", key="job_intent_topic")
+    st.text_area("Guion opcional", key="job_intent_script", height=96)
+    cols = st.columns([1, 1, 1, 1])
+    with cols[0]:
+        st.text_input("Idioma", key="job_intent_language")
+    with cols[1]:
+        st.number_input(
+            "Duración",
+            min_value=4,
+            max_value=300,
+            step=1,
+            key="job_intent_duration_seconds",
+        )
+    with cols[2]:
+        format_label = st.selectbox(
+            "Formato",
+            ["Vertical", "Horizontal"],
+            index=["Vertical", "Horizontal"].index(
+                _simple_format_label(st.session_state.get("job_intent_format"))
+            ),
+            key="simple_job_intent_format_label",
+        )
+        st.session_state["job_intent_format"] = _simple_format_value(format_label)
+    with cols[3]:
+        st.text_input("Preset", key="job_intent_preset")
+
+    if st.button("Validar contenido", key="job_intent_validate_simple"):
+        st.session_state["job_intent_last_validation"] = validate_job_intent(
+            _build_job_intent_from_state()
+        )
+    validation = st.session_state.get("job_intent_last_validation")
+    if validation:
+        if content_is_valid_for_asset_selection(validation):
+            st.success("Contenido validado. Ya puedes elegir assets.")
+        elif validation.get("errors") or validation.get("reasons"):
+            st.warning("Revisa el contenido antes de continuar.")
+        else:
+            st.success("Contenido validado.")
+
+
+def _render_simple_assets_step():
+    st.markdown("### 2. Assets")
+    _render_simple_asset_hub_block()
+
+
+def _render_simple_video_options_step():
+    st.markdown("### 3. Opciones de video")
+    st.text_input(
+        "Audio propio",
+        key="job_intent_audio_path",
+        placeholder="storage/local_audios/audio.mp3",
+    )
+    left, right, center = st.columns([1, 1, 1])
+    with left:
+        subtitle_label = st.selectbox(
+            "Subtítulos",
+            list(SUBTITLE_MODE_LABELS),
+            index=_index_for_value(
+                SUBTITLE_MODE_LABELS,
+                st.session_state["subtitles_mode"],
+                "none",
+            ),
+            key="subtitles_mode_label_simple",
+        )
+        st.session_state["subtitles_mode"] = SUBTITLE_MODE_LABELS[subtitle_label]
+    with right:
+        st.checkbox("Movimiento", key="image_motion_enabled")
+    with center:
+        quality_label = st.selectbox(
+            "Calidad",
+            list(QUALITY_LABELS),
+            index=_index_for_value(
+                QUALITY_LABELS,
+                st.session_state["render_quality"],
+                "draft_720p",
+            ),
+            key="render_quality_label_simple",
+        )
+        st.session_state["render_quality"] = QUALITY_LABELS[quality_label]
+
+
+def _render_simple_create_step():
+    st.markdown("### 4. Crear")
+    scenes_count = _simple_scene_count()
+    prepare_ready = _asset_hub_prepare_result_is_ready()
+    for line in [
+        f"Tema: {st.session_state.get('job_intent_topic') or '-'}",
+        f"Duración: {int(st.session_state.get('job_intent_duration_seconds') or 0)} s",
+        f"Formato: {_simple_format_label(st.session_state.get('job_intent_format'))}",
+        f"Assets: {_simple_asset_label()}",
+        f"Scenes: {scenes_count}",
+        f"Assets preparados: {'Sí' if prepare_ready else 'No'}",
+    ]:
+        st.write(line)
+    missing = _simple_content_missing_message()
+    if missing:
+        st.warning(missing)
+        st.button("Agregar a cola", key="job_intent_enqueue_simple_disabled", disabled=True)
+        return
+
+    if st.button("Agregar a cola", key="job_intent_enqueue_simple"):
+        if st.session_state.get("job_intent_asset_hub_enabled"):
+            try:
+                queue_ready = require_prepared_asset_hub_payload_for_queue(
+                    stored_prepare_context=st.session_state.get(
+                        "asset_hub_prepare_context"
+                    ),
+                    current_prepare_context=_current_asset_hub_prepare_context(),
+                    prepared_payload=st.session_state.get(
+                        "job_intent_asset_hub_payload"
+                    ),
+                )
+            except KurukinAssetHubValidationError as exc:
+                queue_ready = {"ok": False, "error": _asset_hub_safe_error_message(exc)}
+            if (
+                not queue_ready.get("ok")
+                and queue_ready.get("reason") != "asset_hub_prepared_payload_missing"
+            ):
+                st.warning("Prepara los assets seleccionados antes de agregar a cola.")
+                return
+            try:
+                compiled = compile_job_intent_to_mpt_spec(_build_job_intent_from_state())
+                if compiled.get("status") != STATUS_READY_TO_SUBMIT:
+                    if "needs_audio_or_tts" in (compiled.get("reasons") or []):
+                        st.warning("Falta configurar audio.")
+                    else:
+                        st.warning("No se pudo agregar a cola. Revisa los insumos.")
+                    return
+                _prepared_spec, payload, _summary = build_moneyprinter_payload_with_prepared_asset_hub(
+                    compiled.get("mpt_spec") or {},
+                    st.session_state.get("asset_hub_prepare_result") or {},
+                )
+                st.session_state["job_intent_asset_hub_payload"] = payload
+                path = enqueue_moneyprinter_payload(payload)
+                st.session_state["last_enqueued_job_id"] = str(
+                    payload.get("job_id") or ""
+                )
+                st.session_state["last_enqueued_pending_path"] = path.as_posix()
+                st.session_state["last_enqueued_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                st.success("Video agregado a cola.")
+            except (
+                KurukinAssetHubValidationError,
+                KurukinAssetHubWiringError,
+                ValueError,
+            ) as exc:
+                st.error(_asset_hub_safe_error_message(exc))
+        else:
+            result = enqueue_job_intent_from_console(_build_job_intent_from_state())
+            st.session_state["job_intent_last_queue_result"] = result
+            st.session_state["job_intent_last_compile"] = result.get("compiled") or {}
+            if result.get("ok"):
+                st.session_state["last_enqueued_job_id"] = str(result.get("job_id") or "")
+                st.session_state["last_enqueued_pending_path"] = str(
+                    result.get("pending_path") or ""
+                )
+                st.session_state["last_enqueued_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                st.success("Video agregado a cola.")
+            else:
+                st.warning("No se pudo agregar a cola. Revisa el tema y los insumos.")
+
+
+def _simple_render_view():
+    st.title("Crear video Kurukin")
+    _render_simple_content_step()
+    _render_simple_assets_step()
+    _render_simple_video_options_step()
+    _render_simple_create_step()
 
 
 def _current_aroll_broll_config():
@@ -2433,7 +2941,6 @@ def _aroll_broll_view():
 
 
 def _new_render_view():
-    _initialize_form_state()
     _hero_block()
     _end_to_end_flow_block()
     video_type_label = st.selectbox(
@@ -3274,19 +3781,24 @@ def _diagnostics_expander():
 
 st.set_page_config(page_title="Crear video Kurukin", layout="wide")
 _apply_page_style()
+_initialize_form_state()
+advanced_mode = st.checkbox("Mostrar modo avanzado", key="show_advanced_mode")
 
-tab_new, tab_queue, tab_results, tab_preflight, tab_execute = st.tabs(
-    ["Crear video", "Cola", "Resultados", "Preflight", "Ejecutar"]
-)
-with tab_new:
-    _new_render_view()
-with tab_queue:
-    _queue_storage_view()
-with tab_results:
-    _results_view()
-with tab_preflight:
-    _preflight_view()
-with tab_execute:
-    _controlled_runner_view()
+if advanced_mode:
+    tab_new, tab_queue, tab_results, tab_preflight, tab_execute = st.tabs(
+        ["Crear video", "Cola", "Resultados", "Preflight", "Ejecutar"]
+    )
+    with tab_new:
+        _new_render_view()
+    with tab_queue:
+        _queue_storage_view()
+    with tab_results:
+        _results_view()
+    with tab_preflight:
+        _preflight_view()
+    with tab_execute:
+        _controlled_runner_view()
 
-_diagnostics_expander()
+    _diagnostics_expander()
+else:
+    _simple_render_view()
