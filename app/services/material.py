@@ -67,6 +67,30 @@ def _search_videos_for_source(provider: str):
     return search_videos_pexels
 
 
+def search_videos_for_provider(
+    provider: str,
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+) -> List[MaterialInfo]:
+    """Search exactly one supported stock provider through the shared cache.
+
+    This small public entry point is intended for discovery callers which need
+    every enabled provider, unlike ``search_videos_with_fallback`` whose
+    established contract stops at the first provider with results.
+    """
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider not in _EXTERNAL_ASSET_PROVIDERS:
+        raise ValueError(f"unsupported video source: {provider}")
+    return _search_videos_with_cache(
+        normalized_provider,
+        _search_videos_for_source(normalized_provider),
+        search_term,
+        minimum_duration,
+        VideoAspect(video_aspect),
+    )
+
+
 def search_videos_with_fallback(
     search_term: str,
     minimum_duration: int,
