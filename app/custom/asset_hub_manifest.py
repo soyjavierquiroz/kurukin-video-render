@@ -17,10 +17,19 @@ def get_asset_hub_job_assets_dir() -> Path:
     )
 
 
-def is_asset_hub_asset_ready(asset: dict[str, Any]) -> bool:
+def is_asset_hub_asset_ready(
+    asset: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
+) -> bool:
     if "materialization_status" in asset:
         return asset.get("materialization_status") == "ready"
-    return asset.get("status") == "ready"
+    if "status" in asset:
+        return asset.get("status") == "ready"
+    if isinstance(manifest, dict):
+        if "materialization_status" in manifest:
+            return manifest.get("materialization_status") == "ready"
+        return manifest.get("status") == "ready"
+    return False
 
 
 def _resolve_base_dir(base_dir: Path | None = None) -> Path:
@@ -170,7 +179,7 @@ def extract_asset_hub_local_assets(
     for scene in scenes:
         for asset in _asset_order(scene.get("assets", [])):
             try:
-                if not is_asset_hub_asset_ready(asset):
+                if not is_asset_hub_asset_ready(asset, manifest):
                     continue
 
                 asset_type = asset.get("type")

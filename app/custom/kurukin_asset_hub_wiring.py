@@ -332,10 +332,59 @@ def _is_ready_response(response: Mapping[str, Any]) -> bool:
     return response.get("status") == "ready"
 
 
-def _is_manifest_asset_ready(asset: Mapping[str, Any]) -> bool:
+def _normalized_manifest_status(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _effective_manifest_asset_status(
+    manifest: Mapping[str, Any],
+    scene: Mapping[str, Any],
+    asset: Mapping[str, Any],
+) -> str:
     if "materialization_status" in asset:
-        return asset.get("materialization_status") == "ready"
-    return asset.get("status") == "ready"
+        return _normalized_manifest_status(asset.get("materialization_status"))
+    if "status" in asset:
+        return _normalized_manifest_status(asset.get("status"))
+    if "materialization_status" in scene:
+        return _normalized_manifest_status(scene.get("materialization_status"))
+    if "status" in scene:
+        return _normalized_manifest_status(scene.get("status"))
+    if "materialization_status" in manifest:
+        return _normalized_manifest_status(manifest.get("materialization_status"))
+    if "status" in manifest:
+        return _normalized_manifest_status(manifest.get("status"))
+    return ""
+
+
+def _is_manifest_asset_ready(
+    manifest: Mapping[str, Any],
+    scene: Mapping[str, Any],
+    asset: Mapping[str, Any],
+) -> bool:
+    return _effective_manifest_asset_status(manifest, scene, asset) == "ready"
+
+
+def _manifest_for_ready_path_resolution(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    resolved_manifest = deepcopy(dict(manifest))
+    scenes = resolved_manifest.get("scenes")
+    if not isinstance(scenes, list):
+        return resolved_manifest
+
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        assets = scene.get("assets")
+        if not isinstance(assets, list):
+            continue
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            if "materialization_status" in asset or "status" in asset:
+                continue
+            status = _effective_manifest_asset_status(resolved_manifest, scene, asset)
+            if status:
+                asset["materialization_status"] = status
+    return resolved_manifest
 
 
 def _ordered_manifest_assets(assets: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -423,7 +472,7 @@ def validate_explicit_manifest_selection(
         ready_asset_uids = [
             validate_asset_uid(asset.get("asset_uid"))
             for asset in _ordered_manifest_assets(manifest_assets)
-            if _is_manifest_asset_ready(asset)
+            if _is_manifest_asset_ready(manifest, manifest_scene, asset)
         ]
         expected_asset_uids = [
             validate_asset_uid(asset_uid)
@@ -484,7 +533,10 @@ def wire_explicit_asset_hub_bundle(
             "renderer manifest bundle_uid does not match created bundle_uid"
         )
     validate_explicit_manifest_selection(manifest, bundle_scenes)
-    ready_assets = resolve_ready_asset_paths(manifest, materialized_root=root)
+    ready_assets = resolve_ready_asset_paths(
+        _manifest_for_ready_path_resolution(manifest),
+        materialized_root=root,
+    )
     if not ready_assets:
         raise KurukinAssetHubMaterializationNotReady(
             REASON_ASSET_HUB_MATERIALIZATION_NOT_READY

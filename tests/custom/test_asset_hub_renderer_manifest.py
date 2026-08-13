@@ -347,6 +347,15 @@ class TestAssetHubRendererManifest(AssetHubFixtureMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             asset_hub_manifest.extract_asset_hub_local_assets(manifest)
 
+    def test_manifest_ready_allows_asset_without_asset_status(self):
+        manifest = self.make_manifest(status="ready")
+        manifest["scenes"][0]["assets"][0].pop("status")
+
+        assets = asset_hub_manifest.extract_asset_hub_local_assets(manifest)
+
+        self.assertIn("image-a", [asset["asset_uid"] for asset in assets])
+        self.assertEqual(assets[1]["local_path"], str(self.image_a.resolve()))
+
     def test_manifest_asset_without_asset_uid_fails(self):
         manifest = self.make_manifest()
         manifest["scenes"][0]["assets"][0].pop("asset_uid")

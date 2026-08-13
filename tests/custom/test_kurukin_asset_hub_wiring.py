@@ -552,6 +552,90 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
                 {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
             )
 
+    def test_exact_manifest_selection_asset_materialization_status_ready(self):
+        manifest = self._single_scene_manifest_with_statuses(
+            asset_statuses={"materialization_status": " ready "}
+        )
+
+        validate_explicit_manifest_selection(
+            manifest,
+            [{"scene_id": "scene-001", "selected_asset_uids": ["drive-882918f4"]}],
+        )
+
+    def test_exact_manifest_selection_asset_status_ready_without_materialization_status(self):
+        manifest = self._single_scene_manifest_with_statuses(
+            asset_statuses={"status": " READY "}
+        )
+
+        validate_explicit_manifest_selection(
+            manifest,
+            [{"scene_id": "scene-001", "selected_asset_uids": ["drive-882918f4"]}],
+        )
+
+    def test_exact_manifest_selection_inherits_scene_materialization_status_ready(self):
+        manifest = self._single_scene_manifest_with_statuses(
+            scene_statuses={"materialization_status": " ready "}
+        )
+
+        validate_explicit_manifest_selection(
+            manifest,
+            [{"scene_id": "scene-001", "selected_asset_uids": ["drive-882918f4"]}],
+        )
+
+    def test_exact_manifest_selection_inherits_manifest_materialization_status_ready(self):
+        manifest = self._single_scene_manifest_with_statuses(
+            manifest_statuses={"materialization_status": " ready "}
+        )
+
+        validate_explicit_manifest_selection(
+            manifest,
+            [{"scene_id": "scene-001", "selected_asset_uids": ["drive-882918f4"]}],
+        )
+
+    def test_exact_manifest_selection_asset_pending_overrides_manifest_ready(self):
+        manifest = self._single_scene_manifest_with_statuses(
+            manifest_statuses={"materialization_status": "ready"},
+            asset_statuses={"materialization_status": "pending"},
+        )
+
+        with self.assertRaises(KurukinAssetHubWiringError):
+            validate_explicit_manifest_selection(
+                manifest,
+                [{"scene_id": "scene-001", "selected_asset_uids": ["drive-882918f4"]}],
+            )
+
+    def test_exact_manifest_selection_asset_failed_overrides_scene_ready(self):
+        manifest = self._single_scene_manifest_with_statuses(
+            scene_statuses={"materialization_status": "ready"},
+            asset_statuses={"status": "failed"},
+        )
+
+        with self.assertRaises(KurukinAssetHubWiringError):
+            validate_explicit_manifest_selection(
+                manifest,
+                [{"scene_id": "scene-001", "selected_asset_uids": ["drive-882918f4"]}],
+            )
+
+    def test_exact_manifest_selection_without_any_status_is_not_ready(self):
+        manifest = self._single_scene_manifest_with_statuses()
+
+        with self.assertRaises(KurukinAssetHubWiringError):
+            validate_explicit_manifest_selection(
+                manifest,
+                [{"scene_id": "scene-001", "selected_asset_uids": ["drive-882918f4"]}],
+            )
+
+    def test_exact_manifest_selection_real_manifest_bundle_scene_ready_passes(self):
+        manifest = self._single_scene_manifest_with_statuses(
+            manifest_statuses={"materialization_status": "ready", "status": "ready"},
+            scene_statuses={"materialization_status": "ready", "status": "ready"},
+        )
+
+        validate_explicit_manifest_selection(
+            manifest,
+            [{"scene_id": "scene-001", "selected_asset_uids": ["drive-882918f4"]}],
+        )
+
     def test_materialize_uses_force_false(self):
         manifest = self._manifest_for_root("/data/job-assets")
         provider = FakeProvider(manifest=manifest)
@@ -563,6 +647,22 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
         )
 
         self.assertEqual(provider.materialize_calls[0], {"bundle_uid": "jab_test", "force": False})
+
+    def test_wire_inherits_manifest_ready_for_assets_without_status(self):
+        manifest = self._manifest_for_root("/data/job-assets")
+        manifest["materialization_status"] = "ready"
+        for scene in manifest["scenes"]:
+            for asset in scene["assets"]:
+                asset.pop("status", None)
+        provider = FakeProvider(manifest=manifest)
+
+        result = wire_explicit_asset_hub_bundle(
+            make_intent(),
+            provider,
+            {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
+        )
+
+        self.assertEqual(result["asset_hub"]["bundle_uid"], "jab_test")
 
     def test_materialization_not_ready_has_no_manifest_usable(self):
         provider = FakeProvider(materialize_response={"status": "pending"})
@@ -831,6 +931,38 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
                 }
             ],
         }
+
+    def _single_scene_manifest_with_statuses(
+        self,
+        *,
+        manifest_statuses: dict | None = None,
+        scene_statuses: dict | None = None,
+        asset_statuses: dict | None = None,
+    ) -> dict:
+        manifest = {
+            "manifest_version": "1.0",
+            "generated_by": "kurukin-asset-hub",
+            "bundle_uid": "jab_test",
+            "job_id": "mpt-001",
+            "scenes": [
+                {
+                    "scene_id": "scene-001",
+                    "scene_index": 1,
+                    "assets": [
+                        {
+                            "asset_uid": "drive-882918f4",
+                            "type": "video",
+                            "filename": "clip-a.mp4",
+                            "local_path": "/data/job-assets/jab_test/scene-001/clip-a.mp4",
+                        }
+                    ],
+                }
+            ],
+        }
+        manifest.update(manifest_statuses or {})
+        manifest["scenes"][0].update(scene_statuses or {})
+        manifest["scenes"][0]["assets"][0].update(asset_statuses or {})
+        return manifest
 
 
 if __name__ == "__main__":
