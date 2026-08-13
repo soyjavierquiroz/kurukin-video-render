@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import shutil
 import unittest
 import sys
 import tempfile
@@ -401,7 +402,8 @@ class TestVoiceService(unittest.TestCase):
         """
         验证 Gemini TTS 在 edge_tts 7.x 环境下仍会返回项目兼容的字幕结构，
         并且可以被 `subtitle_provider=edge` 的字幕生成链路直接消费，
-        避免再次回退 Whisper。
+        避免再次回退 Whisper。同时使用不存在的嵌套输出目录，覆盖 API 或
+        CLI 直接调用服务时没有提前创建任务目录的边界情况。
         """
 
         class _InlineData:
@@ -448,9 +450,14 @@ class TestVoiceService(unittest.TestCase):
             def __exit__(self, exc_type, exc_value, traceback):
                 captured["closed"] = True
 
-        voice_file = f"{temp_dir}/tts-gemini-Zephyr.mp3"
-        subtitle_file = f"{temp_dir}/tts-gemini-Zephyr.srt"
+        temp_root = Path(tempfile.mkdtemp(prefix="gemini-tts-output-"))
+        self.addCleanup(shutil.rmtree, temp_root, True)
+        output_dir = temp_root / "nested" / "audio"
+        voice_file = str(output_dir / "tts-gemini-Zephyr.mp3")
+        subtitle_file = str(output_dir / "tts-gemini-Zephyr.srt")
         text = "Gemini subtitle generation should work now. Testing multiple lines."
+
+        self.assertFalse(output_dir.exists())
 
         with patch("google.genai.Client", _FakeClient), patch.object(
             vs.config,
@@ -465,6 +472,7 @@ class TestVoiceService(unittest.TestCase):
             )
 
         self.assertIsNotNone(sub_maker)
+        self.assertTrue(Path(voice_file).is_file())
         self.assertEqual(
             getattr(sub_maker, "subs", []),
             ["Gemini subtitle generation should work now", "Testing multiple lines"],
@@ -998,7 +1006,6 @@ class TestElevenLabsVoice(unittest.TestCase):
         mock_config.elevenlabs.get.return_value = "fake-api-key"
         mock_post.return_value.status_code = 200
         mock_post.return_value.content = b"fake-mp3-bytes"
-        mock_clip = mock_clip_cls.return_value.__enter__.return_value
         mock_clip_cls.return_value.duration = 3.0
         mock_clip_cls.return_value.close = lambda: None
 
@@ -1017,7 +1024,10 @@ class TestElevenLabsVoice(unittest.TestCase):
     @patch("app.services.voice.config")
     def test_elevenlabs_tts_no_api_key(self, mock_config):
         mock_config.elevenlabs.get.return_value = ""
-        result = vs.elevenlabs_tts("Hello", "abc123", "/tmp/test.mp3")
+        # Key 解析包含环境变量回退，测试必须显式清空宿主环境，避免开发机或 CI
+        # 恰好设置 ELEVENLABS_API_KEY 后改变“未配置”的测试前提。
+        with patch.dict(os.environ, {}, clear=True):
+            result = vs.elevenlabs_tts("Hello", "abc123", "/tmp/test.mp3")
         self.assertIsNone(result)
 
     @patch("app.services.voice.config")
@@ -1025,6 +1035,42 @@ class TestElevenLabsVoice(unittest.TestCase):
         mock_config.elevenlabs.get.return_value = "fake-key"
         result = vs.elevenlabs_tts("  ", "abc123", "/tmp/test.mp3")
         self.assertIsNone(result)
+
+    def test_elevenlabs_api_key_prefers_config(self):
+        with (
+            patch.object(vs.config, "elevenlabs", {"api_key": "config-key"}),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            self.assertEqual(vs.get_elevenlabs_api_key(), "config-key")
+
+    def test_elevenlabs_api_key_falls_back_to_environment(self):
+        with (
+            patch.object(vs.config, "elevenlabs", {"api_key": ""}),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": " env-key "}),
+        ):
+            self.assertEqual(vs.get_elevenlabs_api_key(), "env-key")
+
+    def test_elevenlabs_api_key_matches_music_service(self):
+        """TTS 和配乐共用同一账号配置，两条生成链路必须解析出相同 Key。"""
+        from app.services import elevenlabs_music
+
+        for configured_key, env_key in (("config-key", "env-key"), ("", "env-key")):
+            with self.subTest(configured_key=configured_key):
+                with (
+                    patch.object(
+                        vs.config, "elevenlabs", {"api_key": configured_key}
+                    ),
+                    patch.object(
+                        elevenlabs_music.config,
+                        "elevenlabs",
+                        {"api_key": configured_key},
+                    ),
+                    patch.dict(os.environ, {"ELEVENLABS_API_KEY": env_key}),
+                ):
+                    self.assertEqual(
+                        vs.get_elevenlabs_api_key(),
+                        elevenlabs_music.get_api_key(),
+                    )
 
 
 if __name__ == "__main__":

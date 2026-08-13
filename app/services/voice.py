@@ -252,6 +252,18 @@ def is_elevenlabs_voice(voice_name: str) -> bool:
     return (voice_name or "").startswith("elevenlabs:")
 
 
+def get_elevenlabs_api_key() -> str:
+    """
+    读取 ElevenLabs TTS 使用的 API Key。
+
+    配置文件优先，环境变量仅作为未配置时的后备来源。WebUI 和配乐功能已经
+    支持 ``ELEVENLABS_API_KEY``，TTS 必须使用相同规则，否则仅通过容器环境
+    变量部署时，音色列表可正常加载，真正合成语音却会误报未配置 Key。
+    """
+    configured_key = str(config.elevenlabs.get("api_key", "") or "").strip()
+    return configured_key or os.getenv("ELEVENLABS_API_KEY", "").strip()
+
+
 def is_chatterbox_voice(voice_name: str) -> bool:
     return (voice_name or "").startswith("chatterbox:")
 
@@ -1144,6 +1156,11 @@ def gemini_tts(
             logger.error(f"Failed to load PCM audio: {e}")
             return None
         
+        # API、CLI 或测试可以直接把尚不存在的嵌套目录作为输出位置。这里在
+        # 真正写文件前统一创建父目录，避免一次成功的 Gemini 请求最后因为
+        # 本地路径不存在而丢失结果，也让该 provider 与其他 TTS 实现行为一致。
+        ensure_file_path_exists(voice_file)
+
         # pydub 会返回打开的输出文件对象。批量生成时若不主动关闭，文件描述符
         # 会持续累积，并在 Windows 上增加后续覆盖或删除音频文件失败的概率。
         exported_audio = audio_segment.export(voice_file, format="mp3")
@@ -1283,7 +1300,7 @@ def elevenlabs_tts(
         logger.error("ElevenLabs TTS text is empty")
         return None
 
-    api_key = config.elevenlabs.get("api_key", "")
+    api_key = get_elevenlabs_api_key()
     if not api_key:
         logger.error("ElevenLabs API key is not set")
         return None

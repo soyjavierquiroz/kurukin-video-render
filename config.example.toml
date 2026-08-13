@@ -64,6 +64,14 @@ twelvelabs_rerank_terms = false
 # 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。
 match_materials_to_script = false
 
+# Optional Sonilo video-matched original background music.
+# Create a key at https://platform.sonilo.com/dashboard. The WebUI can also save
+# this value, or you can set the SONILO_API_KEY environment variable instead.
+sonilo_api_key = ""
+sonilo_base_url = "https://api.sonilo.com"
+# 单次生成流连续无数据时的最长等待秒数；它不是整个请求的总耗时上限。
+sonilo_timeout = 600
+
 # -----------------------------------------------------------------------------
 # LLM Providers / 大模型提供商
 # -----------------------------------------------------------------------------
@@ -74,7 +82,7 @@ match_materials_to_script = false
 llm_provider = "moonshot"
 
 # Kimi / Moonshot AI
-# API key: https://platform.kimi.com/console/api-keys
+# API key: https://platform.kimi.com?track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&aff=moneyprinterturbo
 moonshot_api_key = ""
 moonshot_base_url = ""
 moonshot_model_name = ""
@@ -201,7 +209,9 @@ pollinations_model_name = ""
 mimo_tts_model_name = "mimo-v2.5-tts"
 mimo_tts_style_prompt = "请用自然、清晰、适合短视频旁白的语气朗读。"
 
-# Subtitle provider: "edge" or "whisper". Leave empty to skip generation.
+# Subtitle provider: "edge" or "whisper". Whisper is loaded only when selected
+# explicitly; Edge failures do not trigger an automatic Whisper model download.
+# Leave empty to skip generation.
 subtitle_provider = "edge"
 
 # FFmpeg is normally downloaded and detected automatically. If detection fails,
@@ -256,6 +266,11 @@ upload_post_platforms = ["tiktok", "instagram"]
 upload_post_auto_upload = false
 # YouTube privacy: "public", "unlisted", or "private".
 upload_post_youtube_privacy_status = "public"
+# Maximum number of running and queued cross-post jobs per process. When the
+# limit is reached, video generation still succeeds and only cross-posting is
+# rejected.
+# Cross-post jobs run in the current process and are not resumed after restart.
+upload_post_max_pending_tasks = 10
 
 # =============================================================================
 # Whisper Subtitles / Whisper 字幕
@@ -269,6 +284,10 @@ model_size = "large-v3"
 # "float16" or "int8_float16" for CUDA.
 device = "cpu"
 compute_type = "int8"
+# Optional prompt that biases Whisper's decoder toward specific vocabulary
+# (brand names, technical terms). Passed as initial_prompt to transcribe().
+# Leave empty to disable.
+# initial_prompt = ""
 
 # =============================================================================
 # Material Request Proxy / 素材请求代理
@@ -301,6 +320,9 @@ api_key = ""
 api_key = ""
 # Available models include eleven_multilingual_v2, eleven_flash_v2_5, and eleven_v3.
 model_id = "eleven_multilingual_v2"
+# Video-to-Music uses a separate model family while sharing the same API key.
+music_model_id = "music_v2"
+music_timeout = 600
 
 [chatterbox]
 # OpenAI-compatible Chatterbox TTS server. The defaults target
@@ -318,6 +340,10 @@ voices = ["default-Female"]
 [ui]
 # Hide generation logs in the WebUI.
 hide_log = false
+
+# Open the task folder automatically after video generation completes.
+# 视频生成完成后是否自动打开任务目录；关闭后仍可在任务管理中手动打开。
+open_task_folder_on_completion = true
 
 # The WebUI writes the remaining preferences automatically. Uncomment values
 # below only when you want to define initial defaults manually.

@@ -6,6 +6,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+_INSERTED_NUMPY_STUB = False
+_NUMPY_STUB = None
+
 from scripts import local_job_wrapper
 
 
@@ -24,6 +27,7 @@ class _Logger:
 
 
 def _install_video_import_stubs() -> None:
+    global _INSERTED_NUMPY_STUB, _NUMPY_STUB
     loguru = ModuleType("loguru")
     loguru.logger = _Logger()
     sys.modules.setdefault("loguru", loguru)
@@ -70,7 +74,10 @@ def _install_video_import_stubs() -> None:
     numpy_module = ModuleType("numpy")
     numpy_module.where = lambda *args, **kwargs: ([], [])
     numpy_module.array = lambda value, *args, **kwargs: value
-    sys.modules.setdefault("numpy", numpy_module)
+    if "numpy" not in sys.modules:
+        sys.modules["numpy"] = numpy_module
+        _INSERTED_NUMPY_STUB = True
+        _NUMPY_STUB = numpy_module
 
     moviepy = ModuleType("moviepy")
     for name in (
@@ -109,6 +116,11 @@ def _install_video_import_stubs() -> None:
 
 
 _install_video_import_stubs()
+
+
+def tearDownModule() -> None:
+    if _INSERTED_NUMPY_STUB and sys.modules.get("numpy") is _NUMPY_STUB:
+        del sys.modules["numpy"]
 
 from app.services.video import resolve_video_size
 

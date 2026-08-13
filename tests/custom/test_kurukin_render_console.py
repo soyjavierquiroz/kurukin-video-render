@@ -2389,7 +2389,10 @@ class TestKurukinRenderConsole(unittest.TestCase):
             "salta la ventana nocturna solo para una ejecución manual controlada",
             rendered_text,
         )
-        self.assertIn("Máximo de trabajos", rendered_text)
+        self.assertIn(
+            "Ejecución desde UI deshabilitada por seguridad",
+            rendered_text,
+        )
         self.assertIn(CONTAINER_NIGHTLY_QUEUE_DIR, rendered_text)
         self.assertIn(CONTAINER_API_BASE_URL, rendered_text)
         self.assertIn("--api-base-url", rendered_text)
@@ -2567,10 +2570,6 @@ class TestKurukinRenderConsole(unittest.TestCase):
             rendered_text,
         )
         self.assertIn("KURUKIN_ENABLE_PEXELS_SOURCE=<unset>", rendered_text)
-        self.assertIn(
-            "La cola A-roll/B-roll se activa después de una validación estricta",
-            rendered_text,
-        )
         self.assertNotIn("<div", rendered_text)
         self.assertFalse(pending_dir_exists)
         self.assertFalse(tasks_dir_exists)

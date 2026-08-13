@@ -12,6 +12,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+_INSERTED_NUMPY_STUB = False
+_NUMPY_STUB = None
+
 from app.custom import asset_hub_manifest
 from scripts import local_job_wrapper, nightly_runner
 
@@ -43,6 +46,7 @@ class _FakeClip:
 
 
 def _install_import_stubs() -> None:
+    global _INSERTED_NUMPY_STUB, _NUMPY_STUB
     loguru = ModuleType("loguru")
     loguru.logger = _Logger()
     sys.modules.setdefault("loguru", loguru)
@@ -89,7 +93,10 @@ def _install_import_stubs() -> None:
     numpy_module = ModuleType("numpy")
     numpy_module.where = lambda *args, **kwargs: ([], [])
     numpy_module.array = lambda value, *args, **kwargs: value
-    sys.modules.setdefault("numpy", numpy_module)
+    if "numpy" not in sys.modules:
+        sys.modules["numpy"] = numpy_module
+        _INSERTED_NUMPY_STUB = True
+        _NUMPY_STUB = numpy_module
 
     moviepy = ModuleType("moviepy")
     for name in (
@@ -157,6 +164,11 @@ def _install_import_stubs() -> None:
 
 
 _install_import_stubs()
+
+
+def tearDownModule() -> None:
+    if _INSERTED_NUMPY_STUB and sys.modules.get("numpy") is _NUMPY_STUB:
+        del sys.modules["numpy"]
 
 from app.services import task as task_service  # noqa: E402
 from app.services import video as video_service  # noqa: E402
