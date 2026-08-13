@@ -41,6 +41,7 @@ class TestMaterialAcquisition(unittest.TestCase):
         self.assertEqual([x.provider for x in result.materials], ["asset_hub", "pexels"])
         self.assertEqual(result.materials[0].url, shared)
         self.assertTrue(wire.called)
+        self.assertNotIn("brand_slug", wire.call_args.args[0])
 
     def test_503_and_traversal_are_clear(self):
         hub = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")

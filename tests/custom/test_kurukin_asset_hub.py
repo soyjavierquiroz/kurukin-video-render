@@ -170,8 +170,10 @@ class KurukinAssetHubTests(unittest.TestCase):
         )
 
         self.assertEqual(result["bundle_uid"], "bundle-1")
+        payload = provider.session.calls[0]["json"]
+        self.assertNotIn("brand_slug", payload)
         self.assertEqual(
-            provider.session.calls[0]["json"]["scenes"][0]["selected_asset_uids"],
+            payload["scenes"][0]["selected_asset_uids"],
             ["drive-a", "drive-b"],
         )
 
@@ -206,6 +208,14 @@ class KurukinAssetHubTests(unittest.TestCase):
         )
 
         self.assertNotIn("brand_slug", payload)
+
+    def test_count_matches_selected_asset_uids_when_present(self):
+        payload = build_explicit_bundle_payload(
+            job_id="mpt-001",
+            scenes=[{"count": 99, "selected_asset_uids": ["drive-a", "drive-b"]}],
+        )
+
+        self.assertEqual(payload["scenes"][0]["count"], 2)
 
     def test_parse_renderer_manifest_ready_assets(self):
         manifest = {

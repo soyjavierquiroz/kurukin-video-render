@@ -194,12 +194,15 @@ def _scene_payload(scene: Mapping[str, Any], index: int) -> dict[str, Any]:
     ]
     if not selected_asset_uids:
         raise KurukinAssetHubValidationError(f"scenes[{index}].selected_asset_uids is required")
-    return {
+    payload = {
         "scene_id": _clean_text(scene.get("scene_id")) or f"scene-{index + 1:03d}",
         "scene_index": int(scene.get("scene_index") or index + 1),
         "script_scene": _clean_text(scene.get("script_scene")),
         "selected_asset_uids": selected_asset_uids,
     }
+    if "count" in scene:
+        payload["count"] = len(selected_asset_uids)
+    return payload
 
 
 def build_explicit_bundle_payload(
