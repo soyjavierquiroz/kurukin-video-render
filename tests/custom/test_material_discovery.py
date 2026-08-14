@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from app.custom.kurukin_asset_hub import KurukinAssetHubAuthError
 from app.custom.material_discovery import (
     MaterialDiscoveryError,
+    discover_asset_hub_title_fallback_candidates,
     discover_material_candidates,
 )
 from app.custom.material_source_policy import (
@@ -126,7 +127,7 @@ class TestMaterialDiscovery(unittest.TestCase):
             [("mujer triste", 0), ("triste", 1)],
         )
 
-    def test_asset_hub_title_only_fallback_keeps_exclusive_title_scope(self):
+    def test_asset_hub_does_not_use_title_only_fallback_per_term(self):
         hub = FakeAssetHub({
             "pareja abrazandose": [],
             "pareja": [],
@@ -139,12 +140,49 @@ class TestMaterialDiscovery(unittest.TestCase):
             asset_hub_provider=hub,
         )
 
-        self.assertEqual([call[0] for call in hub.calls], ["pareja abrazandose", "pareja", "mi-otra-yo"])
+        self.assertEqual([call[0] for call in hub.calls], ["pareja abrazandose", "pareja"])
         self.assertTrue(all(
             call[1] == {"sources": [{"scope": "title", "title": "mi-otra-yo"}]}
             for call in hub.calls
         ))
-        self.assertEqual(result.candidates[0].canonical_id, "title-1")
+        self.assertEqual(result.candidates, ())
+
+    def test_asset_hub_consults_all_terms_before_global_fallback(self):
+        hub = FakeAssetHub({
+            "pareja discutiendo": [],
+            "pareja": [],
+            "niño solo": [],
+            "solo": [{"asset_uid": "solo-1", "filename": "solo.mp4", "orientation": "vertical"}],
+        })
+
+        result = discover_material_candidates(
+            policy=title_policy("mi-otra-yo"),
+            stock_terms=["pareja discutiendo", "niño solo"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual([call[0] for call in hub.calls], ["pareja discutiendo", "pareja", "niño solo", "solo"])
+        self.assertEqual([item.canonical_id for item in result.candidates], ["solo-1"])
+
+    def test_asset_hub_title_only_global_fallback_runs_once_and_marks_candidates(self):
+        hub = FakeAssetHub({
+            "mi-otra-yo": [
+                {"asset_uid": "title-1", "filename": "title.mp4", "orientation": "vertical"},
+                {"asset_uid": "title-2", "filename": "title2.mp4", "orientation": "vertical"},
+            ],
+        })
+
+        result = discover_asset_hub_title_fallback_candidates(
+            policy=title_policy("mi-otra-yo"),
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual([call[0] for call in hub.calls], ["mi-otra-yo"])
+        self.assertEqual([item.canonical_id for item in result.candidates], ["title-1", "title-2"])
+        self.assertTrue(all(
+            item.source_info.get("discovery_fallback") == "title_only"
+            for item in result.candidates
+        ))
 
     def test_asset_hub_open_policy_does_not_use_title_only_fallback(self):
         hub = FakeAssetHub({"mujer preocupada": [], "preocupada": []})

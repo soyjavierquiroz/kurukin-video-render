@@ -233,6 +233,24 @@ def _asset_hub_candidate(asset: Mapping[str, Any], *, term: str, rank: int) -> M
     )
 
 
+def _title_only_asset_hub_candidate(asset: Mapping[str, Any], *, title: str, rank: int) -> MaterialCandidate:
+    candidate = _asset_hub_candidate(asset, term=title, rank=rank)
+    return MaterialCandidate(
+        provider=candidate.provider,
+        canonical_id=candidate.canonical_id,
+        dedupe_key=candidate.dedupe_key,
+        search_term=candidate.search_term,
+        rank=candidate.rank,
+        url=candidate.url,
+        duration=candidate.duration,
+        width=candidate.width,
+        height=candidate.height,
+        orientation=candidate.orientation,
+        filename=candidate.filename,
+        source_info={**candidate.source_info, "discovery_fallback": "title_only"},
+    )
+
+
 def _safe_error_message(exc: Exception) -> str:
     message = str(exc or "").strip()
     lowered = message.lower()
@@ -333,15 +351,12 @@ def discover_material_candidates(
         if provider == PROVIDER_ASSET_HUB:
             active_provider = asset_hub_provider or KurukinAssetProvider()
             source_policy = plan["asset_hub"]["source_policy"]
-            title_only_fallback = _exclusive_title_from_source_policy(source_policy)
         for term in terms:
             queries = [term]
             if provider == PROVIDER_ASSET_HUB:
                 simplified = _simplify_asset_hub_retry_term(term)
                 if simplified and simplified not in queries:
                     queries.append(simplified)
-                if title_only_fallback and title_only_fallback not in queries:
-                    queries.append(title_only_fallback)
             found: list[MaterialCandidate] = []
             try:
                 if provider != PROVIDER_ASSET_HUB:
@@ -379,3 +394,42 @@ def discover_material_candidates(
     if remote_attempts and technical_failures == remote_attempts:
         raise MaterialDiscoveryError("all enabled remote material providers failed")
     return MaterialDiscoveryResult(_dedupe(candidates), tuple(diagnostics), tuple(attempted), tuple(succeeded), terms_used)
+
+
+def discover_asset_hub_title_fallback_candidates(
+    *,
+    policy: MaterialSourcePolicy,
+    video_aspect: str = "9:16",
+    asset_hub_provider: KurukinAssetProvider | None = None,
+) -> MaterialDiscoveryResult:
+    """Search the exclusive Asset Hub title once as a global low-priority fallback."""
+    plan = build_discovery_plan(policy)
+    if not plan["asset_hub"]["enabled"]:
+        return MaterialDiscoveryResult((), (), (), (), {"stock": (), "asset_hub": ()})
+    if plan["asset_hub"]["requires_catalog_expansion"]:
+        raise CatalogExpansionRequired("Asset Hub all_titles/all_brands requires catalog expansion before discovery")
+
+    source_policy = plan["asset_hub"]["source_policy"]
+    title = _exclusive_title_from_source_policy(source_policy)
+    if not title:
+        return MaterialDiscoveryResult((), (), (PROVIDER_ASSET_HUB,), (), {"stock": (), "asset_hub": ()})
+
+    active_provider = asset_hub_provider or KurukinAssetProvider()
+    try:
+        assets = active_provider.search(query=title, source_policy=source_policy)
+    except Exception as exc:
+        if _is_fatal_asset_hub_error(exc):
+            raise
+        raise MaterialDiscoveryError("material provider 'asset_hub' failed") from exc
+
+    candidates = [
+        _title_only_asset_hub_candidate(asset, title=title, rank=index)
+        for index, asset in enumerate(assets)
+    ]
+    candidates = [
+        candidate for candidate in candidates
+        if _is_orientation_compatible(candidate, video_aspect)
+    ]
+    diagnostics = (DiscoveryDiagnostic(PROVIDER_ASSET_HUB, title, "success", "global_title_only_fallback", len(candidates)),)
+    succeeded = (PROVIDER_ASSET_HUB,) if candidates else ()
+    return MaterialDiscoveryResult(_dedupe(candidates), diagnostics, (PROVIDER_ASSET_HUB,), succeeded, {"stock": (), "asset_hub": (title,)})

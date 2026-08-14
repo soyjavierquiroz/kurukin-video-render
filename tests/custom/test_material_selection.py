@@ -70,5 +70,46 @@ class TestMaterialSelection(unittest.TestCase):
         result = select_material_candidates(discovery_result=discovery(candidate("kurukin_media:a", provider="asset_hub", orientation="vertical"), candidate("kurukin_media:b", provider="asset_hub", orientation="vertical")), video_aspect="9:16", target_duration=10, clip_duration=5)
         self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["kurukin_media:a", "kurukin_media:b"])
 
+    def test_title_only_candidates_do_not_displace_real_matches(self):
+        title_only = candidate(
+            "title",
+            term="mi-otra-yo",
+            provider="asset_hub",
+            rank=0,
+            width=1080,
+            height=1920,
+            source_info={"discovery_fallback": "title_only"},
+        )
+        real = candidate("real", term="niño solo", provider="asset_hub", rank=10, width=1080, height=1920)
+
+        result = select_material_candidates(
+            discovery_result=discovery(title_only, real),
+            video_aspect="9:16",
+            target_duration=5,
+            clip_duration=5,
+        )
+
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["real"])
+
+    def test_selection_covers_multiple_terms_in_narrative_order(self):
+        items = (
+            candidate("one-a", "pareja discutiendo", rank=1, width=1080, height=1920),
+            candidate("one-b", "pareja discutiendo", rank=2, width=1080, height=1920),
+            candidate("two-a", "niño solo", rank=5, width=1080, height=1920),
+            candidate("three-a", "mujer laptop", rank=8, width=1080, height=1920),
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(*items),
+            video_aspect="9:16",
+            target_duration=15,
+            clip_duration=5,
+        )
+
+        self.assertEqual(
+            [d.candidate.search_term for d in result.decisions],
+            ["pareja discutiendo", "niño solo", "mujer laptop"],
+        )
+
 
 if __name__ == "__main__": unittest.main()

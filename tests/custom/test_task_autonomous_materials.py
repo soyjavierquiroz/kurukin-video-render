@@ -14,6 +14,12 @@ class TestAutonomousMaterialPreparation(unittest.TestCase):
     def policy(self):
         return {"providers": {"enabled": ["pexels"]}}
 
+    def title_policy(self):
+        return {
+            "providers": {"enabled": ["asset_hub"]},
+            "asset_hub": {"include": {"titles": ["mi-otra-yo"]}},
+        }
+
     def test_policy_runs_discover_select_acquire_and_uses_audio_duration(self):
         params = VideoParams(video_subject="cat", material_source_policy=self.policy(), asset_hub_terms=["hub cat"])
         discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
@@ -27,6 +33,21 @@ class TestAutonomousMaterialPreparation(unittest.TestCase):
         self.assertEqual(discover.call_args.kwargs["asset_hub_terms"], ["hub cat"])
         self.assertEqual(select.call_args.kwargs["target_duration"], 17)
         acquire.assert_called_once_with(selection_result=selection, task_id="t1")
+
+    def test_title_only_global_fallback_runs_once_on_shortfall(self):
+        params = VideoParams(video_subject="cat", material_source_policy=self.title_policy())
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(dedupe_key="real"),))
+        fallback = SimpleNamespace(candidates=(SimpleNamespace(dedupe_key="title"),), diagnostics=(), providers_attempted=(), providers_succeeded=())
+        first_selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=1, selected_count=1)
+        final_selection = SimpleNamespace(decisions=(SimpleNamespace(), SimpleNamespace()), shortfall=0, selected_count=2)
+        acquired = [MaterialInfo(provider="asset_hub", url="/tmp/one.mp4")]
+
+        with patch.object(task, "discover_material_candidates", return_value=discovery), patch.object(task, "discover_asset_hub_title_fallback_candidates", return_value=fallback) as title_fallback, patch.object(task, "select_material_candidates", side_effect=(first_selection, final_selection)) as select, patch.object(task, "acquire_selected_materials", return_value=SimpleNamespace(materials=acquired)), patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            error = task._prepare_autonomous_materials("t1", params, ["pareja discutiendo", "niño solo"], 10)
+
+        self.assertIsNone(error)
+        title_fallback.assert_called_once()
+        self.assertEqual(select.call_count, 2)
 
     def test_shortfall_warns_and_continues(self):
         params = VideoParams(video_subject="cat", material_source_policy=self.policy())

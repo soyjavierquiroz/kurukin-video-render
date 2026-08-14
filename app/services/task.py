@@ -17,7 +17,11 @@ from loguru import logger
 from app.config import config
 from app.custom import asset_hub_manifest
 from app.custom.material_acquisition import acquire_selected_materials
-from app.custom.material_discovery import discover_material_candidates
+from app.custom.material_discovery import (
+    MaterialDiscoveryResult,
+    discover_asset_hub_title_fallback_candidates,
+    discover_material_candidates,
+)
 from app.custom.material_selection import select_material_candidates
 from app.custom.material_source_policy import material_source_policy_from_dict
 from app.models import const
@@ -1016,8 +1020,6 @@ def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) 
         video_aspect=params.video_aspect,
         minimum_duration=params.video_clip_duration,
     )
-    if not discovery.candidates:
-        return "No usable visual materials found"
 
     target_duration = audio_duration
     if target_duration <= 0:
@@ -1025,13 +1027,38 @@ def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) 
             params.video_clip_duration,
             len(video_terms) * params.video_clip_duration,
         )
+    recent_keys = material.recent_external_asset_keys()
     selection = select_material_candidates(
         discovery_result=discovery,
         video_aspect=params.video_aspect,
         target_duration=target_duration,
         clip_duration=params.video_clip_duration,
-        recent_dedupe_keys=material.recent_external_asset_keys(),
+        recent_dedupe_keys=recent_keys,
     )
+    if selection.shortfall > 0:
+        title_fallback = discover_asset_hub_title_fallback_candidates(
+            policy=policy,
+            video_aspect=params.video_aspect,
+        )
+        if title_fallback.candidates:
+            discovery = MaterialDiscoveryResult(
+                candidates=tuple(getattr(discovery, "candidates", ()) or ()) + title_fallback.candidates,
+                diagnostics=tuple(getattr(discovery, "diagnostics", ()) or ()) + title_fallback.diagnostics,
+                providers_attempted=tuple(dict.fromkeys(
+                    tuple(getattr(discovery, "providers_attempted", ()) or ()) + title_fallback.providers_attempted
+                )),
+                providers_succeeded=tuple(dict.fromkeys(
+                    tuple(getattr(discovery, "providers_succeeded", ()) or ()) + title_fallback.providers_succeeded
+                )),
+                terms_used=getattr(discovery, "terms_used", {"stock": tuple(video_terms), "asset_hub": tuple(params.asset_hub_terms or video_terms)}),
+            )
+            selection = select_material_candidates(
+                discovery_result=discovery,
+                video_aspect=params.video_aspect,
+                target_duration=target_duration,
+                clip_duration=params.video_clip_duration,
+                recent_dedupe_keys=recent_keys,
+            )
     if not selection.decisions:
         return "No usable visual materials found"
     if selection.shortfall > 0:

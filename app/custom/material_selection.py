@@ -160,6 +160,11 @@ def _base(candidate: Any, options: MaterialSelectionOptions, recent: set[str]) -
     return scores
 
 
+def _is_low_priority_fallback(candidate: Any) -> bool:
+    source_info = getattr(candidate, "source_info", None)
+    return isinstance(source_info, dict) and source_info.get("discovery_fallback") == "title_only"
+
+
 def select_material_candidates(*, discovery_result: Any, video_aspect: str, target_duration: float,
                                clip_duration: float, recent_dedupe_keys: Iterable[str] = ()) -> MaterialSelectionResult:
     """Choose a bounded, diverse set.  Candidate ordering is the final tie-break."""
@@ -171,11 +176,10 @@ def select_material_candidates(*, discovery_result: Any, video_aspect: str, targ
         item for item in (getattr(discovery_result, "candidates", ()) or ())
         if _is_orientation_compatible(item, options.video_aspect)
     ]
-    # First choose one candidate per term (when available), then fill capacity.
-    terms = []
-    for item in candidates:
-        term = str(getattr(item, "search_term", "") or "")
-        if term and term not in terms: terms.append(term)
+    candidate_layers = (
+        [item for item in candidates if not _is_low_priority_fallback(item)],
+        [item for item in candidates if _is_low_priority_fallback(item)],
+    )
     recent_fallback = False
     def choose(pool):
         nonlocal recent_fallback
@@ -201,19 +205,25 @@ def select_material_candidates(*, discovery_result: Any, video_aspect: str, targ
                                                    effective_duration(chosen, options.clip_duration), fallback))
         seen.add(getattr(chosen, "dedupe_key", "")); providers.append(getattr(chosen, "provider", ""))
         return True
-    # Prefer fresh assets globally. This pass still gives every term one chance.
-    for allow_recent in (False, True):
-        for term in terms:
+    # Prefer fresh real matches globally. Low-priority fallbacks only fill remaining capacity.
+    for active_candidates in candidate_layers:
+        terms = []
+        for item in active_candidates:
+            term = str(getattr(item, "search_term", "") or "")
+            if term and term not in terms: terms.append(term)
+        for allow_recent in (False, True):
+            for term in terms:
+                if len(decisions) >= target: break
+                pool = [(index, item) for index, item in enumerate(active_candidates)
+                        if getattr(item, "dedupe_key", "") not in seen and getattr(item, "search_term", "") == term
+                        and (allow_recent or getattr(item, "dedupe_key", "") not in recent)]
+                choose(pool)
+            while len(decisions) < target:
+                pool = [(index, item) for index, item in enumerate(active_candidates)
+                        if getattr(item, "dedupe_key", "") not in seen
+                        and (allow_recent or getattr(item, "dedupe_key", "") not in recent)]
+                if not choose(pool): break
             if len(decisions) >= target: break
-            pool = [(index, item) for index, item in enumerate(candidates)
-                    if getattr(item, "dedupe_key", "") not in seen and getattr(item, "search_term", "") == term
-                    and (allow_recent or getattr(item, "dedupe_key", "") not in recent)]
-            choose(pool)
-        while len(decisions) < target:
-            pool = [(index, item) for index, item in enumerate(candidates)
-                    if getattr(item, "dedupe_key", "") not in seen
-                    and (allow_recent or getattr(item, "dedupe_key", "") not in recent)]
-            if not choose(pool): break
         if len(decisions) >= target: break
     covered = tuple(dict.fromkeys(str(getattr(d.candidate, "search_term", "") or "") for d in decisions if getattr(d.candidate, "search_term", "")))
     return MaterialSelectionResult(options, tuple(decisions), target, len(decisions), max(0, target-len(decisions)),
