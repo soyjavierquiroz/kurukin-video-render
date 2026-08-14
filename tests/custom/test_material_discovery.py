@@ -65,7 +65,7 @@ class TestMaterialDiscovery(unittest.TestCase):
         self.assertEqual(cache.call_args.args[2:4], ("term", 3))
 
     def test_all_open_providers_are_searched_without_short_circuit(self):
-        hub = FakeAssetHub({"es": [{"asset_uid": "hub-1", "filename": "one.mp4"}]})
+        hub = FakeAssetHub({"es": [{"asset_uid": "hub-1", "filename": "one.mp4", "orientation": "vertical"}]})
         calls = []
 
         def search(provider, term, duration, aspect):
@@ -87,9 +87,9 @@ class TestMaterialDiscovery(unittest.TestCase):
 
     def test_identity_dedupe_and_sanitization(self):
         hub = FakeAssetHub({"term": [
-            {"asset_uid": "a", "filename": "same.mp4", "drive_file_id": "private", "nested": {"API_KEY": "secret"}},
-            {"asset_uid": "b", "filename": "same.mp4", "remote_path": "/private"},
-            {"asset_uid": "a", "filename": "duplicate.mp4"},
+            {"asset_uid": "a", "filename": "same.mp4", "orientation": "vertical", "drive_file_id": "private", "nested": {"API_KEY": "secret"}},
+            {"asset_uid": "b", "filename": "same.mp4", "orientation": "vertical", "remote_path": "/private"},
+            {"asset_uid": "a", "filename": "duplicate.mp4", "orientation": "vertical"},
         ]})
         def search(provider, *_args):
             return [stock(provider, "x", filename="same.mp4")]

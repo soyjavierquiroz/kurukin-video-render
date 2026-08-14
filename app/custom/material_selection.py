@@ -41,13 +41,75 @@ class MaterialSelectionResult:
     selected_effective_duration: float
 
 
+def _aspect_text(video_aspect: Any) -> str:
+    return str(getattr(video_aspect, "value", video_aspect) or "")
+
+
+def _target_orientation(video_aspect: Any) -> str | None:
+    aspect = _aspect_text(video_aspect).replace(" ", "").replace("x", ":").lower()
+    if aspect in {"9:16", "4:5", "vertical", "portrait"}:
+        return "portrait"
+    if aspect in {"16:9", "horizontal", "landscape", "wide"}:
+        return "landscape"
+    parts = aspect.split(":", 1)
+    if len(parts) == 2:
+        try:
+            width, height = float(parts[0]), float(parts[1])
+        except ValueError:
+            return None
+        if width > 0 and height > 0:
+            if height > width:
+                return "portrait"
+            if width > height:
+                return "landscape"
+    return None
+
+
+def _metadata_orientation(value: Any) -> str | None:
+    orientation = str(value or "").replace(" ", "").replace("x", ":").lower()
+    if not orientation:
+        return None
+    if any(token in orientation for token in ("portrait", "vertical", "9:16", "4:5")):
+        return "portrait"
+    if any(token in orientation for token in ("landscape", "horizontal", "wide", "16:9")):
+        return "landscape"
+    return None
+
+
+def _positive_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _is_orientation_compatible(candidate: Any, video_aspect: str) -> bool:
+    """Strictly match portrait/landscape targets using geometry first."""
+    target = _target_orientation(video_aspect)
+    if target is None:
+        return True
+
+    width = _positive_number(getattr(candidate, "width", None))
+    height = _positive_number(getattr(candidate, "height", None))
+    if width is not None and height is not None:
+        if height > width:
+            return target == "portrait"
+        if width > height:
+            return target == "landscape"
+        return False
+
+    orientation = _metadata_orientation(getattr(candidate, "orientation", None))
+    return orientation == target
+
+
 def orientation_score(candidate: Any, video_aspect: str) -> int:
     """Return a stable compatibility score without changing candidate metadata."""
     orientation = str(getattr(candidate, "orientation", "") or "").lower()
     width, height = getattr(candidate, "width", None), getattr(candidate, "height", None)
     if not orientation and isinstance(width, (int, float)) and isinstance(height, (int, float)):
         orientation = "portrait" if height > width else "landscape" if width > height else "square"
-    aspect = str(video_aspect or "").replace(" ", "").lower()
+    aspect = _aspect_text(video_aspect).replace(" ", "").lower()
     normalized = orientation.replace("x", ":")
     square = "square" in orientation or normalized == "1:1"
     portrait = any(value in orientation for value in ("portrait", "vertical", "9:16", "4:5"))
@@ -105,7 +167,10 @@ def select_material_candidates(*, discovery_result: Any, video_aspect: str, targ
     options = MaterialSelectionOptions(str(video_aspect), float(target_duration), float(clip_duration), tuple(recent_dedupe_keys))
     target = max(0, int(ceil(max(0.0, options.target_duration) / options.clip_duration)))
     recent, seen, decisions, providers = set(options.recent_dedupe_keys), set(), [], []
-    candidates = list(getattr(discovery_result, "candidates", ()) or ())
+    candidates = [
+        item for item in (getattr(discovery_result, "candidates", ()) or ())
+        if _is_orientation_compatible(item, options.video_aspect)
+    ]
     # First choose one candidate per term (when available), then fill capacity.
     terms = []
     for item in candidates:

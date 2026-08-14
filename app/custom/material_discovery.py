@@ -21,6 +21,7 @@ from app.custom.material_source_policy import (
     PROVIDER_LOCAL,
     build_discovery_plan,
 )
+from app.custom.material_selection import _is_orientation_compatible
 from app.custom.kurukin_local_visual_picker import pick_local_visual_for_intent
 from app.services import material
 
@@ -298,6 +299,7 @@ def discover_material_candidates(
                 if remote_provider_count == 1:
                     raise MaterialDiscoveryError(f"material provider '{provider}' failed") from exc
                 continue
+            found = [candidate for candidate in found if _is_orientation_compatible(candidate, video_aspect)]
             candidates.extend(found)
             if provider not in succeeded:
                 succeeded.append(provider)

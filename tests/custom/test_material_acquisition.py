@@ -34,14 +34,61 @@ class TestMaterialAcquisition(unittest.TestCase):
     def test_mixed_uses_asset_hub_wiring_without_copying(self):
         hub = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")
         stock = MaterialCandidate("pexels", "pexels:1", "p:1", "dog", url="https://download/1")
-        shared = "/data/job-assets/bundle/a.mp4"
-        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle", return_value={"asset_hub": {"bundle_uid": "bundle"}}) as wire, patch("app.custom.material_acquisition.convert_asset_hub_manifest_to_materials", return_value=[MaterialInfo(provider="asset_hub", url=shared)]), patch("app.custom.material_acquisition.material.download_material_candidate", return_value=str(Path(self.tmp.name) / "tasks/t1/materials/p.mp4"), create=True):
-            provider = SimpleNamespace(get_renderer_manifest=lambda uid: {"bundle_uid": uid})
+        shared = Path(self.tmp.name) / "bundle/a.mp4"
+        shared.parent.mkdir()
+        shared.write_text("video")
+        manifest = {
+            "manifest_version": "1.0",
+            "generated_by": "kurukin-asset-hub",
+            "bundle_uid": "bundle",
+            "status": "ready",
+            "scenes": [
+                {
+                    "scene_id": "scene-001",
+                    "scene_index": 1,
+                    "assets": [
+                        {"asset_uid": "uid-a", "type": "video", "filename": "a.mp4", "local_path": str(shared), "status": "ready"},
+                    ],
+                }
+            ],
+        }
+        with patch.dict("os.environ", {"ASSET_HUB_MATERIALIZED_ROOT": self.tmp.name}), patch("app.custom.material_acquisition.utils.storage_dir", self.storage), patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle", return_value={"asset_hub": {"bundle_uid": "bundle"}}) as wire, patch("app.custom.material_acquisition.material.download_material_candidate", return_value=str(Path(self.tmp.name) / "tasks/t1/materials/p.mp4"), create=True):
+            provider = SimpleNamespace(get_renderer_manifest=lambda uid: manifest)
             result = acquire_selected_materials(selection_result=SimpleNamespace(decisions=(decision(hub), decision(stock))), task_id="t1", asset_hub_provider=provider)
         self.assertEqual([x.provider for x in result.materials], ["asset_hub", "pexels"])
-        self.assertEqual(result.materials[0].url, shared)
+        self.assertEqual(result.materials[0].url, str(shared))
         self.assertTrue(wire.called)
         self.assertNotIn("brand_slug", wire.call_args.args[0])
+
+    def test_asset_hub_manifest_extras_do_not_enter_materials(self):
+        selected = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")
+        selected_path = Path(self.tmp.name) / "bundle/a.mp4"
+        extra_path = Path(self.tmp.name) / "bundle/extra.mp4"
+        selected_path.parent.mkdir()
+        selected_path.write_text("selected")
+        extra_path.write_text("extra")
+        manifest = {
+            "manifest_version": "1.0",
+            "generated_by": "kurukin-asset-hub",
+            "bundle_uid": "bundle",
+            "status": "ready",
+            "scenes": [
+                {
+                    "scene_id": "scene-001",
+                    "scene_index": 1,
+                    "assets": [
+                        {"asset_uid": "uid-a", "type": "video", "filename": "a.mp4", "local_path": str(selected_path), "status": "ready"},
+                        {"asset_uid": "uid-extra", "type": "video", "filename": "extra.mp4", "local_path": str(extra_path), "status": "ready"},
+                    ],
+                }
+            ],
+        }
+        with patch.dict("os.environ", {"ASSET_HUB_MATERIALIZED_ROOT": self.tmp.name}), patch("app.custom.material_acquisition.utils.storage_dir", self.storage), patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle", return_value={"asset_hub": {"bundle_uid": "bundle"}}):
+            provider = SimpleNamespace(get_renderer_manifest=lambda uid: manifest)
+            result = acquire_selected_materials(selection_result=SimpleNamespace(decisions=(decision(selected),)), task_id="t1", asset_hub_provider=provider)
+        self.assertEqual([item.url for item in result.materials], [str(selected_path)])
+        payload = json.loads(Path(result.manifest_path).read_text())
+        self.assertEqual([item["canonical_id"] for item in payload["selected"]], ["uid-a"])
 
     def test_503_and_traversal_are_clear(self):
         hub = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")

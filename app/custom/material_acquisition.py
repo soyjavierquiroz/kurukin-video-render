@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from app.custom.asset_hub_manifest import convert_asset_hub_manifest_to_materials
+from app.custom.asset_hub_manifest import extract_asset_hub_local_assets
 from app.custom.kurukin_asset_hub import KurukinAssetProvider
 from app.custom.kurukin_asset_hub_wiring import wire_explicit_asset_hub_bundle
 from app.models.schema import MaterialInfo
@@ -87,9 +87,25 @@ def _asset_hub_materials(decisions: list[Any], task_id: str, provider: Any) -> t
         if _status_code(exc) == 503:
             raise MaterialAcquisitionUnavailable("Asset Hub materialization is temporarily unavailable (503)") from exc
         raise
-    materials = list(convert_asset_hub_manifest_to_materials(manifest, strict=True))
-    if len(materials) != len(decisions):
-        raise MaterialAcquisitionError("Asset Hub manifest did not yield the exact selected material count")
+    selected_uids = [decision.candidate.canonical_id for decision in decisions]
+    assets_by_uid = {
+        str(asset.get("asset_uid")): asset
+        for asset in extract_asset_hub_local_assets(manifest, strict=True)
+        if str(asset.get("asset_uid")) in selected_uids
+    }
+    missing = [asset_uid for asset_uid in selected_uids if asset_uid not in assets_by_uid]
+    if missing:
+        raise MaterialAcquisitionError("Asset Hub manifest is missing selected assets")
+    materials = [
+        MaterialInfo(
+            provider="asset_hub",
+            url=str(assets_by_uid[asset_uid]["local_path"]),
+            duration=int(float(assets_by_uid[asset_uid].get("duration_seconds") or 0)),
+            motion="",
+            motion_intensity=0.0,
+        )
+        for asset_uid in selected_uids
+    ]
     for info, decision in zip(materials, decisions):
         candidate = decision.candidate
         info.source_info = _safe({"provider": "asset_hub", "asset_id": candidate.canonical_id,
