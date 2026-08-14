@@ -649,6 +649,71 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
     return clip
 
 
+def _sanitize_video_file_for_moviepy(video_path: str) -> str:
+    sanitized_dir = utils.storage_dir("temp/sanitized_videos", create=True)
+    descriptor, sanitized_path = tempfile.mkstemp(
+        prefix="moviepy-sanitized-",
+        suffix=".mp4",
+        dir=sanitized_dir,
+    )
+    os.close(descriptor)
+
+    sanitized_realpath = os.path.realpath(sanitized_path)
+    sanitized_root = os.path.realpath(sanitized_dir)
+    if not sanitized_realpath.startswith(sanitized_root + os.sep):
+        raise ValueError(f"sanitized video path escaped temp directory: {sanitized_path}")
+    if sanitized_realpath.startswith(os.path.realpath("/data/job-assets") + os.sep):
+        raise ValueError(f"sanitized video path must not be under /data/job-assets: {sanitized_path}")
+
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        "-i",
+        video_path,
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-map_chapters",
+        "-1",
+        "-map_metadata",
+        "-1",
+        "-c:v",
+        "copy",
+        "-movflags",
+        "+faststart",
+        sanitized_path,
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        delete_files(sanitized_path)
+        error_message = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(error_message or "ffmpeg sanitized remux failed")
+
+    return sanitized_path
+
+
+def _open_video_clip_with_sanitized_fallback(
+    video_path: str,
+    audio: bool = False,
+) -> tuple[VideoFileClip, str]:
+    try:
+        return _open_video_clip_quietly(video_path, audio=audio), video_path
+    except Exception as first_exc:
+        logger.warning(
+            "failed to open video directly, trying sanitized remux: "
+            f"{video_path}, error: {str(first_exc)}"
+        )
+        sanitized_path = _sanitize_video_file_for_moviepy(video_path)
+        return _open_video_clip_quietly(sanitized_path, audio=audio), sanitized_path
+
+
 def close_clip(clip):
     if clip is None:
         return
@@ -1522,10 +1587,19 @@ def preprocess_video(
                 clip, material_source_path = _open_image_clip_with_fallback(
                     material_source_path
                 )
+            elif ext in const.FILE_TYPE_VIDEOS:
+                clip, material_source_path = _open_video_clip_with_sanitized_fallback(
+                    material_source_path
+                )
             else:
                 clip = _open_video_clip_quietly(material_source_path)
-        except Exception:
+        except Exception as exc:
             # 非标准扩展名或探测失败时再回退到图片模式，兼容历史上直接传本地图片路径的情况。
+            if ext in const.FILE_TYPE_VIDEOS:
+                logger.warning(
+                    f"skip unreadable local material: {material.url}, error: {str(exc)}"
+                )
+                continue
             try:
                 clip, material_source_path = _open_image_clip_with_fallback(
                     material_source_path

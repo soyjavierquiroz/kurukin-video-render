@@ -460,6 +460,154 @@ class TestAssetHubRendererManifest(AssetHubFixtureMixin, unittest.TestCase):
             result = video_service.preprocess_video([material])
         self.assertEqual(result[0].url, str(self.video_a.resolve()))
 
+    def test_video_normal_open_does_not_remux(self):
+        with patch.object(
+            video_service,
+            "_open_video_clip_quietly",
+            return_value=_FakeClip(),
+        ) as open_video, patch.object(
+            video_service,
+            "_sanitize_video_file_for_moviepy",
+        ) as sanitize_video:
+            clip, opened_path = video_service._open_video_clip_with_sanitized_fallback(
+                str(self.video_a)
+            )
+
+        self.assertIsInstance(clip, _FakeClip)
+        self.assertEqual(opened_path, str(self.video_a))
+        open_video.assert_called_once_with(str(self.video_a), audio=False)
+        sanitize_video.assert_not_called()
+
+    def test_video_open_failure_remuxes_and_reopens_sanitized_copy(self):
+        sanitized_path = str(Path(self.tmp.name) / "storage" / "temp" / "clean.mp4")
+        with patch.object(
+            video_service,
+            "_open_video_clip_quietly",
+            side_effect=[IndexError("chapters"), _FakeClip()],
+        ) as open_video, patch.object(
+            video_service,
+            "_sanitize_video_file_for_moviepy",
+            return_value=sanitized_path,
+        ) as sanitize_video:
+            clip, opened_path = video_service._open_video_clip_with_sanitized_fallback(
+                str(self.video_a)
+            )
+
+        self.assertIsInstance(clip, _FakeClip)
+        self.assertEqual(opened_path, sanitized_path)
+        sanitize_video.assert_called_once_with(str(self.video_a))
+        self.assertEqual(
+            [call.args[0] for call in open_video.call_args_list],
+            [str(self.video_a), sanitized_path],
+        )
+
+    def test_sanitized_remux_command_strips_extra_streams_and_metadata(self):
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def fake_storage_dir(base: Path, sub_dir="", create=False):
+            path = base / sub_dir
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            return str(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                video_service.utils,
+                "storage_dir",
+                side_effect=lambda sub_dir="", create=False: fake_storage_dir(
+                    Path(tmp), sub_dir, create
+                ),
+            ), patch.object(
+                video_service.utils,
+                "get_ffmpeg_binary",
+                return_value="ffmpeg",
+            ), patch.object(video_service.subprocess, "run", side_effect=fake_run):
+                sanitized_path = video_service._sanitize_video_file_for_moviepy(
+                    str(self.video_a)
+                )
+
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertEqual(command[command.index("-i") + 1], str(self.video_a))
+        self.assertEqual(
+            command[command.index("-map") : -1],
+            [
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-map_chapters",
+                "-1",
+                "-map_metadata",
+                "-1",
+                "-c:v",
+                "copy",
+                "-movflags",
+                "+faststart",
+            ],
+        )
+        self.assertTrue(sanitized_path.endswith(".mp4"))
+        self.assertIn("/temp/sanitized_videos/", sanitized_path)
+        self.assertNotIn("/data/job-assets/", sanitized_path)
+
+    def test_video_extension_does_not_fall_back_to_image(self):
+        material = SimpleNamespace(
+            provider="asset_hub",
+            url=str(self.video_a),
+            duration=0,
+        )
+        with patch.object(
+            video_service,
+            "_open_video_clip_with_sanitized_fallback",
+            side_effect=RuntimeError("moviepy failed"),
+        ), patch.object(video_service, "_open_image_clip_with_fallback") as open_image:
+            result = video_service.preprocess_video([material])
+
+        self.assertEqual(result, [])
+        open_image.assert_not_called()
+
+    def test_video_remux_path_is_used_downstream(self):
+        material = SimpleNamespace(
+            provider="asset_hub",
+            url=str(self.video_a),
+            duration=0,
+        )
+        sanitized_path = str(Path(self.tmp.name) / "storage" / "temp" / "clean.mp4")
+        with patch.object(
+            video_service,
+            "_open_video_clip_with_sanitized_fallback",
+            return_value=(_FakeClip(), sanitized_path),
+        ):
+            result = video_service.preprocess_video([material])
+
+        self.assertEqual(result[0].url, sanitized_path)
+
+    def test_video_remux_failure_keeps_skip_behavior(self):
+        material = SimpleNamespace(
+            provider="asset_hub",
+            url=str(self.video_a),
+            duration=0,
+        )
+        with patch.object(
+            video_service,
+            "_open_video_clip_quietly",
+            side_effect=IndexError("chapters"),
+        ), patch.object(
+            video_service,
+            "_sanitize_video_file_for_moviepy",
+            side_effect=RuntimeError("ffmpeg sanitized remux failed"),
+        ), patch.object(video_service, "_open_image_clip_with_fallback") as open_image:
+            result = video_service.preprocess_video([material])
+
+        self.assertEqual(result, [])
+        open_image.assert_not_called()
+
     def test_video_provider_asset_hub_rejects_outside_base_dir(self):
         outside = Path(self.tmp.name) / "outside.mp4"
         outside.write_text("dummy", encoding="utf-8")
