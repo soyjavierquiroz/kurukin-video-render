@@ -33,6 +33,13 @@ def policy(*providers):
     return MaterialSourcePolicy(MaterialProviderPolicy(providers), **kwargs)
 
 
+def title_policy(title):
+    return MaterialSourcePolicy(
+        MaterialProviderPolicy((PROVIDER_ASSET_HUB,)),
+        AssetHubCatalogPolicy(include=AssetHubIncludePolicy(titles=(title,))),
+    )
+
+
 class FakeAssetHub:
     def __init__(self, results=None, error=None):
         self.results = results or {}
@@ -99,6 +106,57 @@ class TestMaterialDiscovery(unittest.TestCase):
         self.assertEqual(result.candidates[0].canonical_id, "a")
         self.assertNotIn("drive_file_id", str(result.candidates[0].source_info).lower())
         self.assertNotIn("secret", str(result.candidates[0].source_info).lower())
+
+    def test_asset_hub_retries_once_with_simplified_visual_word(self):
+        hub = FakeAssetHub({
+            "mujer triste": [],
+            "triste": [{"asset_uid": "sad-1", "filename": "sad.mp4", "orientation": "vertical"}],
+        })
+
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ASSET_HUB),
+            stock_terms=["mujer triste"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual([call[0] for call in hub.calls], ["mujer triste", "triste"])
+        self.assertEqual(result.candidates[0].canonical_id, "sad-1")
+        self.assertEqual(
+            [(item.term, item.candidate_count) for item in result.diagnostics],
+            [("mujer triste", 0), ("triste", 1)],
+        )
+
+    def test_asset_hub_title_only_fallback_keeps_exclusive_title_scope(self):
+        hub = FakeAssetHub({
+            "pareja abrazandose": [],
+            "pareja": [],
+            "mi-otra-yo": [{"asset_uid": "title-1", "filename": "title.mp4", "orientation": "vertical"}],
+        })
+
+        result = discover_material_candidates(
+            policy=title_policy("mi-otra-yo"),
+            stock_terms=["pareja abrazandose"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual([call[0] for call in hub.calls], ["pareja abrazandose", "pareja", "mi-otra-yo"])
+        self.assertTrue(all(
+            call[1] == {"sources": [{"scope": "title", "title": "mi-otra-yo"}]}
+            for call in hub.calls
+        ))
+        self.assertEqual(result.candidates[0].canonical_id, "title-1")
+
+    def test_asset_hub_open_policy_does_not_use_title_only_fallback(self):
+        hub = FakeAssetHub({"mujer preocupada": [], "preocupada": []})
+
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ASSET_HUB),
+            stock_terms=["mujer preocupada"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual([call[0] for call in hub.calls], ["mujer preocupada", "preocupada"])
+        self.assertEqual(result.candidates, ())
 
     def test_empty_is_success_and_partial_failure_continues(self):
         def search(provider, *_args):

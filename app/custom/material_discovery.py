@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Mapping, Sequence
 
 from app.custom.kurukin_asset_hub import (
@@ -31,6 +32,11 @@ _FORBIDDEN_SOURCE_KEY_PARTS = (
     "credential", "api_key", "apikey", "token", "password", "secret",
     "authorization", "auth",
 )
+_VISUAL_SUBJECT_WORDS = {
+    "adulto", "adulta", "hombre", "mujer", "nino", "nina", "niño", "niña",
+    "persona", "personas",
+}
+_CONNECTOR_WORDS = {"con", "de", "del", "la", "las", "los", "un", "una", "y"}
 
 
 class MaterialDiscoveryError(RuntimeError):
@@ -86,6 +92,37 @@ def _normalize_terms(values: Sequence[str] | None) -> tuple[str, ...]:
         if text and text not in result:
             result.append(text)
     return tuple(result)
+
+
+def _term_words(term: str) -> list[str]:
+    return re.findall(r"[\wáéíóúüñÁÉÍÓÚÜÑ]+", term, flags=re.UNICODE)
+
+
+def _simplify_asset_hub_retry_term(term: str) -> str:
+    words = _term_words(term)
+    if len(words) <= 1:
+        return ""
+    lowered = [word.lower() for word in words]
+    if lowered[0] == "pareja":
+        return words[0]
+    if lowered[0] in _VISUAL_SUBJECT_WORDS:
+        for word, clean in zip(reversed(words), reversed(lowered)):
+            if clean not in _VISUAL_SUBJECT_WORDS and clean not in _CONNECTOR_WORDS:
+                return word
+    for word, clean in zip(words, lowered):
+        if clean not in _CONNECTOR_WORDS:
+            return word
+    return words[0]
+
+
+def _exclusive_title_from_source_policy(source_policy: Mapping[str, Any] | None) -> str:
+    sources = (source_policy or {}).get("sources")
+    if not isinstance(sources, list) or len(sources) != 1:
+        return ""
+    source = sources[0]
+    if not isinstance(source, Mapping) or str(source.get("scope") or "").strip() != "title":
+        return ""
+    return str(source.get("title") or "").strip()
 
 
 def _safe_number(value: Any, converter: type[int] | type[float]) -> int | float | None:
@@ -215,6 +252,20 @@ def _is_fatal_asset_hub_error(exc: Exception) -> bool:
         return False
 
 
+def _asset_hub_found_candidates(
+    provider: KurukinAssetProvider,
+    *,
+    query: str,
+    source_policy: Mapping[str, Any],
+    original_term: str,
+) -> list[MaterialCandidate]:
+    assets = provider.search(query=query, source_policy=source_policy)
+    return [
+        _asset_hub_candidate(asset, term=original_term, rank=index)
+        for index, asset in enumerate(assets)
+    ]
+
+
 def _dedupe(candidates: list[MaterialCandidate]) -> tuple[MaterialCandidate, ...]:
     seen: set[str] = set()
     result: list[MaterialCandidate] = []
@@ -282,15 +333,34 @@ def discover_material_candidates(
         if provider == PROVIDER_ASSET_HUB:
             active_provider = asset_hub_provider or KurukinAssetProvider()
             source_policy = plan["asset_hub"]["source_policy"]
+            title_only_fallback = _exclusive_title_from_source_policy(source_policy)
         for term in terms:
-            remote_attempts += 1
+            queries = [term]
+            if provider == PROVIDER_ASSET_HUB:
+                simplified = _simplify_asset_hub_retry_term(term)
+                if simplified and simplified not in queries:
+                    queries.append(simplified)
+                if title_only_fallback and title_only_fallback not in queries:
+                    queries.append(title_only_fallback)
+            found: list[MaterialCandidate] = []
             try:
-                if provider == PROVIDER_ASSET_HUB:
-                    assets = active_provider.search(query=term, source_policy=source_policy)
-                    found = [_asset_hub_candidate(asset, term=term, rank=index) for index, asset in enumerate(assets)]
-                else:
+                if provider != PROVIDER_ASSET_HUB:
+                    remote_attempts += 1
                     items = material.search_videos_for_provider(provider, term, minimum_duration, video_aspect)
                     found = [candidate for index, item in enumerate(items) if (candidate := _stock_candidate(item, provider=provider, term=term, rank=index)) is not None]
+                else:
+                    for query in queries:
+                        remote_attempts += 1
+                        found = _asset_hub_found_candidates(
+                            active_provider,
+                            query=query,
+                            source_policy=source_policy,
+                            original_term=term,
+                        )
+                        found = [candidate for candidate in found if _is_orientation_compatible(candidate, video_aspect)]
+                        diagnostics.append(DiscoveryDiagnostic(provider, query, "success", "ok", len(found)))
+                        if found:
+                            break
             except Exception as exc:
                 if provider == PROVIDER_ASSET_HUB and _is_fatal_asset_hub_error(exc):
                     raise
@@ -299,11 +369,12 @@ def discover_material_candidates(
                 if remote_provider_count == 1:
                     raise MaterialDiscoveryError(f"material provider '{provider}' failed") from exc
                 continue
-            found = [candidate for candidate in found if _is_orientation_compatible(candidate, video_aspect)]
+            if provider != PROVIDER_ASSET_HUB:
+                found = [candidate for candidate in found if _is_orientation_compatible(candidate, video_aspect)]
+                diagnostics.append(DiscoveryDiagnostic(provider, term, "success", "ok", len(found)))
             candidates.extend(found)
             if provider not in succeeded:
                 succeeded.append(provider)
-            diagnostics.append(DiscoveryDiagnostic(provider, term, "success", "ok", len(found)))
 
     if remote_attempts and technical_failures == remote_attempts:
         raise MaterialDiscoveryError("all enabled remote material providers failed")
