@@ -19,6 +19,7 @@ from app.custom.asset_hub_manifest import (
 
 DEFAULT_CREATED_BY = "money-printer-turbo"
 DEFAULT_TIMEOUT_SECONDS = 15
+DEFAULT_MATERIALIZE_TIMEOUT_SECONDS = 90
 MAX_ATTEMPTS = 3
 RETRY_STATUSES = {500, 502, 503, 504}
 NO_RETRY_STATUSES = {401, 403, 404, 422}
@@ -50,6 +51,16 @@ def _safe_message(message: Any) -> str:
     if any(word in lowered for word in ("api_key", "apikey", "authorization", "token", "secret")):
         return "<redacted>"
     return text
+
+
+def _positive_float(value: Any, default: int | float) -> int | float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return int(parsed) if parsed.is_integer() else parsed
 
 
 def get_materialized_root(env: Mapping[str, str] | None = None) -> Path:
@@ -236,6 +247,7 @@ class KurukinAssetProvider:
         api_key: str | None = None,
         session: requests.Session | None = None,
         timeout: int | float = DEFAULT_TIMEOUT_SECONDS,
+        materialize_timeout: int | float | None = None,
         sleeper: Callable[[float], None] | None = None,
         backoff_seconds: tuple[float, ...] = (0.1, 0.2),
         env: Mapping[str, str] | None = None,
@@ -248,7 +260,16 @@ class KurukinAssetProvider:
         if not self.api_key:
             raise KurukinAssetHubAuthError("ASSET_HUB_API_KEY is required")
         self.session = session or requests.Session()
-        self.timeout = timeout
+        self.timeout = _positive_float(
+            source.get("ASSET_HUB_TIMEOUT_SECONDS"),
+            timeout,
+        )
+        self.materialize_timeout = _positive_float(
+            source.get("ASSET_HUB_MATERIALIZE_TIMEOUT_SECONDS"),
+            materialize_timeout
+            if materialize_timeout is not None
+            else DEFAULT_MATERIALIZE_TIMEOUT_SECONDS,
+        )
         self.sleeper = sleeper or time.sleep
         self.backoff_seconds = backoff_seconds
 
@@ -269,6 +290,7 @@ class KurukinAssetProvider:
         *,
         json_body: dict[str, Any] | None = None,
         max_attempts: int = MAX_ATTEMPTS,
+        timeout: int | float | None = None,
     ) -> dict[str, Any]:
         last_error: Exception | None = None
         attempts = max(1, int(max_attempts))
@@ -279,7 +301,7 @@ class KurukinAssetProvider:
                     self._url(path),
                     headers=self._headers(),
                     json=deepcopy(json_body) if json_body is not None else None,
-                    timeout=self.timeout,
+                    timeout=self.timeout if timeout is None else timeout,
                 )
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_error = exc
@@ -371,6 +393,7 @@ class KurukinAssetProvider:
             f"/api/jobs/asset-bundles/{clean_uid}/materialize",
             json_body={"force": bool(force)},
             max_attempts=MAX_ATTEMPTS if not force else 1,
+            timeout=self.materialize_timeout,
         )
 
     def get_renderer_manifest(self, bundle_uid: str) -> dict[str, Any]:

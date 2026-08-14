@@ -201,6 +201,29 @@ class KurukinAssetHubTests(unittest.TestCase):
 
         self.assertEqual(len(provider.session.calls), 1)
 
+    def test_materialize_bundle_uses_longer_timeout(self):
+        provider = make_provider([FakeResponse(200, {"status": "ready"})])
+
+        provider.materialize_bundle("bundle-1")
+
+        self.assertEqual(provider.session.calls[0]["timeout"], 90)
+
+    def test_materialize_timeout_can_be_overridden_by_env(self):
+        provider = KurukinAssetProvider(
+            base_url="https://asset-hub.test",
+            api_key="super-secret-key",
+            session=FakeSession([FakeResponse(200, {"status": "ready"})]),
+            sleeper=lambda _delay: None,
+            backoff_seconds=(0, 0),
+            env={
+                "ASSET_HUB_MATERIALIZE_TIMEOUT_SECONDS": "180",
+            },
+        )
+
+        provider.materialize_bundle("bundle-1")
+
+        self.assertEqual(provider.session.calls[0]["timeout"], 180)
+
     def test_explicit_only_bundle_omits_brand_slug(self):
         payload = build_explicit_bundle_payload(
             job_id="mpt-001",
