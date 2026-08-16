@@ -349,14 +349,99 @@ def _split_script_lines_preserving_punctuation(text):
 
 
 def _align_script_to_whisper(script_tokens, whisper_tokens):
-    whisper_text_tokens = [token["text"] for token in whisper_tokens]
-    matcher = SequenceMatcher(None, script_tokens, whisper_text_tokens, autojunk=False)
+    whisper_text_tokens = [
+        token["text"]
+        for token in whisper_tokens
+    ]
+
+    matcher = SequenceMatcher(
+        None,
+        script_tokens,
+        whisper_text_tokens,
+        autojunk=False,
+    )
+
     mapping = {}
+    replace_blocks = []
+
+    # First preserve ordinary exact token matches.
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag != "equal":
-            continue
-        for offset in range(i2 - i1):
-            mapping[i1 + offset] = j1 + offset
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                mapping[i1 + offset] = j1 + offset
+        elif tag == "replace":
+            replace_blocks.append(
+                (i1, i2, j1, j2)
+            )
+
+    # Whisper can legitimately merge adjacent words which are
+    # separate tokens in the canonical script:
+    #
+    #   "descansar", "te"  -> "descansarte"
+    #   "recibir", "te"    -> "recibirte"
+    #
+    # Treat those word-boundary differences as exact matches.
+    # Multiple script tokens may therefore point to the same
+    # Whisper token/timing anchor.
+    for i1, i2, j1, j2 in replace_blocks:
+        used_whisper_indices = set(
+            mapping.values()
+        )
+
+        for whisper_index in range(j1, j2):
+            if whisper_index in used_whisper_indices:
+                continue
+
+            whisper_token = whisper_text_tokens[
+                whisper_index
+            ]
+
+            matched = False
+
+            # Two-token merges cover the common Spanish clitic
+            # cases. Three-token support costs little and makes
+            # the rule robust without fuzzy matching.
+            for group_size in (2, 3):
+                max_start = i2 - group_size + 1
+
+                for script_index in range(
+                    i1,
+                    max_start,
+                ):
+                    indices = list(
+                        range(
+                            script_index,
+                            script_index + group_size,
+                        )
+                    )
+
+                    if any(
+                        index in mapping
+                        for index in indices
+                    ):
+                        continue
+
+                    combined = "".join(
+                        script_tokens[index]
+                        for index in indices
+                    )
+
+                    if combined != whisper_token:
+                        continue
+
+                    for index in indices:
+                        mapping[index] = whisper_index
+
+                    used_whisper_indices.add(
+                        whisper_index
+                    )
+
+                    matched = True
+                    break
+
+                if matched:
+                    break
+
     return mapping
 
 
