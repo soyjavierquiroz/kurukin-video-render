@@ -601,6 +601,316 @@ def submit_and_wait(
         time.sleep(poll_seconds)
 
 
+
+_TRANSIENT_ERROR_MARKERS = (
+    "503",
+    "502",
+    "504",
+    "timeout",
+    "timed out",
+    "temporarily unavailable",
+    "temporary failure",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "network is unreachable",
+    "remote end closed",
+    "broken pipe",
+    "econnreset",
+    "etimedout",
+    "socket hang up",
+)
+
+
+def _transient_failed_run(
+    run_dir: Path,
+) -> bool:
+    error_file = (
+        run_dir
+        / "error.json"
+    )
+
+    if not error_file.is_file():
+        return False
+
+    try:
+        raw = error_file.read_text(
+            encoding="utf-8"
+        ).lower()
+    except OSError:
+        return False
+
+    return any(
+        marker in raw
+        for marker in _TRANSIENT_ERROR_MARKERS
+    )
+
+
+def _retry_pending_file(
+    failed_run: Path,
+    paths: dict[str, Path],
+) -> Path:
+    source = (
+        failed_run
+        / "job.json"
+    )
+
+    if not source.is_file():
+        raise RunnerError(
+            "failed run has no job.json "
+            "for retry"
+        )
+
+    pending_dir = (
+        paths["pending"]
+    )
+
+    pending_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    retry_file = (
+        pending_dir
+        / (
+            "retry-"
+            + failed_run.name
+            + ".json"
+        )
+    )
+
+    counter = 1
+    original = retry_file
+
+    while retry_file.exists():
+        retry_file = (
+            pending_dir
+            / (
+                original.stem
+                + f"-{counter}"
+                + original.suffix
+            )
+        )
+        counter += 1
+
+    shutil.copy2(
+        source,
+        retry_file,
+    )
+
+    return retry_file
+
+
+def process_one_job_with_retry(
+    pending_file: Path,
+    paths: dict[str, Path],
+    args: argparse.Namespace,
+    logger: Logger,
+    *,
+    renderer_runner=None,
+    duration_runner=None,
+) -> Path:
+    result = process_one_job(
+        pending_file,
+        paths,
+        args,
+        logger,
+        renderer_runner=renderer_runner,
+        duration_runner=duration_runner,
+    )
+
+    if (
+        result.parent.name != "failed"
+        or not _transient_failed_run(result)
+    ):
+        return result
+
+    logger.log(
+        f"transient failure detected for "
+        f"{result.name}; retrying once"
+    )
+
+    retry_file = _retry_pending_file(
+        result,
+        paths,
+    )
+
+    # Short bounded delay only. We never retry indefinitely.
+    time.sleep(30)
+
+    retry_result = process_one_job(
+        retry_file,
+        paths,
+        args,
+        logger,
+        renderer_runner=renderer_runner,
+        duration_runner=duration_runner,
+    )
+
+    if retry_result.parent.name == "failed":
+        logger.log(
+            f"retry exhausted for "
+            f"{retry_result.name}; "
+            "continuing with next job"
+        )
+
+    return retry_result
+
+
+def _emergency_failed_job(
+    pending_file: Path,
+    paths: dict[str, Path],
+    exc: Exception,
+) -> Path:
+    failed_root = (
+        paths["failed"]
+    )
+
+    failed_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    timestamp = dt.datetime.now(
+        dt.timezone.utc
+    ).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+
+    stem = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "-",
+        pending_file.stem,
+    ).strip(
+        "-._"
+    ) or "job"
+
+    destination = (
+        failed_root
+        / (
+            f"runner-guard-"
+            f"{stem}-"
+            f"{timestamp}"
+        )
+    )
+
+    counter = 1
+    original = destination
+
+    while destination.exists():
+        destination = Path(
+            str(original)
+            + f"-{counter}"
+        )
+        counter += 1
+
+    destination.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
+
+    if pending_file.is_file():
+        shutil.move(
+            str(pending_file),
+            str(
+                destination
+                / "job.json"
+            ),
+        )
+
+    write_json(
+        destination
+        / "error.json",
+        api_error_payload(exc),
+    )
+
+    return destination
+
+
+def safe_process_one_job(
+    pending_file: Path,
+    paths: dict[str, Path],
+    args: argparse.Namespace,
+    logger: Logger,
+    *,
+    renderer_runner=None,
+    duration_runner=None,
+) -> Path:
+    """
+    Last-resort isolation boundary for one nightly job.
+
+    A bad job is never allowed to terminate processing of the
+    remaining queue.
+    """
+
+    try:
+        from scripts.nightly_preflight import (
+            preflight_job_file,
+            quarantine_job,
+        )
+
+        try:
+            preflight_job_file(
+                pending_file,
+                materialize=False,
+            )
+        except Exception as exc:
+            report = {
+                "ok": False,
+                "error_type": (
+                    type(exc).__name__
+                ),
+                "error": str(exc),
+                "phase": "runner_preflight",
+                "job_file": str(
+                    pending_file
+                ),
+            }
+
+            blocked = quarantine_job(
+                pending_file,
+                report=report,
+                queue_dir=(
+                    paths["pending"]
+                    .parent
+                ),
+            )
+
+            logger.log(
+                f"blocked {pending_file.name}: "
+                f"{exc}; "
+                f"continuing with next job"
+            )
+
+            return blocked
+
+        return process_one_job_with_retry(
+            pending_file,
+            paths,
+            args,
+            logger,
+            renderer_runner=renderer_runner,
+            duration_runner=duration_runner,
+        )
+
+    except Exception as exc:
+        emergency = _emergency_failed_job(
+            pending_file,
+            paths,
+            exc,
+        )
+
+        logger.log(
+            f"runner guard caught unexpected "
+            f"failure for {pending_file.name}: "
+            f"{exc}; moved to "
+            f"{emergency.name}; "
+            "continuing with next job"
+        )
+
+        return emergency
+
+
 def process_one_job(
     pending_file: Path,
     paths: dict[str, Path],
@@ -741,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.ignore_window:
             logger.log("manual window override enabled")
         jobs_started = 0
+        poisoned_jobs: set[Path] = set()
+
         while jobs_started < args.max_jobs:
             if not args.ignore_window and not is_in_window(
                 dt.datetime.now().astimezone(), args.window_start, args.window_end
@@ -752,12 +1064,42 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 break
 
-            jobs = pending_jobs(paths["pending"])
+            jobs = [
+                job
+                for job in pending_jobs(paths["pending"])
+                if job.resolve() not in poisoned_jobs
+            ]
             if not jobs:
                 logger.log("no pending jobs")
                 break
 
-            process_one_job(jobs[0], paths, args, logger)
+            current_job = jobs[0]
+
+            # LAST-CHANCE per-job guard.
+            #
+            # safe_process_one_job already contains its own
+            # isolation logic. This second barrier exists so
+            # that even a bug in that emergency path cannot
+            # terminate the unattended nightly queue.
+            try:
+                safe_process_one_job(
+                    current_job,
+                    paths,
+                    args,
+                    logger,
+                )
+            except Exception as exc:
+                poisoned_jobs.add(
+                    current_job.resolve()
+                )
+
+                logger.log(
+                    "LAST-CHANCE GUARD: "
+                    f"{current_job.name} raised "
+                    f"{type(exc).__name__}: {exc}; "
+                    "job skipped for this runner session; "
+                    "continuing with next pending job"
+                )
             jobs_started += 1
 
         logger.log(f"finished jobs_started={jobs_started}")
