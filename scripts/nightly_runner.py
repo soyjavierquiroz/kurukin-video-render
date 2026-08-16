@@ -499,12 +499,20 @@ def handle_human_review_batch_job(job: dict[str, Any], reserved_dir: Path) -> di
     result = {
         "ok": status == "completed",
         "status": status,
+        "requires_review": status == "review_required",
         "production_plan_path": job["production_plan_path"],
         "task_id": job.get("task_id"),
     }
     write_json(reserved_dir / "render-result.json", result)
+
+    if status == "review_required":
+        return result
+
     if status != "completed":
-        raise RunnerError(f"approved review render did not complete: {status}")
+        raise RunnerError(
+            f"approved review render did not complete: {status}"
+        )
+
     write_json(
         reserved_dir / "submit-response.json",
         {
@@ -610,8 +618,13 @@ def process_one_job(
         payload = validate_job(job)
         write_json(run_dir / "moneyprinter-payload.json", payload)
 
+        human_review_result = None
+
         if is_human_review_batch_job(job):
-            handle_human_review_batch_job(job, run_dir)
+            human_review_result = handle_human_review_batch_job(
+                job,
+                run_dir,
+            )
         elif is_aroll_broll_job(job):
             handle_aroll_broll_job(
                 job,
@@ -633,8 +646,40 @@ def process_one_job(
                 logger,
             )
 
-        completed_path = move_run_dir(run_dir, paths["completed"])
-        logger.log(f"moved {run_dir.name} to completed")
+        if (
+            human_review_result
+            and human_review_result.get("status")
+            == "review_required"
+        ):
+            review_required_dir = (
+                paths["failed"].parent
+                / "review_required"
+            )
+
+            review_required_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            review_path = move_run_dir(
+                run_dir,
+                review_required_dir,
+            )
+
+            logger.log(
+                f"moved {run_dir.name} "
+                "to review_required"
+            )
+
+            return review_path
+
+        completed_path = move_run_dir(
+            run_dir,
+            paths["completed"],
+        )
+        logger.log(
+            f"moved {run_dir.name} to completed"
+        )
         return completed_path
     except Exception as exc:
         write_json(run_dir / "error.json", api_error_payload(exc))
