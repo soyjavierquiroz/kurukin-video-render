@@ -10,15 +10,18 @@ from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
 from os import path
+from pathlib import Path
 from uuid import uuid4
 
 from loguru import logger
 
 from app.config import config
 from app.custom import asset_hub_manifest
+from app.custom import human_review
 from app.custom.material_acquisition import acquire_selected_materials
 from app.custom.material_discovery import (
     MaterialDiscoveryResult,
+    discover_asset_hub_review_reserve_candidates,
     discover_asset_hub_title_fallback_candidates,
     discover_material_candidates,
 )
@@ -950,7 +953,15 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         subtitle.create(audio_file=audio_file, subtitle_file=subtitle_path)
         if getattr(params, "subtitle_correction_enabled", True):
             logger.info("\n\n## correcting subtitle")
-            subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+            alignment_result = subtitle.correct(
+                subtitle_file=subtitle_path, video_script=video_script
+            )
+            logger.info(
+                "subtitle alignment result, "
+                f"status: {alignment_result.get('status')}, "
+                f"confidence: {alignment_result.get('confidence')}, "
+                f"review_required: {alignment_result.get('review_required')}"
+            )
 
     optimize_subtitle_if_enabled(subtitle_path, params)
 
@@ -1010,8 +1021,8 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return downloaded_videos
 
 
-def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) -> str | None:
-    """Materialize policy-selected assets into the normal local-material path."""
+def _select_autonomous_materials(task_id, params, video_terms, audio_duration):
+    """Run discovery and ranking without materializing selected assets."""
     policy = material_source_policy_from_dict(params.material_source_policy)
     discovery = discover_material_candidates(
         policy=policy,
@@ -1059,6 +1070,147 @@ def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) 
                 clip_duration=params.video_clip_duration,
                 recent_dedupe_keys=recent_keys,
             )
+    # Human Review requires many more candidates than
+    # autonomous rendering. PRIMARY selection is already frozen
+    # above; everything added here is suggestions/backups only.
+    if getattr(params, "human_review", None):
+        review_terms = tuple(
+            params.asset_hub_terms
+            or video_terms
+        )
+
+        semantic_reserve = (
+            discover_asset_hub_review_reserve_candidates(
+                policy=policy,
+                terms=review_terms,
+                video_aspect=params.video_aspect,
+                limit_per_term=100,
+            )
+        )
+
+        title_reserve = (
+            discover_asset_hub_title_fallback_candidates(
+                policy=policy,
+                video_aspect=params.video_aspect,
+                limit=100,
+            )
+        )
+
+        merged_candidates = []
+        seen_dedupe_keys = set()
+
+        candidate_sources = (
+            tuple(
+                getattr(
+                    discovery,
+                    "candidates",
+                    (),
+                )
+                or ()
+            )
+            + tuple(semantic_reserve.candidates)
+            + tuple(title_reserve.candidates)
+        )
+
+        for candidate in candidate_sources:
+            key = str(
+                getattr(
+                    candidate,
+                    "dedupe_key",
+                    "",
+                )
+                or getattr(
+                    candidate,
+                    "canonical_id",
+                    "",
+                )
+                or ""
+            )
+
+            if not key or key in seen_dedupe_keys:
+                continue
+
+            seen_dedupe_keys.add(key)
+            merged_candidates.append(candidate)
+
+        discovery = MaterialDiscoveryResult(
+            candidates=tuple(merged_candidates),
+            diagnostics=(
+                tuple(
+                    getattr(
+                        discovery,
+                        "diagnostics",
+                        (),
+                    )
+                    or ()
+                )
+                + tuple(
+                    semantic_reserve.diagnostics
+                )
+                + tuple(
+                    title_reserve.diagnostics
+                )
+            ),
+            providers_attempted=tuple(
+                dict.fromkeys(
+                    tuple(
+                        getattr(
+                            discovery,
+                            "providers_attempted",
+                            (),
+                        )
+                        or ()
+                    )
+                    + tuple(
+                        semantic_reserve.providers_attempted
+                    )
+                    + tuple(
+                        title_reserve.providers_attempted
+                    )
+                )
+            ),
+            providers_succeeded=tuple(
+                dict.fromkeys(
+                    tuple(
+                        getattr(
+                            discovery,
+                            "providers_succeeded",
+                            (),
+                        )
+                        or ()
+                    )
+                    + tuple(
+                        semantic_reserve.providers_succeeded
+                    )
+                    + tuple(
+                        title_reserve.providers_succeeded
+                    )
+                )
+            ),
+            terms_used=getattr(
+                discovery,
+                "terms_used",
+                {
+                    "stock": tuple(video_terms),
+                    "asset_hub": review_terms,
+                },
+            ),
+        )
+
+        logger.info(
+            "human review reserve pool expanded: "
+            f"{len(discovery.candidates)} "
+            "unique candidates"
+        )
+
+    return discovery, selection
+
+
+def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) -> str | None:
+    """Materialize policy-selected assets into the normal local-material path."""
+    discovery, selection = _select_autonomous_materials(
+        task_id, params, video_terms, audio_duration
+    )
     if not selection.decisions:
         return "No usable visual materials found"
     if selection.shortfall > 0:
@@ -1073,6 +1225,51 @@ def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) 
     params.video_source = "local"
     params.video_materials = list(acquisition.materials)
     return None
+
+
+def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio_file, audio_duration):
+    if params.material_source_policy is None:
+        return _mark_task_failed(
+            task_id,
+            "review",
+            "human review requires material_source_policy selection",
+        )
+    try:
+        discovery, selection = _select_autonomous_materials(
+            task_id, params, video_terms, audio_duration
+        )
+    except Exception as exc:
+        return _mark_task_failed(task_id, "materials", str(exc))
+    if not selection.decisions:
+        return _mark_task_failed(task_id, "materials", "No usable visual materials found")
+
+    review = getattr(params, "human_review", None) or {}
+    output_path = Path(review.get("production_plan_path") or human_review.plan_path(
+        str(review.get("batch_id") or "batch"),
+        str(review.get("stem") or task_id),
+    ))
+    plan = human_review.build_plan(
+        batch_id=str(review.get("batch_id") or "batch"),
+        task_id=task_id,
+        stem=str(review.get("stem") or task_id),
+        audio_path=str(review.get("audio_path") or audio_file),
+        script_path=str(review.get("script_path") or ""),
+        script_text=video_script,
+        duration=float(audio_duration or 0),
+        aspect_ratio=str(params.video_aspect),
+        visual_style=str(review.get("visual_style") or "none"),
+        selection_result=selection,
+        discovery_result=discovery,
+        output_path=output_path,
+    )
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_COMPLETE,
+        progress=100,
+        review_status=human_review.STATUS_PENDING,
+        production_plan_path=output_path.as_posix(),
+    )
+    return {"production_plan_path": output_path.as_posix(), "review_status": plan.get("review_status")}
 
 
 def generate_final_videos(
@@ -1624,6 +1821,16 @@ def _run_pipeline(
             audio_file=audio_file,
         )
         return {"audio_file": audio_file, "audio_duration": audio_duration}
+
+    if stop_at == "review":
+        return _prepare_human_review_plan(
+            task_id,
+            params,
+            video_script,
+            video_terms,
+            audio_file,
+            audio_duration,
+        )
 
     # 4. Generate subtitle
     subtitle_path = generate_subtitle(

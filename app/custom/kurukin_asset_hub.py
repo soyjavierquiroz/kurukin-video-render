@@ -199,10 +199,18 @@ def resolve_ready_asset_paths(
 
 
 def _scene_payload(scene: Mapping[str, Any], index: int) -> dict[str, Any]:
-    selected_asset_uids = [
-        validate_asset_uid(asset_uid, field_name=f"scenes[{index}].selected_asset_uids")
+    validated_asset_uids = [
+        validate_asset_uid(
+            asset_uid,
+            field_name=f"scenes[{index}].selected_asset_uids",
+        )
         for asset_uid in scene.get("selected_asset_uids") or []
     ]
+
+    # Asset Hub requires unique asset_uids inside each scene.
+    # Preserve ranking/order while removing duplicates.
+    selected_asset_uids = list(dict.fromkeys(validated_asset_uids))
+
     if not selected_asset_uids:
         raise KurukinAssetHubValidationError(f"scenes[{index}].selected_asset_uids is required")
     payload = {

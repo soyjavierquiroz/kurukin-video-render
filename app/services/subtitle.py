@@ -1,6 +1,9 @@
 import json
 import os.path
 import re
+import shutil
+import unicodedata
+from difflib import SequenceMatcher
 from timeit import default_timer as timer
 
 try:
@@ -17,6 +20,8 @@ device = config.whisper.get("device", "cpu")
 compute_type = config.whisper.get("compute_type", "int8")
 initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
+GLOBAL_OK_THRESHOLD = 0.90
+LINE_MIN_COVERAGE = 0.40
 
 
 def create(audio_file, subtitle_file: str = ""):
@@ -199,99 +204,293 @@ def similarity(a, b):
     return 1 - (distance / max_length)
 
 
-def correct(subtitle_file, video_script):
-    subtitle_items = file_to_subtitles(subtitle_file)
+def _subtitle_raw_path(subtitle_file):
+    base, ext = os.path.splitext(subtitle_file)
+    return f"{base}.raw{ext or '.srt'}"
+
+
+def _subtitle_alignment_report_path(subtitle_file):
+    base, _ = os.path.splitext(subtitle_file)
+    return f"{base}-alignment.json"
+
+
+def _parse_srt_time(time_value):
+    hours, minutes, seconds, milliseconds = re.match(
+        r"(\d+):(\d+):(\d+),(\d+)", time_value
+    ).groups()
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(milliseconds) / 1000
+    )
+
+
+def _parse_srt_timerange(timerange):
+    start_text, end_text = timerange.split(" --> ", 1)
+    return _parse_srt_time(start_text), _parse_srt_time(end_text)
+
+
+def _normalize_token_for_subtitle_alignment(text):
+    text = unicodedata.normalize("NFKD", text.lower())
+    chars = []
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        if char.isalnum():
+            chars.append(char)
+    return "".join(chars)
+
+
+def _tokenize_for_subtitle_alignment(text):
+    tokens = []
+    current = []
+    for char in text or "":
+        if char.isalnum():
+            current.append(char)
+        elif current:
+            token = _normalize_token_for_subtitle_alignment("".join(current))
+            if token:
+                tokens.append(token)
+            current = []
+    if current:
+        token = _normalize_token_for_subtitle_alignment("".join(current))
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _whisper_subtitle_tokens(subtitle_items):
+    tokens = []
+    for subtitle_index, item in enumerate(subtitle_items):
+        try:
+            start, end = _parse_srt_timerange(item[1])
+        except (AttributeError, ValueError):
+            continue
+        text_tokens = _tokenize_for_subtitle_alignment(item[2])
+        if not text_tokens or end <= start:
+            continue
+
+        token_duration = (end - start) / len(text_tokens)
+        for token_index, token in enumerate(text_tokens):
+            token_start = start + token_duration * token_index
+            token_end = (
+                end
+                if token_index == len(text_tokens) - 1
+                else start + token_duration * (token_index + 1)
+            )
+            tokens.append(
+                {
+                    "text": token,
+                    "start": max(0, token_start),
+                    "end": max(0, token_end),
+                    "subtitle_index": subtitle_index,
+                }
+            )
+    return tokens
+
+
+def _script_subtitle_lines(video_script):
     normalized_script = utils.normalize_script_for_subtitle_matching(video_script)
-    script_lines = utils.split_string_by_punctuations(normalized_script)
+    canonical_lines = utils.split_string_by_punctuations(normalized_script)
+    script_lines = _split_script_lines_preserving_punctuation(normalized_script)
+    if len(script_lines) != len(canonical_lines):
+        logger.debug(
+            "subtitle script split count differs after preserving punctuation, "
+            f"canonical: {len(canonical_lines)}, preserved: {len(script_lines)}"
+        )
+    lines = []
+    flat_tokens = []
+    for line in script_lines:
+        original_text = line.strip()
+        tokens = _tokenize_for_subtitle_alignment(original_text)
+        token_indices = []
+        for token in tokens:
+            token_indices.append(len(flat_tokens))
+            flat_tokens.append(token)
+        lines.append(
+            {
+                "text": original_text,
+                "tokens": tokens,
+                "token_indices": token_indices,
+            }
+        )
+    return lines, flat_tokens
 
-    corrected = False
-    new_subtitle_items = []
-    script_index = 0
-    subtitle_index = 0
 
-    while script_index < len(script_lines) and subtitle_index < len(subtitle_items):
-        script_line = script_lines[script_index].strip()
-        subtitle_line = subtitle_items[subtitle_index][2].strip()
+def _split_script_lines_preserving_punctuation(text):
+    result = []
+    current = ""
 
-        if script_line == subtitle_line:
-            new_subtitle_items.append(subtitle_items[subtitle_index])
-            script_index += 1
-            subtitle_index += 1
-        else:
-            combined_subtitle = subtitle_line
-            start_time = subtitle_items[subtitle_index][1].split(" --> ")[0]
-            end_time = subtitle_items[subtitle_index][1].split(" --> ")[1]
-            next_subtitle_index = subtitle_index + 1
+    for index, char in enumerate(text or ""):
+        previous_char = text[index - 1] if index > 0 else ""
+        next_char = text[index + 1] if index < len(text) - 1 else ""
 
-            while next_subtitle_index < len(subtitle_items):
-                next_subtitle = subtitle_items[next_subtitle_index][2].strip()
-                if similarity(
-                    script_line, combined_subtitle + " " + next_subtitle
-                ) > similarity(script_line, combined_subtitle):
-                    combined_subtitle += " " + next_subtitle
-                    end_time = subtitle_items[next_subtitle_index][1].split(" --> ")[1]
-                    next_subtitle_index += 1
-                else:
-                    break
+        if char == "\n":
+            if current.strip():
+                result.append(current.strip())
+            current = ""
+            continue
 
-            if similarity(script_line, combined_subtitle) > 0.8:
-                logger.warning(
-                    f"Merged/Corrected - Script: {script_line}, Subtitle: {combined_subtitle}"
-                )
-                new_subtitle_items.append(
-                    (
-                        len(new_subtitle_items) + 1,
-                        f"{start_time} --> {end_time}",
-                        script_line,
-                    )
-                )
-                corrected = True
+        current += char
+
+        if char == "." and previous_char.isdigit() and next_char.isdigit():
+            continue
+        if char == "," and previous_char.isdigit() and next_char.isdigit():
+            continue
+        if utils.str_contains_punctuation(char):
+            if current.strip():
+                result.append(current.strip())
+            current = ""
+
+    if current.strip():
+        result.append(current.strip())
+    return result
+
+
+def _align_script_to_whisper(script_tokens, whisper_tokens):
+    whisper_text_tokens = [token["text"] for token in whisper_tokens]
+    matcher = SequenceMatcher(None, script_tokens, whisper_text_tokens, autojunk=False)
+    mapping = {}
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            continue
+        for offset in range(i2 - i1):
+            mapping[i1 + offset] = j1 + offset
+    return mapping
+
+
+def _build_alignment_result(subtitle_file, video_script):
+    subtitle_items = file_to_subtitles(subtitle_file)
+    whisper_tokens = _whisper_subtitle_tokens(subtitle_items)
+    script_lines, script_tokens = _script_subtitle_lines(video_script)
+    token_mapping = _align_script_to_whisper(script_tokens, whisper_tokens)
+
+    total_script_tokens = len(script_tokens)
+    matched_script_tokens = len(token_mapping)
+    script_coverage = (
+        matched_script_tokens / total_script_tokens if total_script_tokens else 0
+    )
+
+    report_lines = []
+    output_items = []
+    all_lines_have_min_coverage = True
+    all_lines_have_valid_timing = True
+    monotonic = True
+    previous_end = 0
+
+    for line_index, script_line in enumerate(script_lines, start=1):
+        mapped_token_indices = [
+            token_mapping[token_index]
+            for token_index in script_line["token_indices"]
+            if token_index in token_mapping
+        ]
+        total_line_tokens = len(script_line["tokens"])
+        matched_line_tokens = len(mapped_token_indices)
+        line_coverage = (
+            matched_line_tokens / total_line_tokens if total_line_tokens else 0
+        )
+
+        start = None
+        end = None
+        if mapped_token_indices:
+            first_token = whisper_tokens[min(mapped_token_indices)]
+            last_token = whisper_tokens[max(mapped_token_indices)]
+            start = max(0, first_token["start"])
+            end = max(0, last_token["end"])
+
+            if start < previous_end:
+                start = previous_end
+            if end <= start:
+                all_lines_have_valid_timing = False
             else:
-                logger.warning(
-                    f"Mismatch - Script: {script_line}, Subtitle: {combined_subtitle}"
-                )
-                new_subtitle_items.append(
-                    (
-                        len(new_subtitle_items) + 1,
-                        f"{start_time} --> {end_time}",
-                        script_line,
-                    )
-                )
-                corrected = True
-
-            script_index += 1
-            subtitle_index = next_subtitle_index
-
-    # Process the remaining lines of the script.
-    while script_index < len(script_lines):
-        logger.warning(f"Extra script line: {script_lines[script_index]}")
-        if subtitle_index < len(subtitle_items):
-            new_subtitle_items.append(
-                (
-                    len(new_subtitle_items) + 1,
-                    subtitle_items[subtitle_index][1],
-                    script_lines[script_index],
-                )
-            )
-            subtitle_index += 1
+                previous_end = end
+                output_items.append((line_index, start, end, script_line["text"]))
         else:
-            new_subtitle_items.append(
-                (
-                    len(new_subtitle_items) + 1,
-                    "00:00:00,000 --> 00:00:00,000",
-                    script_lines[script_index],
-                )
-            )
-        script_index += 1
-        corrected = True
+            all_lines_have_valid_timing = False
 
-    if corrected:
-        with open(subtitle_file, "w", encoding="utf-8") as fd:
-            for i, item in enumerate(new_subtitle_items):
-                fd.write(f"{i + 1}\n{item[1]}\n{item[2]}\n\n")
-        logger.info("Subtitle corrected")
+        if total_line_tokens and line_coverage < LINE_MIN_COVERAGE:
+            all_lines_have_min_coverage = False
+        if start is not None and end is not None and end < start:
+            monotonic = False
+
+        report_lines.append(
+            {
+                "index": line_index,
+                "text": script_line["text"],
+                "matched_tokens": matched_line_tokens,
+                "total_tokens": total_line_tokens,
+                "coverage": round(line_coverage, 4),
+                "start": round(start, 3) if start is not None else None,
+                "end": round(end, 3) if end is not None else None,
+            }
+        )
+
+    status_ok = (
+        total_script_tokens > 0
+        and script_coverage >= GLOBAL_OK_THRESHOLD
+        and all_lines_have_min_coverage
+        and all_lines_have_valid_timing
+        and monotonic
+        and len(output_items) == len(script_lines)
+    )
+    status = "ok" if status_ok else "review_required"
+
+    return {
+        "status": status,
+        "confidence": round(script_coverage, 4),
+        "matched_script_tokens": matched_script_tokens,
+        "total_script_tokens": total_script_tokens,
+        "script_coverage": round(script_coverage, 4),
+        "script_lines": len(script_lines),
+        "aligned_lines": len(output_items),
+        "review_required": not status_ok,
+        "lines": report_lines,
+        "_output_items": output_items,
+    }
+
+
+def _write_alignment_report(subtitle_file, report):
+    report_path = _subtitle_alignment_report_path(subtitle_file)
+    public_report = {
+        key: value for key, value in report.items() if not key.startswith("_")
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(public_report, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def _write_aligned_subtitle(subtitle_file, output_items):
+    lines = []
+    for index, start, end, text in output_items:
+        lines.append(utils.text_to_srt(index, text, start, end).strip())
+    with open(subtitle_file, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(lines) + "\n")
+
+
+def correct(subtitle_file, video_script):
+    raw_subtitle_file = _subtitle_raw_path(subtitle_file)
+    if os.path.isfile(subtitle_file):
+        shutil.copyfile(subtitle_file, raw_subtitle_file)
+
+    report = _build_alignment_result(subtitle_file, video_script)
+    _write_alignment_report(subtitle_file, report)
+
+    if report["status"] == "ok":
+        _write_aligned_subtitle(subtitle_file, report["_output_items"])
+        logger.info(
+            "subtitle aligned with script, "
+            f"confidence: {report['confidence']:.4f}, "
+            f"lines: {report['aligned_lines']}/{report['script_lines']}"
+        )
     else:
-        logger.success("Subtitle is correct")
+        logger.warning(
+            "subtitle alignment requires review; keeping Whisper output, "
+            f"confidence: {report['confidence']:.4f}, "
+            f"lines: {report['aligned_lines']}/{report['script_lines']}"
+        )
+
+    return {key: value for key, value in report.items() if not key.startswith("_")}
 
 
 if __name__ == "__main__":

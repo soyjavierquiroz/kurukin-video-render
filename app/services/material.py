@@ -596,6 +596,7 @@ def search_videos_pexels(
                             str(v.get("id")) if v.get("id") is not None else None
                         ),
                         "source_page": _safe_public_url(v.get("url")),
+                        "thumbnail_url": _safe_public_url(v.get("image")),
                         "creator": _creator_info(v.get("user")),
                         "rendition": {
                             "id": (
@@ -720,6 +721,11 @@ def search_videos_pixabay(
                             str(v.get("id")) if v.get("id") is not None else None
                         ),
                         "source_page": _safe_public_url(v.get("pageURL")),
+                        "thumbnail_url": _safe_public_url(
+                            v.get("previewURL")
+                            or v.get("webformatURL")
+                            or v.get("largeImageURL")
+                        ),
                         "creator": _creator_info(
                             {
                                 "id": v.get("user_id"),
@@ -831,6 +837,14 @@ def search_videos_coverr(
                 "search_term": search_term,
                 "asset_id": str(video_id),
                 "source_page": _safe_public_url(v.get("canonical_url") or v.get("url")),
+                "thumbnail_url": _safe_public_url(
+                    v.get("thumbnail")
+                    or v.get("thumbnail_url")
+                    or v.get("poster")
+                    or v.get("poster_url")
+                    or (v.get("urls") or {}).get("poster")
+                    or (v.get("urls") or {}).get("thumbnail")
+                ),
                 "creator": _creator_info(v.get("creator") or v.get("author")),
                 "rendition": {
                     "id": "mp4_download",

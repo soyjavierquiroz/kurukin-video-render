@@ -37,6 +37,11 @@ _VISUAL_SUBJECT_WORDS = {
     "persona", "personas",
 }
 _CONNECTOR_WORDS = {"con", "de", "del", "la", "las", "los", "un", "una", "y"}
+_PREVIEW_SOURCE_KEYS = (
+    "thumbnail_url", "thumbnail", "preview_url", "preview", "poster_url", "poster",
+    "image_url", "image", "keyframe_url", "keyframe", "cover_url", "cover",
+    "source_thumbnail_url", "source_thumbnail",
+)
 
 
 class MaterialDiscoveryError(RuntimeError):
@@ -163,6 +168,14 @@ def _sanitize_source_info(value: Any) -> dict[str, Any]:
     return clean(value)
 
 
+def _preview_source_info(source: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: source[key]
+        for key in _PREVIEW_SOURCE_KEYS
+        if key in source and source[key] not in (None, "")
+    }
+
+
 def _orientation(width: int | None, height: int | None) -> str | None:
     if width is None or height is None or width <= 0 or height <= 0:
         return None
@@ -217,6 +230,7 @@ def _asset_hub_candidate(asset: Mapping[str, Any], *, term: str, rank: int) -> M
         key: source[key] for key in ("filename", "orientation", "duration", "width", "height", "scope", "brand", "title")
         if key in source
     }
+    safe_info.update(_preview_source_info(source))
     return MaterialCandidate(
         provider=PROVIDER_ASSET_HUB,
         canonical_id=asset_uid,
@@ -396,11 +410,143 @@ def discover_material_candidates(
     return MaterialDiscoveryResult(_dedupe(candidates), tuple(diagnostics), tuple(attempted), tuple(succeeded), terms_used)
 
 
+
+def discover_asset_hub_review_reserve_candidates(
+    *,
+    policy: MaterialSourcePolicy,
+    terms: Sequence[str],
+    video_aspect: str = "9:16",
+    asset_hub_provider: KurukinAssetProvider | None = None,
+    limit_per_term: int = 100,
+) -> MaterialDiscoveryResult:
+    """
+    Build a large Human Review reserve pool.
+
+    Unlike normal autonomous discovery, Human Review needs enough
+    unique assets to show alternatives/backups for every scene.
+
+    Search each semantic term independently, then globally dedupe.
+    """
+
+    plan = build_discovery_plan(policy)
+
+    if not plan["asset_hub"]["enabled"]:
+        return MaterialDiscoveryResult(
+            (),
+            (),
+            (),
+            (),
+            {
+                "stock": (),
+                "asset_hub": (),
+            },
+        )
+
+    if plan["asset_hub"]["requires_catalog_expansion"]:
+        raise CatalogExpansionRequired(
+            "Asset Hub all_titles/all_brands requires "
+            "catalog expansion before discovery"
+        )
+
+    source_policy = plan["asset_hub"]["source_policy"]
+    normalized_terms = _normalize_terms(terms)
+
+    if not normalized_terms:
+        return MaterialDiscoveryResult(
+            (),
+            (),
+            (PROVIDER_ASSET_HUB,),
+            (),
+            {
+                "stock": (),
+                "asset_hub": (),
+            },
+        )
+
+    provider = (
+        asset_hub_provider
+        or KurukinAssetProvider()
+    )
+
+    candidates: list[MaterialCandidate] = []
+    diagnostics: list[DiscoveryDiagnostic] = []
+
+    for term in normalized_terms:
+        try:
+            assets = provider.search(
+                query=term,
+                source_policy=source_policy,
+                limit=limit_per_term,
+            )
+        except Exception as exc:
+            if _is_fatal_asset_hub_error(exc):
+                raise
+
+            diagnostics.append(
+                DiscoveryDiagnostic(
+                    PROVIDER_ASSET_HUB,
+                    term,
+                    "failure",
+                    _safe_error_message(exc),
+                    None,
+                )
+            )
+            continue
+
+        found = [
+            _asset_hub_candidate(
+                asset,
+                term=term,
+                rank=index,
+            )
+            for index, asset in enumerate(assets)
+        ]
+
+        found = [
+            candidate
+            for candidate in found
+            if _is_orientation_compatible(
+                candidate,
+                video_aspect,
+            )
+        ]
+
+        diagnostics.append(
+            DiscoveryDiagnostic(
+                PROVIDER_ASSET_HUB,
+                term,
+                "success",
+                "human_review_reserve",
+                len(found),
+            )
+        )
+
+        candidates.extend(found)
+
+    unique = _dedupe(candidates)
+
+    return MaterialDiscoveryResult(
+        candidates=unique,
+        diagnostics=tuple(diagnostics),
+        providers_attempted=(PROVIDER_ASSET_HUB,),
+        providers_succeeded=(
+            (PROVIDER_ASSET_HUB,)
+            if unique
+            else ()
+        ),
+        terms_used={
+            "stock": (),
+            "asset_hub": normalized_terms,
+        },
+    )
+
+
 def discover_asset_hub_title_fallback_candidates(
     *,
     policy: MaterialSourcePolicy,
     video_aspect: str = "9:16",
     asset_hub_provider: KurukinAssetProvider | None = None,
+    limit: int = 20,
 ) -> MaterialDiscoveryResult:
     """Search the exclusive Asset Hub title once as a global low-priority fallback."""
     plan = build_discovery_plan(policy)
@@ -416,7 +562,11 @@ def discover_asset_hub_title_fallback_candidates(
 
     active_provider = asset_hub_provider or KurukinAssetProvider()
     try:
-        assets = active_provider.search(query=title, source_policy=source_policy)
+        assets = active_provider.search(
+            query=title,
+            source_policy=source_policy,
+            limit=limit,
+        )
     except Exception as exc:
         if _is_fatal_asset_hub_error(exc):
             raise

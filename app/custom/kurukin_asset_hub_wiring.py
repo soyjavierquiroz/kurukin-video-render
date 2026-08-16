@@ -474,10 +474,18 @@ def validate_explicit_manifest_selection(
             for asset in _ordered_manifest_assets(manifest_assets)
             if _is_manifest_asset_ready(manifest, manifest_scene, asset)
         ]
-        expected_asset_uids = [
+        validated_expected_asset_uids = [
             validate_asset_uid(asset_uid)
             for asset_uid in _as_list(expected_scene.get("selected_asset_uids"))
         ]
+
+        # create_bundle() normalizes selected_asset_uids by removing
+        # duplicates while preserving order. Validate the renderer
+        # manifest against that same canonical selection.
+        expected_asset_uids = list(
+            dict.fromkeys(validated_expected_asset_uids)
+        )
+
         if ready_asset_uids != expected_asset_uids:
             raise KurukinAssetHubWiringError(
                 f"renderer manifest scene {scene_id} does not match explicit selected_asset_uids"

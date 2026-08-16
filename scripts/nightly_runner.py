@@ -34,6 +34,7 @@ CONTAINER_QUEUE_DIR = Path("/MoneyPrinterTurbo/storage/nightly_jobs")
 DEFAULT_API_BASE_URL = "http://127.0.0.1:18080/api/v1"
 METADATA_KEYS = {"job_id", "notes", "description", "runner"}
 RENDER_MODE_AROLL_BROLL = "aroll_broll"
+RENDER_MODE_HUMAN_REVIEW_BATCH = "human_review_batch"
 COMPLETE_STATE = 1
 FAILED_STATE = -1
 PROCESSING_STATE = 4
@@ -216,6 +217,10 @@ def is_aroll_broll_job(job: dict[str, Any]) -> bool:
     return isinstance(job, dict) and job.get("render_mode") == RENDER_MODE_AROLL_BROLL
 
 
+def is_human_review_batch_job(job: dict[str, Any]) -> bool:
+    return isinstance(job, dict) and job.get("render_mode") == RENDER_MODE_HUMAN_REVIEW_BATCH
+
+
 def task_id_for_aroll_broll_job(job: dict[str, Any], reserved_dir: Path) -> str:
     return sanitize_task_id(
         str(job.get("task_id") or job.get("job_id") or reserved_dir.name)
@@ -246,6 +251,11 @@ def validate_job(job: Any) -> dict[str, Any]:
         raise RunnerError("job must be a JSON object")
 
     render_mode = job.get("render_mode")
+    if render_mode == RENDER_MODE_HUMAN_REVIEW_BATCH:
+        plan_path = job.get("production_plan_path")
+        if not isinstance(plan_path, str) or not plan_path.strip():
+            raise RunnerError("production_plan_path is required for human review batch jobs")
+        return {key: value for key, value in job.items() if key not in METADATA_KEYS}
     if render_mode == RENDER_MODE_AROLL_BROLL:
         if not is_aroll_broll_renderer_enabled():
             raise ArollBrollRunnerError(
@@ -475,6 +485,51 @@ def handle_aroll_broll_job(
     }
 
 
+def handle_human_review_batch_job(job: dict[str, Any], reserved_dir: Path) -> dict[str, Any]:
+    from scripts.produce_batch import process_approved_review_plan
+
+    if not is_human_review_batch_job(job):
+        raise RunnerError("job is not a human review batch render")
+    status = process_approved_review_plan(
+        job["production_plan_path"],
+        preset=str(job.get("preset") or "karaoke"),
+        position=str(job.get("position") or "bottom"),
+        visual_style=str(job.get("visual_style") or "none"),
+    )
+    result = {
+        "ok": status == "completed",
+        "status": status,
+        "production_plan_path": job["production_plan_path"],
+        "task_id": job.get("task_id"),
+    }
+    write_json(reserved_dir / "render-result.json", result)
+    if status != "completed":
+        raise RunnerError(f"approved review render did not complete: {status}")
+    write_json(
+        reserved_dir / "submit-response.json",
+        {
+            "status": 200,
+            "message": "success",
+            "data": {"task_id": job.get("task_id")},
+            "render_mode": RENDER_MODE_HUMAN_REVIEW_BATCH,
+        },
+    )
+    write_json(
+        reserved_dir / "final-task.json",
+        {
+            "status": 200,
+            "message": "success",
+            "data": {
+                "task_id": job.get("task_id"),
+                "state": COMPLETE_STATE,
+                "progress": 100,
+                "render_mode": RENDER_MODE_HUMAN_REVIEW_BATCH,
+            },
+        },
+    )
+    return result
+
+
 def submit_and_wait(
     run_dir: Path,
     payload: dict[str, Any],
@@ -555,7 +610,9 @@ def process_one_job(
         payload = validate_job(job)
         write_json(run_dir / "moneyprinter-payload.json", payload)
 
-        if is_aroll_broll_job(job):
+        if is_human_review_batch_job(job):
+            handle_human_review_batch_job(job, run_dir)
+        elif is_aroll_broll_job(job):
             handle_aroll_broll_job(
                 job,
                 run_dir,

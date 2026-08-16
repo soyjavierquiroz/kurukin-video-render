@@ -108,6 +108,19 @@ class TestMaterialDiscovery(unittest.TestCase):
         self.assertNotIn("drive_file_id", str(result.candidates[0].source_info).lower())
         self.assertNotIn("secret", str(result.candidates[0].source_info).lower())
 
+    def test_asset_hub_search_preview_metadata_is_preserved(self):
+        hub = FakeAssetHub({"term": [
+            {"asset_uid": "a", "orientation": "vertical", "preview_url": "https://asset-hub.example/a.jpg"},
+        ]})
+
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ASSET_HUB),
+            stock_terms=["term"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual(result.candidates[0].source_info["preview_url"], "https://asset-hub.example/a.jpg")
+
     def test_asset_hub_retries_once_with_simplified_visual_word(self):
         hub = FakeAssetHub({
             "mujer triste": [],
