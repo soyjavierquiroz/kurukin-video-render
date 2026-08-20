@@ -118,6 +118,44 @@ class TestMaterialDiscovery(unittest.TestCase):
                 self.assertFalse(noisy & set(serialized.split()))
                 self.assertNotIn("persona demás también", serialized)
 
+    def test_visual_query_v2_keeps_scene_queries_with_incompatible_hint(self):
+        queries = build_visual_queries_v2(
+            "Por eso descansar te da culpa. Recibir te incomoda.",
+            ["niña sola"],
+        )
+        serialized = " ".join(queries).lower()
+
+        self.assertGreaterEqual(len(queries), 2)
+        self.assertIn("culpa", serialized)
+        self.assertTrue("apoyo emocional" in serialized or "agotamiento" in serialized)
+        self.assertNotEqual(queries, ("niña sola",))
+
+    def test_visual_query_v2_compatible_hint_can_complement_scene(self):
+        queries = build_visual_queries_v2(
+            "Recibir ayuda te incomoda.",
+            ["apoyo emocional"],
+        )
+        serialized = " ".join(queries).lower()
+
+        self.assertIn("incomoda", serialized)
+        self.assertIn("apoyo emocional", serialized)
+        self.assertDiverseQueries(queries)
+
+    def test_visual_query_v2_hint_never_collapses_conceptual_scene(self):
+        queries = build_visual_queries_v2(
+            "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas.",
+            ["mujer trabajando"],
+        )
+        serialized = " ".join(queries).lower()
+
+        self.assertGreaterEqual(len(queries), 2)
+        self.assertNotEqual(queries, ("mujer trabajando",))
+        self.assertTrue("fortaleza" in serialized or "carga emocional" in serialized)
+        self.assertNotIn("trabajando", serialized)
+
+    def test_visual_query_v2_empty_scene_ignores_existing_hint(self):
+        self.assertEqual(build_visual_queries_v2("   ", ["niña sola"]), ())
+
     def test_stock_wrapper_delegates_to_cache_entrypoint(self):
         if not hasattr(material, "search_videos_for_provider"):
             self.skipTest("full-suite provider-import guard supplied a minimal material module")
@@ -283,6 +321,22 @@ class TestMaterialDiscovery(unittest.TestCase):
         )
 
         self.assertEqual([item.canonical_id for item in result.candidates], ["a", "b", "c"])
+
+    def test_asset_hub_search_terms_store_real_multi_query_provenance(self):
+        hub = FakeAssetHub({
+            "Por eso descansar te da culpa": [],
+            "persona culpa agotamiento": [{"asset_uid": "a", "orientation": "vertical-9x16"}],
+            "persona descanso": [{"asset_uid": "b", "orientation": "vertical-9x16"}],
+        })
+
+        result = discover_asset_hub_review_reserve_candidates(
+            policy=policy(PROVIDER_ASSET_HUB),
+            terms=["Por eso descansar te da culpa"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertIn("persona culpa agotamiento", [call[0] for call in hub.calls])
+        self.assertEqual(result.candidates[0].search_term, "persona culpa agotamiento")
 
     def test_title_exclusive_never_uses_generic_fallback(self):
         hub = FakeAssetHub({

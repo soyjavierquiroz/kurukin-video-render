@@ -317,11 +317,14 @@ def _asset_hub_found_candidates(
     limit: int = 20,
 ) -> list[MaterialCandidate]:
     assets = provider.search(query=query, source_policy=source_policy, limit=limit)
-    return [
-        _asset_hub_candidate(asset, term=original_term, rank=index)
-        for index, asset in enumerate(assets)
-        if _asset_hub_is_video_asset(asset)
-    ]
+    candidates = []
+    for index, asset in enumerate(assets):
+        if not _asset_hub_is_video_asset(asset):
+            continue
+        candidate = _asset_hub_candidate(asset, term=query, rank=index)
+        candidate.source_info["visual_query_source_term"] = original_term
+        candidates.append(candidate)
+    return candidates
 
 
 def _asset_hub_is_video_asset(asset: Mapping[str, Any]) -> bool:

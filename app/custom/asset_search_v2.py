@@ -26,6 +26,7 @@ _NARRATIVE_NOISE = {
     "podias", "podías", "puede", "pueden", "quizas", "quizás", "seguia",
     "seguís", "sentias", "sentías", "siempre", "tambien", "también",
     "todavia", "todavía",
+    "hiciste", "querias", "querías",
 }
 
 _SUBJECTS = {
@@ -35,14 +36,16 @@ _SUBJECTS = {
 }
 _ACTIONS = {
     "abrazando", "abrazandose", "abrazar", "acompañar", "acompanar",
-    "ayudar", "calma", "cuidar", "discute", "discutiendo", "escucha",
-    "escuchara", "llorando", "llorar", "mira", "mirando", "observa",
-    "pensativa", "pensativo", "proteger", "protegiera", "rescatar",
+    "ayuda", "ayudar", "ayudarte", "calma", "cuidar", "descansar", "descanso",
+    "discute", "discutiendo", "escucha",
+    "escuchar", "escuchara", "estar", "llorando", "llorar", "mira", "mirando", "observa",
+    "pedir", "recibir", "pensativa", "pensativo", "proteger", "protegiera", "rescatar",
     "rescatadas", "rescatados", "salvar", "sostiene", "sosteniendo",
 }
 _MOODS = {
-    "ansiedad", "asustada", "asustado", "calma", "culpa", "culpable",
-    "dolor", "emocional", "fuerte", "introspeccion", "introspección",
+    "agotamiento", "ansiedad", "asustada", "asustado", "calma", "carga",
+    "culpa", "culpable", "dolor", "emocional", "fuerte", "fortaleza",
+    "incomodidad", "incomoda", "introspeccion", "introspección",
     "miedo", "nostalgia", "preocupacion", "preocupación", "preocupada",
     "preocupado", "resiliente", "soledad", "sola", "solo", "triste",
     "tristeza", "vulnerabilidad", "vulnerable",
@@ -58,7 +61,7 @@ _SETTINGS = {
 
 _CONCEPT_RULES: tuple[tuple[set[str], tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
     (
-        {"escucha", "escuchara", "proteger", "protegiera", "apoyo", "necesito"},
+        {"escucha", "escuchar", "escuchara", "proteger", "protegiera", "apoyo", "necesito"},
         ("vulnerable", "apoyo emocional"),
         ("consuelo", "acompañamiento"),
         ("protección emocional", "vulnerabilidad"),
@@ -90,8 +93,50 @@ _CONCEPT_RULES: tuple[tuple[set[str], tuple[str, ...], tuple[str, ...], tuple[st
     (
         {"soledad", "sola", "solo", "nadie"},
         ("persona", "soledad"),
-        ("aislamiento", "introspección"),
-        ("vulnerabilidad emocional",),
+        ("introspección",),
+        ("vulnerabilidad emocional", "aislamiento"),
+    ),
+    (
+        {"fuerte", "fortaleza", "resolver", "podes", "podés", "poder"},
+        ("fortaleza", "agotamiento"),
+        ("responsabilidad emocional",),
+        ("carga emocional",),
+    ),
+    (
+        {"infancia", "chica", "nina", "niña", "necesidades"},
+        ("vulnerabilidad", "soledad"),
+        ("infancia",),
+        ("abandono emocional",),
+    ),
+    (
+        {"pedir", "recibir", "necesitar", "necesitas", "necesitás", "ayuda", "ayudar", "ayudarte"},
+        ("vulnerabilidad", "incomodidad"),
+        ("apoyo emocional", "acompañamiento"),
+        ("aceptar ayuda",),
+    ),
+    (
+        {"alguien", "estar", "permitir", "permitirle"},
+        ("vulnerabilidad",),
+        ("apoyo emocional", "acompañamiento"),
+        ("consuelo emocional",),
+    ),
+    (
+        {"descansar", "descanso", "culpa", "culpable"},
+        ("culpa", "agotamiento"),
+        ("descanso",),
+        ("cansancio emocional",),
+    ),
+    (
+        {"vulnerable", "vulnerabilidad", "peligroso"},
+        ("vulnerabilidad", "miedo"),
+        ("ansiedad",),
+        ("riesgo emocional",),
+    ),
+    (
+        {"proteger", "protegió", "protegio", "fortaleza", "prision", "prisión"},
+        ("fortaleza", "aislamiento"),
+        ("protección emocional",),
+        ("carga emocional",),
     ),
 )
 
@@ -99,12 +144,27 @@ _TERM_ALIASES = {
     "asustada": ("miedo", "ansiedad", "preocupación"),
     "asustado": ("miedo", "ansiedad", "preocupación"),
     "escuchara": ("apoyo emocional", "consuelo"),
+    "escuchar": ("apoyo emocional", "consuelo"),
+    "ayudarte": ("apoyo emocional", "aceptar ayuda"),
+    "alguien": ("apoyo emocional", "acompañamiento"),
+    "estar": ("acompañamiento", "apoyo emocional"),
     "protegiera": ("protección emocional", "vulnerable"),
     "rescatarte": ("dependencia emocional", "rescate"),
     "rescatadas": ("dependencia emocional", "rescate"),
     "rescatados": ("dependencia emocional", "rescate"),
     "sostiene": ("cuidadora", "responsabilidad emocional"),
-    "fuerte": ("resiliente",),
+    "fuerte": ("fortaleza", "responsabilidad emocional", "carga emocional"),
+    "podés": ("fortaleza", "agotamiento"),
+    "podes": ("fortaleza", "agotamiento"),
+    "chica": ("infancia", "vulnerabilidad", "abandono emocional"),
+    "necesidades": ("vulnerabilidad", "abandono emocional"),
+    "recibir": ("apoyo emocional", "aceptar ayuda", "vulnerabilidad"),
+    "descansar": ("descanso", "culpa", "agotamiento"),
+    "descanso": ("descanso", "agotamiento"),
+    "incomoda": ("incomodidad", "vulnerabilidad"),
+    "incomodás": ("incomodidad", "vulnerabilidad"),
+    "prisión": ("aislamiento", "carga emocional"),
+    "prision": ("aislamiento", "carga emocional"),
     "triste": ("tristeza", "vulnerable"),
     "tristeza": ("vulnerable", "introspección"),
 }
@@ -191,19 +251,19 @@ def _dedupe_phrases(values: Sequence[str]) -> list[str]:
 def _concept_mood(value: str) -> bool:
     folded = _fold(value)
     return (
-        any(word in folded for word in ("miedo", "ansiedad", "vulner", "preocup", "soledad", "triste", "dependencia"))
+        any(word in folded for word in ("agotamiento", "aislamiento", "culpa", "fortaleza", "incomodidad", "miedo", "ansiedad", "vulner", "preocup", "soledad", "triste", "dependencia"))
         or folded == "relacion"
     )
 
 
 def _concept_relation(value: str) -> bool:
     folded = _fold(value)
-    return any(word in folded for word in ("apoyo", "consuelo", "acompan", "cuidadora")) and "proteccion" not in folded
+    return any(word in folded for word in ("aceptar ayuda", "apoyo", "consuelo", "acompan", "cuidadora", "descanso", "infancia")) and "proteccion" not in folded
 
 
 def _concept_theme(value: str) -> bool:
     folded = _fold(value)
-    return any(word in folded for word in ("proteccion", "responsabilidad", "desequilibrada", "rescate", "discusion", "desacuerdo"))
+    return any(word in folded for word in ("abandono", "cansancio", "carga", "proteccion", "responsabilidad", "riesgo", "desequilibrada", "rescate", "discusion", "desacuerdo"))
 
 
 def _signals(tokens: Sequence[str]) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str]]:
@@ -228,6 +288,29 @@ def _signals(tokens: Sequence[str]) -> tuple[list[str], list[str], list[str], li
     return subjects, actions, moods, objects, settings, concepts
 
 
+def _hints_are_compatible(
+    scene_tokens: Sequence[str],
+    scene_concepts: Sequence[str],
+    hint_tokens: Sequence[str],
+    hint_concepts: Sequence[str],
+) -> bool:
+    scene_folded = {_fold(token) for token in scene_tokens}
+    hint_folded = {_fold(token) for token in hint_tokens}
+    if scene_folded & hint_folded:
+        return True
+    scene_concept_folded = {_fold(item) for item in scene_concepts}
+    hint_concept_folded = {_fold(item) for item in hint_concepts}
+    if scene_concept_folded & hint_concept_folded:
+        return True
+    return (
+        any(_concept_relation(item) for item in scene_concepts)
+        and any(_concept_relation(item) for item in hint_concepts)
+    ) or (
+        any(_concept_theme(item) for item in scene_concepts)
+        and any(_concept_theme(item) for item in hint_concepts)
+    )
+
+
 def build_visual_queries_v2(
     scene_text: str,
     existing_terms: Sequence[str] | None = None,
@@ -235,13 +318,33 @@ def build_visual_queries_v2(
     max_queries: int = 3,
 ) -> tuple[str, ...]:
     """Build compact, diverse lexical visual queries without extra AI calls."""
-    hint_tokens = _clean_tokens(existing_terms or ())
     scene_tokens = _clean_tokens([scene_text])
-    tokens = list(dict.fromkeys([*hint_tokens, *scene_tokens]))
-    if not tokens:
+    if not scene_tokens:
         return ()
 
-    subjects, actions, moods, objects, settings, concepts = _signals(tokens)
+    hint_tokens = _clean_tokens(existing_terms or ())
+    scene_subjects, scene_actions, scene_moods, scene_objects, scene_settings, scene_concepts = _signals(scene_tokens)
+    _, hint_actions, _, hint_objects, hint_settings, hint_concepts = _signals(hint_tokens)
+    scene_has_visual_signal = bool(scene_actions or scene_moods or scene_objects or scene_settings or scene_concepts)
+
+    if scene_has_visual_signal:
+        subjects = list(scene_subjects)
+        actions = list(scene_actions)
+        moods = list(scene_moods)
+        objects = list(scene_objects)
+        settings = list(scene_settings)
+        concepts = list(scene_concepts)
+        if _hints_are_compatible(scene_tokens, scene_concepts, hint_tokens, hint_concepts):
+            _append_unique(actions, hint_actions, limit=4)
+            _append_unique(concepts, hint_concepts, limit=12)
+            if not objects:
+                _append_unique(objects, hint_objects, limit=1)
+            if not settings:
+                _append_unique(settings, hint_settings, limit=1)
+    else:
+        tokens = list(dict.fromkeys([*scene_tokens, *hint_tokens]))
+        subjects, actions, moods, objects, settings, concepts = _signals(tokens)
+
     subject = subjects[:1] or (["persona"] if (actions or moods or concepts) else [])
     relation_subject = subjects[:1] or (["persona"] if (actions or objects or settings) else [])
 
@@ -261,7 +364,7 @@ def build_visual_queries_v2(
 
     theme_lane = concept_themes[:2] or concept_relations[:2] or concept_moods[:2]
     if len(_query(theme_lane).split()) < 3:
-        _append_unique(theme_lane, concept_moods[:1], limit=3)
+        _append_unique(theme_lane, concept_moods, limit=3)
 
     lanes = (
         [*subject, *raw_moods[:2]],

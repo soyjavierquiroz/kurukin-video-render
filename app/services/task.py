@@ -1021,7 +1021,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return downloaded_videos
 
 
-def _select_autonomous_materials(task_id, params, video_terms, audio_duration):
+def _select_autonomous_materials(task_id, params, video_terms, audio_duration, video_script: str = ""):
     """Run discovery and ranking without materializing selected assets."""
     policy = material_source_policy_from_dict(params.material_source_policy)
     discovery = discover_material_candidates(
@@ -1074,9 +1074,24 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration):
     # autonomous rendering. PRIMARY selection is already frozen
     # above; everything added here is suggestions/backups only.
     if getattr(params, "human_review", None):
+        segment_queries = (
+            human_review.visual_queries_for_review_segments(
+                video_script,
+                len(getattr(selection, "decisions", ()) or ()),
+                tuple(params.asset_hub_terms or video_terms),
+            )
+            if video_script
+            else []
+        )
         review_terms = tuple(
-            params.asset_hub_terms
-            or video_terms
+            dict.fromkeys(
+                query
+                for queries in segment_queries
+                for query in queries
+                if str(query or "").strip()
+            )
+        ) or tuple(
+            params.asset_hub_terms or video_terms
         )
 
         semantic_reserve = (
@@ -1236,7 +1251,7 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
         )
     try:
         discovery, selection = _select_autonomous_materials(
-            task_id, params, video_terms, audio_duration
+            task_id, params, video_terms, audio_duration, video_script
         )
     except Exception as exc:
         return _mark_task_failed(task_id, "materials", str(exc))

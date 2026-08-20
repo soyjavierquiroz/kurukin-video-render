@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from app.custom.asset_search_v2 import build_visual_queries_v2
 from app.custom.material_discovery import MaterialCandidate
 from app.custom.material_selection import MaterialSelectionDecision
 from app.models.schema import MaterialInfo
@@ -173,6 +174,7 @@ def _unique_candidates_by_uid(candidates: list[Any]) -> list[Any]:
 def _ranked_segment_candidates(
     candidate: Any,
     all_candidates: list[Any],
+    preferred_terms: list[str] | tuple[str, ...] | None = None,
 ) -> list[Any]:
     """
     Rank candidates for one scene.
@@ -198,6 +200,30 @@ def _ranked_segment_candidates(
         or ""
     )
 
+    preferred = [
+        str(term or "").strip()
+        for term in (preferred_terms or ())
+        if str(term or "").strip()
+    ]
+
+    preferred_matches = [
+        item
+        for item in all_candidates
+        if getattr(
+            item,
+            "dedupe_key",
+            "",
+        ) != candidate_key
+        and str(
+            getattr(
+                item,
+                "search_term",
+                "",
+            )
+            or ""
+        ) in preferred
+    ]
+
     same_term = [
         item
         for item in all_candidates
@@ -214,6 +240,7 @@ def _ranked_segment_candidates(
             )
             or ""
         ) == candidate_term
+        and item not in preferred_matches
     ]
 
     remaining = [
@@ -225,10 +252,12 @@ def _ranked_segment_candidates(
             "",
         ) != candidate_key
         and item not in same_term
+        and item not in preferred_matches
     ]
 
     return _unique_candidates_by_uid(
-        [candidate]
+        preferred_matches
+        + [candidate]
         + same_term
         + remaining
     )
@@ -1557,6 +1586,19 @@ def split_script_for_segments(script_text: str, segment_count: int) -> list[str]
     return chunks
 
 
+def visual_queries_for_review_segments(
+    script_text: str,
+    segment_count: int,
+    existing_terms: list[str] | tuple[str, ...] | None = None,
+) -> list[tuple[str, ...]]:
+    """Build scene-scoped Asset Search V2 queries for Human Review."""
+    fragments = split_script_for_segments(script_text, segment_count)
+    return [
+        build_visual_queries_v2(fragment, existing_terms or ())
+        for fragment in fragments
+    ]
+
+
 def build_plan(
     *,
     batch_id: str,
@@ -1581,6 +1623,21 @@ def build_plan(
     selected_decisions = list(getattr(selection_result, "decisions", ()) or [])
     clip_duration = float(getattr(getattr(selection_result, "options", None), "clip_duration", 5) or 5)
     script_fragments = split_script_for_segments(script_text, len(selected_decisions))
+    segment_queries = visual_queries_for_review_segments(
+        script_text,
+        len(selected_decisions),
+        tuple(getattr(selection_result, "search_terms", ()) or ()),
+    )
+    review_inputs = [
+        (
+            decision,
+            script_fragments[index],
+            segment_queries[index] if index < len(segment_queries) else (),
+        )
+        for index, decision in enumerate(selected_decisions)
+        if index < len(script_fragments)
+        and str(script_fragments[index] or "").strip()
+    ]
     segments = []
 
     # ----------------------------------------------------------
@@ -1595,12 +1652,13 @@ def build_plan(
     reserved_segments = []
     used_selected_asset_uids: set[str] = set()
 
-    for decision in selected_decisions:
+    for decision, _script_fragment, queries in review_inputs:
         original_candidate = decision.candidate
 
         ranked_candidates = _ranked_segment_candidates(
             original_candidate,
             all_candidates,
+            queries,
         )
 
         candidate, forced_repeat = _select_segment_candidate(
@@ -1616,6 +1674,8 @@ def build_plan(
         reserved_segments.append(
             (
                 decision,
+                _script_fragment,
+                queries,
                 original_candidate,
                 ranked_candidates,
                 candidate,
@@ -1648,6 +1708,8 @@ def build_plan(
     for reserved in reserved_segments:
         (
             decision,
+            script_fragment,
+            queries,
             original_candidate,
             ranked_candidates,
             candidate,
@@ -1719,6 +1781,8 @@ def build_plan(
     ):
         (
             decision,
+            script_fragment,
+            queries,
             original_candidate,
             ranked_candidates,
             candidate,
@@ -1867,14 +1931,12 @@ def build_plan(
                     end - start,
                 ),
                 "script_text": (
-                    script_fragments[
-                        index - 1
-                    ]
-                    if index - 1
-                    < len(script_fragments)
-                    else ""
+                    script_fragment
                 ),
                 "search_terms": [
+                    str(query)
+                    for query in queries
+                ] or [
                     str(
                         getattr(
                             candidate,

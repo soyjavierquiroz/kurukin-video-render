@@ -165,6 +165,54 @@ class TestHumanReviewPlan(unittest.TestCase):
             ["asset-a", "asset-b"],
         )
 
+    def test_scene_queries_prefer_scene_derived_asset_over_old_hint(self):
+        old_hint = candidate("old-hint", term="niña sola")
+        scene_asset = candidate("scene-asset", term="persona culpa agotamiento")
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="Por eso descansar te da culpa.",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([old_hint]),
+            discovery_result=SimpleNamespace(candidates=(old_hint, scene_asset)),
+            output_path=plan_file,
+        )
+
+        segment = plan["segments"][0]
+        self.assertEqual(segment["selected_asset"]["asset_uid"], "scene-asset")
+        self.assertIn("persona culpa agotamiento", segment["search_terms"])
+        self.assertNotEqual(segment["search_terms"], ["niña sola"])
+
+    def test_empty_trailing_script_segment_is_not_selected(self):
+        assets = [candidate(f"asset-{index}") for index in range(3)]
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="Uno dos",
+            duration=15,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection(assets),
+            discovery_result=SimpleNamespace(candidates=tuple(assets)),
+            output_path=plan_file,
+        )
+
+        self.assertEqual(len(plan["segments"]), 2)
+        self.assertTrue(all(segment["script_text"].strip() for segment in plan["segments"]))
+        self.assertEqual([segment["segment_id"] for segment in plan["segments"]], ["segment-001", "segment-002"])
+
     def test_exhausted_candidate_pool_allows_repeat_with_warning(self):
         asset_a = candidate("asset-a")
         asset_b = candidate("asset-b")
