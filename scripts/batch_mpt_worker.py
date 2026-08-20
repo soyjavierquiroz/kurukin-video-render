@@ -192,6 +192,15 @@ def _stage_human_review_timeline(
             piece["playback_speed"]
         )
 
+        flip_horizontal = bool(
+            piece.get(
+                "flip_horizontal",
+                human_review.asset_flip_horizontal(
+                    piece.get("asset")
+                ),
+            )
+        )
+
         if (
             source_duration <= 0
             or output_duration <= 0
@@ -213,12 +222,19 @@ def _stage_human_review_timeline(
         # Example:
         #   speed 0.90
         #   setpts=(PTS-STARTPTS)/0.90
-        vf = (
-            f"trim=start=0:"
-            f"duration={source_duration:.6f},"
-            "setpts="
-            f"(PTS-STARTPTS)/{playback_speed:.6f}"
-        )
+        filters = [
+            (
+                f"trim=start=0:"
+                f"duration={source_duration:.6f}"
+            ),
+            (
+                "setpts="
+                f"(PTS-STARTPTS)/{playback_speed:.6f}"
+            ),
+        ]
+        if flip_horizontal:
+            filters.append("hflip")
+        vf = ",".join(filters)
 
         command = [
             "ffmpeg",
@@ -297,6 +313,9 @@ def _stage_human_review_timeline(
                     "playback_speed": (
                         playback_speed
                     ),
+                    "flip_horizontal": (
+                        flip_horizontal
+                    ),
                 },
             )
         )
@@ -308,7 +327,8 @@ def _stage_human_review_timeline(
             f"{uid} "
             f"source={source_duration:.3f}s "
             f"output={output_duration:.3f}s "
-            f"speed={playback_speed:.3f}x"
+            f"speed={playback_speed:.3f}x "
+            f"flip={str(flip_horizontal).lower()}"
         )
 
     print(

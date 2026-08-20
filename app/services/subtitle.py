@@ -22,6 +22,38 @@ initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
 GLOBAL_OK_THRESHOLD = 0.90
 LINE_MIN_COVERAGE = 0.40
+SEMANTIC_SUBTITLE_TARGET_LINE_CHARS = 36
+SEMANTIC_SUBTITLE_HARD_LINE_CHARS = 44
+SEMANTIC_SUBTITLE_MAX_CUE_CHARS = SEMANTIC_SUBTITLE_HARD_LINE_CHARS * 2 + 2
+SEMANTIC_BOUNDARY_CONNECTORS = {
+    "aunque",
+    "como",
+    "cuando",
+    "donde",
+    "entonces",
+    "mientras",
+    "pero",
+    "porque",
+    "que",
+    "si",
+}
+SEMANTIC_ORPHAN_WORDS = {
+    "aunque",
+    "con",
+    "de",
+    "del",
+    "el",
+    "la",
+    "las",
+    "los",
+    "o",
+    "para",
+    "pero",
+    "por",
+    "que",
+    "sin",
+    "y",
+}
 
 
 def create(audio_file, subtitle_file: str = ""):
@@ -445,6 +477,194 @@ def _align_script_to_whisper(script_tokens, whisper_tokens):
     return mapping
 
 
+def _plain_words(text):
+    return re.findall(r"\S+", text or "")
+
+
+def _semantic_boundary_strength(left_word, right_word=""):
+    left = str(left_word or "").strip()
+    right = str(right_word or "").strip()
+    left_token = _normalize_token_for_subtitle_alignment(left)
+    right_token = _normalize_token_for_subtitle_alignment(right)
+    if re.search(r"[.!?！？。]$", left):
+        return 100
+    if re.search(r"[;:]$", left):
+        return 80
+    if left.endswith(","):
+        return 60
+    if right_token in SEMANTIC_BOUNDARY_CONNECTORS:
+        return 45
+    if left_token in SEMANTIC_BOUNDARY_CONNECTORS:
+        return 35
+    return 5
+
+
+def _is_semantic_orphan(word):
+    return _normalize_token_for_subtitle_alignment(word) in SEMANTIC_ORPHAN_WORDS
+
+
+def _join_semantic_words(words):
+    return " ".join(word["text"] for word in words)
+
+
+def _line_break_penalty(left_words, right_words):
+    penalty = 0
+    if left_words and _is_semantic_orphan(left_words[-1]["text"]):
+        penalty += 220
+    if right_words and _is_semantic_orphan(right_words[0]["text"]):
+        penalty += 220
+    return penalty
+
+
+def _wrap_semantic_words(words):
+    text = _join_semantic_words(words)
+    if len(text) <= SEMANTIC_SUBTITLE_HARD_LINE_CHARS:
+        return [text]
+
+    best = None
+    for split in range(1, len(words)):
+        left_words = words[:split]
+        right_words = words[split:]
+        left = _join_semantic_words(left_words)
+        right = _join_semantic_words(right_words)
+        overflow = max(
+            0,
+            len(left) - SEMANTIC_SUBTITLE_HARD_LINE_CHARS,
+            len(right) - SEMANTIC_SUBTITLE_HARD_LINE_CHARS,
+        )
+        if overflow > 2:
+            continue
+        boundary = _semantic_boundary_strength(
+            left_words[-1]["text"],
+            right_words[0]["text"] if right_words else "",
+        )
+        balance = abs(len(left) - len(right))
+        target = (
+            abs(len(left) - SEMANTIC_SUBTITLE_TARGET_LINE_CHARS)
+            + abs(len(right) - SEMANTIC_SUBTITLE_TARGET_LINE_CHARS)
+        )
+        penalty = _line_break_penalty(left_words, right_words)
+        score = boundary * 6 - balance * 2 - target - penalty - overflow * 50
+        if best is None or score > best[0]:
+            best = (score, left, right)
+
+    if best is not None:
+        return [best[1], best[2]]
+
+    split = max(1, len(words) // 2)
+    return [_join_semantic_words(words[:split]), _join_semantic_words(words[split:])]
+
+
+def _semantic_words_from_alignment(script_lines, token_mapping, whisper_tokens):
+    words = []
+    for script_line in script_lines:
+        token_offset = 0
+        for raw_word in _plain_words(script_line["text"]):
+            word_tokens = _tokenize_for_subtitle_alignment(raw_word)
+            token_indices = script_line["token_indices"][
+                token_offset: token_offset + len(word_tokens)
+            ]
+            token_offset += len(word_tokens)
+            mapped = [
+                token_mapping[token_index]
+                for token_index in token_indices
+                if token_index in token_mapping
+            ]
+            if mapped:
+                first = whisper_tokens[min(mapped)]
+                last = whisper_tokens[max(mapped)]
+                start = max(0, first["start"])
+                end = max(0, last["end"])
+            else:
+                start = None
+                end = None
+            words.append(
+                {
+                    "text": raw_word,
+                    "token_indices": token_indices,
+                    "mapped_indices": mapped,
+                    "start": start,
+                    "end": end,
+                }
+            )
+    return words
+
+
+def _cue_end_score(words, start, end, total_words):
+    selected = words[start:end]
+    text = _join_semantic_words(selected)
+    if not selected:
+        return None
+    if len(text) > SEMANTIC_SUBTITLE_MAX_CUE_CHARS + 2:
+        return None
+    lines = _wrap_semantic_words(selected)
+    if len(lines) > 2:
+        return None
+    if any(len(line) > SEMANTIC_SUBTITLE_HARD_LINE_CHARS + 2 for line in lines):
+        return None
+    next_word = words[end]["text"] if end < total_words else ""
+    boundary = _semantic_boundary_strength(selected[-1]["text"], next_word)
+    target = SEMANTIC_SUBTITLE_TARGET_LINE_CHARS * min(2, len(lines))
+    fullness = -abs(len(text) - target)
+    orphan_penalty = 0
+    if end < total_words and _is_semantic_orphan(next_word):
+        orphan_penalty += 60
+    if _is_semantic_orphan(selected[-1]["text"]) and end < total_words:
+        orphan_penalty += 60
+    final_bonus = 70 if end == total_words else 0
+    return boundary * 8 + fullness + final_bonus - orphan_penalty
+
+
+def _semantic_subtitle_items(script_lines, token_mapping, whisper_tokens):
+    words = _semantic_words_from_alignment(script_lines, token_mapping, whisper_tokens)
+    output = []
+    start = 0
+    index = 1
+    total_words = len(words)
+    previous_end = 0
+
+    while start < total_words:
+        best = None
+        fallback = None
+        for end in range(start + 1, total_words + 1):
+            selected = words[start:end]
+            text = _join_semantic_words(selected)
+            if len(text) > SEMANTIC_SUBTITLE_MAX_CUE_CHARS + 2:
+                break
+            lines = _wrap_semantic_words(selected)
+            if len(lines) <= 2 and all(
+                len(line) <= SEMANTIC_SUBTITLE_HARD_LINE_CHARS + 2
+                for line in lines
+            ):
+                fallback = end
+                score = _cue_end_score(words, start, end, total_words)
+                if score is not None and (best is None or score > best[0]):
+                    best = (score, end)
+
+        end = best[1] if best is not None else fallback
+        if end is None:
+            end = min(total_words, start + 1)
+
+        selected = words[start:end]
+        mapped_words = [word for word in selected if word["start"] is not None and word["end"] is not None]
+        if not mapped_words:
+            start = end
+            continue
+
+        cue_start = max(previous_end, mapped_words[0]["start"])
+        cue_end = mapped_words[-1]["end"]
+        if cue_end <= cue_start:
+            start = end
+            continue
+
+        output.append((index, cue_start, cue_end, "\n".join(_wrap_semantic_words(selected))))
+        previous_end = cue_end
+        index += 1
+        start = end
+
+    return output
+
+
 def _build_alignment_result(subtitle_file, video_script):
     subtitle_items = file_to_subtitles(subtitle_file)
     whisper_tokens = _whisper_subtitle_tokens(subtitle_items)
@@ -458,7 +678,7 @@ def _build_alignment_result(subtitle_file, video_script):
     )
 
     report_lines = []
-    output_items = []
+    line_output_items = []
     all_lines_have_min_coverage = True
     all_lines_have_valid_timing = True
     monotonic = True
@@ -490,7 +710,7 @@ def _build_alignment_result(subtitle_file, video_script):
                 all_lines_have_valid_timing = False
             else:
                 previous_end = end
-                output_items.append((line_index, start, end, script_line["text"]))
+                line_output_items.append((line_index, start, end, script_line["text"]))
         else:
             all_lines_have_valid_timing = False
 
@@ -517,9 +737,14 @@ def _build_alignment_result(subtitle_file, video_script):
         and all_lines_have_min_coverage
         and all_lines_have_valid_timing
         and monotonic
-        and len(output_items) == len(script_lines)
+        and len(line_output_items) == len(script_lines)
     )
     status = "ok" if status_ok else "review_required"
+    output_items = (
+        _semantic_subtitle_items(script_lines, token_mapping, whisper_tokens)
+        if status_ok
+        else line_output_items
+    )
 
     return {
         "status": status,
@@ -528,7 +753,8 @@ def _build_alignment_result(subtitle_file, video_script):
         "total_script_tokens": total_script_tokens,
         "script_coverage": round(script_coverage, 4),
         "script_lines": len(script_lines),
-        "aligned_lines": len(output_items),
+        "aligned_lines": len(line_output_items),
+        "subtitle_cues": len(output_items),
         "review_required": not status_ok,
         "lines": report_lines,
         "_output_items": output_items,

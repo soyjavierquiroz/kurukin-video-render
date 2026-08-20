@@ -48,6 +48,7 @@ PREVIEW_KEYS = (
 )
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+FLIP_HORIZONTAL_DEFAULT = True
 
 
 def utc_timestamp() -> str:
@@ -156,6 +157,7 @@ def serialize_candidate(candidate: Any, decision: Any | None = None, thumbnail_p
             "rank": getattr(candidate, "rank", None),
         },
         "ranking": ranking,
+        "flip_horizontal": FLIP_HORIZONTAL_DEFAULT,
     }
 
 
@@ -293,6 +295,93 @@ def _asset_uid_value(asset: Mapping[str, Any] | None) -> str:
     ).strip()
 
 
+def asset_flip_horizontal(asset: Mapping[str, Any] | None) -> bool:
+    if not isinstance(asset, Mapping):
+        return FLIP_HORIZONTAL_DEFAULT
+    value = asset.get("flip_horizontal", FLIP_HORIZONTAL_DEFAULT)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def _normalize_asset_editorial_fields(asset: Any) -> None:
+    if isinstance(asset, dict) and "flip_horizontal" not in asset:
+        asset["flip_horizontal"] = FLIP_HORIZONTAL_DEFAULT
+
+
+def normalize_plan_editorial_fields(plan: dict[str, Any]) -> dict[str, Any]:
+    for segment in plan.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        _normalize_asset_editorial_fields(segment.get("selected_asset"))
+        _normalize_asset_editorial_fields(segment.get("original_selected_asset"))
+        for key in ("alternatives", "backup_assets"):
+            for asset in segment.get(key) or []:
+                _normalize_asset_editorial_fields(asset)
+    return plan
+
+
+def _iter_visible_editable_assets(plan: dict[str, Any]):
+    for segment in plan.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        segment_id = str(segment.get("segment_id") or "")
+        selected = segment.get("selected_asset")
+        if isinstance(selected, dict):
+            yield segment_id, selected
+        for key in ("alternatives", "backup_assets"):
+            for asset in segment.get(key) or []:
+                if isinstance(asset, dict):
+                    yield segment_id, asset
+
+
+def set_asset_flip_horizontal(
+    plan_file: Path,
+    segment_id: str,
+    asset_uid: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    plan = normalize_plan_editorial_fields(read_json(plan_file))
+
+    if plan.get("review_status") == STATUS_APPROVED:
+        raise ValueError("approved production plans are frozen")
+
+    changed = False
+    for current_segment_id, asset in _iter_visible_editable_assets(plan):
+        if current_segment_id != segment_id:
+            continue
+        if _asset_uid_value(asset) != asset_uid:
+            continue
+        asset["flip_horizontal"] = bool(enabled)
+        changed = True
+
+    if not changed:
+        raise ValueError(f"asset {asset_uid} is not available for {segment_id}")
+
+    plan["coverage"] = coverage_summary(plan)
+    plan["updated_at"] = utc_timestamp()
+    write_json_atomic(plan_file, plan)
+    return plan
+
+
+def set_all_visible_flip_horizontal(
+    plan_file: Path,
+    enabled: bool,
+) -> dict[str, Any]:
+    plan = normalize_plan_editorial_fields(read_json(plan_file))
+
+    if plan.get("review_status") == STATUS_APPROVED:
+        raise ValueError("approved production plans are frozen")
+
+    for _segment_id, asset in _iter_visible_editable_assets(plan):
+        asset["flip_horizontal"] = bool(enabled)
+
+    plan["coverage"] = coverage_summary(plan)
+    plan["updated_at"] = utc_timestamp()
+    write_json_atomic(plan_file, plan)
+    return plan
+
+
 def _unique_assets_by_uid(assets: list[Any]) -> list[dict[str, Any]]:
     unique: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -301,6 +390,7 @@ def _unique_assets_by_uid(assets: list[Any]) -> list[dict[str, Any]]:
         if not isinstance(asset, dict):
             continue
 
+        _normalize_asset_editorial_fields(asset)
         uid = _asset_uid_value(asset)
         if not uid or uid in seen:
             continue
@@ -573,7 +663,7 @@ def set_segment_backup(
     asset_uid: str,
     enabled: bool,
 ) -> dict[str, Any]:
-    plan = read_json(plan_file)
+    plan = normalize_plan_editorial_fields(read_json(plan_file))
 
     if plan.get("review_status") == STATUS_APPROVED:
         raise ValueError("approved production plans are frozen")
@@ -841,6 +931,7 @@ def render_timeline_from_plan(
                 "role": role,
                 "asset_uid": uid,
                 "asset": dict(asset),
+                "flip_horizontal": asset_flip_horizontal(asset),
                 "source_duration": round(
                     source_duration,
                     6,
@@ -2028,7 +2119,7 @@ def replace_segment_asset(
     segment_id: str,
     asset_uid: str,
 ) -> dict[str, Any]:
-    plan = read_json(plan_file)
+    plan = normalize_plan_editorial_fields(read_json(plan_file))
 
     if plan.get("review_status") == STATUS_APPROVED:
         raise ValueError("approved production plans are frozen")
@@ -2141,7 +2232,7 @@ def approve_plan(
     *,
     allow_insufficient_coverage: bool = False,
 ) -> dict[str, Any]:
-    plan = read_json(plan_file)
+    plan = normalize_plan_editorial_fields(read_json(plan_file))
 
     if plan.get("review_status") == STATUS_APPROVED:
         enqueue_approved_plan(

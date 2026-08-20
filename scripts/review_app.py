@@ -38,6 +38,28 @@ def show_asset(asset: dict, key: str) -> None:
     st.caption(f"{asset.get('provider') or asset.get('source')} · {asset.get('asset_uid')}")
 
 
+def show_flip_checkbox(plan_file: Path, segment_id: str, asset: dict, key: str) -> None:
+    uid = str(asset.get("asset_uid") or "")
+    current = human_review.asset_flip_horizontal(asset)
+    enabled = st.checkbox(
+        "Flip horizontal",
+        value=current,
+        key=f"flip-{key}",
+    )
+    if enabled != current and uid:
+        try:
+            human_review.set_asset_flip_horizontal(
+                plan_file,
+                segment_id,
+                uid,
+                enabled,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
+
+
 def script_preview(text: object, limit: int = 420) -> str:
     value = " ".join(str(text or "").split())
     if len(value) <= limit:
@@ -60,12 +82,26 @@ def main() -> None:
         labels.append(f"{plan.get('batch_id')} / {plan.get('stem')}")
     selected_index = st.sidebar.radio("Pending jobs", range(len(plans)), format_func=lambda idx: labels[idx])
     plan_file = plans[selected_index]
-    plan = human_review.read_json(plan_file)
+    plan = human_review.normalize_plan_editorial_fields(
+        human_review.read_json(plan_file)
+    )
 
     st.subheader(f"{plan.get('batch_id')} / {plan.get('stem')}")
     st.caption(str(plan_file))
     for warning in plan.get("warnings") or []:
         st.warning(f"{warning.get('code')}: {warning.get('message')}")
+
+    flip_all, flip_none = st.columns(2)
+
+    with flip_all:
+        if st.button("Flip todos"):
+            human_review.set_all_visible_flip_horizontal(plan_file, True)
+            st.rerun()
+
+    with flip_none:
+        if st.button("Sin flip todos"):
+            human_review.set_all_visible_flip_horizontal(plan_file, False)
+            st.rerun()
 
     coverage = human_review.coverage_summary(plan)
 
@@ -291,6 +327,13 @@ def main() -> None:
                 f"{segment_id}-selected",
             )
 
+            show_flip_checkbox(
+                plan_file,
+                segment_id,
+                selected,
+                f"{segment_id}-selected",
+            )
+
             metadata = (
                 selected.get("metadata")
                 if isinstance(
@@ -352,6 +395,16 @@ def main() -> None:
                     )
 
                 show_asset(
+                    alternative,
+                    (
+                        f"{segment_id}"
+                        f"-alt-{index}"
+                    ),
+                )
+
+                show_flip_checkbox(
+                    plan_file,
+                    segment_id,
                     alternative,
                     (
                         f"{segment_id}"

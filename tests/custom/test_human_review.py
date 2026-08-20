@@ -11,6 +11,8 @@ from app.custom import human_review
 from app.custom.material_discovery import MaterialCandidate
 from app.custom.material_selection import MaterialSelectionDecision, MaterialSelectionOptions, MaterialSelectionResult
 from app.models.schema import VideoParams
+from app.models.schema import MaterialInfo
+from scripts import batch_mpt_worker
 from scripts import nightly_runner
 from scripts import produce_batch
 
@@ -110,11 +112,12 @@ class TestHumanReviewPlan(unittest.TestCase):
             output_path=plan_file,
         )
 
-        self.assertEqual(plan["schema_version"], 1)
+        self.assertEqual(plan["schema_version"], human_review.SCHEMA_VERSION)
         self.assertEqual(plan["review_status"], human_review.STATUS_PENDING)
         self.assertEqual(plan["segments"][0]["selected_asset"]["asset_uid"], "asset-1")
         self.assertLessEqual(len(plan["segments"][0]["alternatives"]), 3)
         self.assertTrue(Path(plan["segments"][0]["selected_asset"]["thumbnail_path"]).exists())
+        self.assertTrue(plan["segments"][0]["selected_asset"]["flip_horizontal"])
 
     def test_selected_assets_prefer_unused_candidates_across_segments(self):
         assets = [candidate(uid) for uid in ("asset-a", "asset-b", "asset-c")]
@@ -740,6 +743,141 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(segment["original_selected_asset"]["asset_uid"], "asset-1")
         self.assertTrue(segment["feedback"]["human_changed"])
 
+    def test_legacy_asset_without_flip_defaults_to_true(self):
+        self.assertTrue(human_review.asset_flip_horizontal({"asset_uid": "legacy"}))
+
+    def test_set_asset_flip_false_persists(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="script",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([candidate("asset-1")]),
+            discovery_result=SimpleNamespace(candidates=(candidate("asset-1"),)),
+            output_path=plan_file,
+        )
+
+        plan = human_review.set_asset_flip_horizontal(
+            plan_file,
+            "segment-001",
+            "asset-1",
+            False,
+        )
+
+        self.assertFalse(plan["segments"][0]["selected_asset"]["flip_horizontal"])
+        reloaded = human_review.read_json(plan_file)
+        self.assertFalse(reloaded["segments"][0]["selected_asset"]["flip_horizontal"])
+
+    def test_suggested_flip_false_promoted_to_primary_stays_false(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="script",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([candidate("asset-1")]),
+            discovery_result=SimpleNamespace(candidates=(candidate("asset-1"), candidate("asset-2"))),
+            output_path=plan_file,
+        )
+        human_review.set_asset_flip_horizontal(plan_file, "segment-001", "asset-2", False)
+
+        plan = human_review.replace_segment_asset(plan_file, "segment-001", "asset-2")
+
+        self.assertEqual(plan["segments"][0]["selected_asset"]["asset_uid"], "asset-2")
+        self.assertFalse(plan["segments"][0]["selected_asset"]["flip_horizontal"])
+
+    def test_suggested_flip_false_promoted_to_backup_stays_false(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="script",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([candidate("asset-1", source_info={"duration": 3})]),
+            discovery_result=SimpleNamespace(
+                candidates=(
+                    candidate("asset-1", source_info={"duration": 3}),
+                    candidate("asset-2"),
+                )
+            ),
+            output_path=plan_file,
+        )
+        human_review.set_asset_flip_horizontal(plan_file, "segment-001", "asset-2", False)
+
+        plan = human_review.set_segment_backup(plan_file, "segment-001", "asset-2", True)
+
+        backup = plan["segments"][0]["backup_assets"][0]
+        self.assertEqual(backup["asset_uid"], "asset-2")
+        self.assertFalse(backup["flip_horizontal"])
+
+    def test_set_all_visible_flip_horizontal_updates_all_assets(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="script",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([candidate("asset-1")]),
+            discovery_result=SimpleNamespace(candidates=(candidate("asset-1"), candidate("asset-2"), candidate("asset-3"))),
+            output_path=plan_file,
+        )
+
+        plan = human_review.set_all_visible_flip_horizontal(plan_file, False)
+        assets = [plan["segments"][0]["selected_asset"]] + plan["segments"][0]["alternatives"]
+        self.assertTrue(all(asset["flip_horizontal"] is False for asset in assets))
+
+        plan = human_review.set_all_visible_flip_horizontal(plan_file, True)
+        assets = [plan["segments"][0]["selected_asset"]] + plan["segments"][0]["alternatives"]
+        self.assertTrue(all(asset["flip_horizontal"] is True for asset in assets))
+
+    def test_flip_does_not_change_coverage_or_timeline_durations(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="script",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([candidate("asset-1")]),
+            discovery_result=SimpleNamespace(candidates=(candidate("asset-1"),)),
+            output_path=plan_file,
+        )
+        before_coverage = human_review.coverage_summary(plan)
+        before_piece = dict(human_review.render_timeline_from_plan(plan).pieces[0])
+
+        plan["segments"][0]["selected_asset"]["flip_horizontal"] = False
+        after_coverage = human_review.coverage_summary(plan)
+        after_piece = dict(human_review.render_timeline_from_plan(plan).pieces[0])
+
+        self.assertEqual(before_coverage, after_coverage)
+        for key in ("segment_id", "role", "asset_uid", "source_duration", "output_duration", "playback_speed"):
+            self.assertEqual(before_piece[key], after_piece[key])
+
     def test_approve_sets_status_and_enqueues_nightly_job(self):
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
         human_review.write_json_atomic(
@@ -774,6 +912,53 @@ class TestHumanReviewPlan(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             human_review.replace_segment_asset(plan_file, "segment-001", "a")
+
+    def test_materialization_adds_hflip_only_when_flip_enabled(self):
+        source = self.root / "asset.mp4"
+        source.write_bytes(b"video")
+
+        def stage_with_flip(enabled):
+            plan = {
+                "review_status": human_review.STATUS_APPROVED,
+                "duration": 4.9,
+                "segments": [
+                    {
+                        "segment_id": "segment-001",
+                        "duration": 5,
+                        "selected_asset": {
+                            "asset_uid": "asset-1",
+                            "canonical_id": "asset-1",
+                            "flip_horizontal": enabled,
+                            "metadata": {"duration": 5},
+                        },
+                        "backup_assets": [],
+                    }
+                ],
+            }
+            selection_obj = SimpleNamespace(decisions=(decision(candidate("asset-1")),))
+            acquisition = SimpleNamespace(
+                materials=(
+                    MaterialInfo(provider="local", url=source.as_posix(), duration=5),
+                )
+            )
+
+            def fake_run(command, **_kwargs):
+                Path(command[-1]).parent.mkdir(parents=True, exist_ok=True)
+                Path(command[-1]).write_bytes(b"staged")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with patch("scripts.batch_mpt_worker.subprocess.run", side_effect=fake_run) as run:
+                batch_mpt_worker._stage_human_review_timeline(
+                    plan=plan,
+                    selection=selection_obj,
+                    acquisition=acquisition,
+                    task_id=f"test-flip-{enabled}",
+                )
+            command = run.call_args.args[0]
+            return command[command.index("-vf") + 1]
+
+        self.assertIn("hflip", stage_with_flip(True).split(","))
+        self.assertNotIn("hflip", stage_with_flip(False).split(","))
 
 
 class TestHumanReviewPipeline(unittest.TestCase):
