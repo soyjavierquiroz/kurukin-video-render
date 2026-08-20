@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import re
 from typing import Any, Mapping, Sequence
 
+from app.custom.asset_search_v2 import build_visual_queries_v2
 from app.custom.kurukin_asset_hub import (
     KurukinAssetHubAuthError,
     KurukinAssetHubError,
@@ -22,7 +23,6 @@ from app.custom.material_source_policy import (
     PROVIDER_LOCAL,
     build_discovery_plan,
 )
-from app.custom.material_selection import _is_orientation_compatible
 from app.custom.kurukin_local_visual_picker import pick_local_visual_for_intent
 from app.services import material
 
@@ -42,6 +42,7 @@ _PREVIEW_SOURCE_KEYS = (
     "image_url", "image", "keyframe_url", "keyframe", "cover_url", "cover",
     "source_thumbnail_url", "source_thumbnail",
 )
+TITLE_PREFERRED_MIN_CANDIDATES = 4
 
 
 class MaterialDiscoveryError(RuntimeError):
@@ -128,6 +129,26 @@ def _exclusive_title_from_source_policy(source_policy: Mapping[str, Any] | None)
     if not isinstance(source, Mapping) or str(source.get("scope") or "").strip() != "title":
         return ""
     return str(source.get("title") or "").strip()
+
+
+def _source_policy_sources(source_policy: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    sources = (source_policy or {}).get("sources")
+    return [source for source in sources if isinstance(source, Mapping)] if isinstance(sources, list) else []
+
+
+def _policy_with_sources(sources: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, str]]]:
+    return {"sources": [dict(source) for source in sources]}
+
+
+def _title_preferred_policies(
+    source_policy: Mapping[str, Any] | None,
+) -> tuple[dict[str, list[dict[str, str]]] | None, dict[str, list[dict[str, str]]] | None]:
+    sources = _source_policy_sources(source_policy)
+    title_sources = [source for source in sources if str(source.get("scope") or "").strip() == "title"]
+    generic_sources = [source for source in sources if str(source.get("scope") or "").strip() == "generic"]
+    if title_sources and generic_sources:
+        return _policy_with_sources(title_sources), _policy_with_sources(generic_sources)
+    return None, None
 
 
 def _safe_number(value: Any, converter: type[int] | type[float]) -> int | float | None:
@@ -227,7 +248,10 @@ def _asset_hub_candidate(asset: Mapping[str, Any], *, term: str, rank: int) -> M
     height = _safe_number(asset.get("height"), int)
     orientation = _safe_text(asset.get("orientation")) or _orientation(width, height)
     safe_info = {
-        key: source[key] for key in ("filename", "orientation", "duration", "width", "height", "scope", "brand", "title")
+        key: source[key] for key in (
+            "filename", "media_type", "orientation", "duration", "width", "height",
+            "scope", "brand", "title", "title_type",
+        )
         if key in source
     }
     safe_info.update(_preview_source_info(source))
@@ -290,12 +314,137 @@ def _asset_hub_found_candidates(
     query: str,
     source_policy: Mapping[str, Any],
     original_term: str,
+    limit: int = 20,
 ) -> list[MaterialCandidate]:
-    assets = provider.search(query=query, source_policy=source_policy)
+    assets = provider.search(query=query, source_policy=source_policy, limit=limit)
     return [
         _asset_hub_candidate(asset, term=original_term, rank=index)
         for index, asset in enumerate(assets)
+        if _asset_hub_is_video_asset(asset)
     ]
+
+
+def _asset_hub_is_video_asset(asset: Mapping[str, Any]) -> bool:
+    media_type = str(asset.get("media_type") or "").strip().lower()
+    return not media_type or media_type == "video"
+
+
+def _asset_hub_search_queries(term: str) -> tuple[str, ...]:
+    queries = list(build_visual_queries_v2(term, [term]))
+    if term and term not in queries:
+        queries.insert(0, term)
+    simplified = _simplify_asset_hub_retry_term(term)
+    if simplified and simplified not in queries:
+        queries.append(simplified)
+    return tuple(dict.fromkeys(queries))
+
+
+def _rank_asset_hub_candidates(
+    candidates: list[MaterialCandidate],
+    *,
+    video_aspect: str,
+    clip_duration: int | float,
+) -> list[MaterialCandidate]:
+    def key(pair: tuple[int, MaterialCandidate]) -> tuple[int, int, int]:
+        from app.custom.material_selection import _duration_score, orientation_score
+
+        index, item = pair
+        return (
+            -orientation_score(item, video_aspect),
+            -_duration_score(item, float(clip_duration or 0) or 1.0),
+            index,
+        )
+
+    return [item for _, item in sorted(enumerate(candidates), key=key)]
+
+
+def _merge_asset_hub_query_results(
+    batches: Sequence[Sequence[MaterialCandidate]],
+    *,
+    video_aspect: str,
+    clip_duration: int | float,
+) -> list[MaterialCandidate]:
+    merged: list[MaterialCandidate] = []
+    seen: set[str] = set()
+    for batch in batches:
+        for candidate in batch:
+            if candidate.dedupe_key in seen:
+                continue
+            seen.add(candidate.dedupe_key)
+            merged.append(candidate)
+    return _rank_asset_hub_candidates(
+        merged,
+        video_aspect=video_aspect,
+        clip_duration=clip_duration,
+    )
+
+
+def _asset_hub_multi_query_candidates(
+    provider: KurukinAssetProvider,
+    *,
+    term: str,
+    source_policy: Mapping[str, Any],
+    video_aspect: str,
+    clip_duration: int | float,
+    limit: int = 20,
+) -> tuple[list[MaterialCandidate], list[DiscoveryDiagnostic]]:
+    batches: list[list[MaterialCandidate]] = []
+    diagnostics: list[DiscoveryDiagnostic] = []
+    for query in _asset_hub_search_queries(term):
+        found = _asset_hub_found_candidates(
+            provider,
+            query=query,
+            source_policy=source_policy,
+            original_term=term,
+            limit=limit,
+        )
+        diagnostics.append(DiscoveryDiagnostic(PROVIDER_ASSET_HUB, query, "success", "ok", len(found)))
+        batches.append(found)
+    return (
+        _merge_asset_hub_query_results(
+            batches,
+            video_aspect=video_aspect,
+            clip_duration=clip_duration,
+        ),
+        diagnostics,
+    )
+
+
+def _search_title_preferred_asset_hub(
+    provider: KurukinAssetProvider,
+    *,
+    term: str,
+    title_policy: Mapping[str, Any],
+    generic_policy: Mapping[str, Any],
+    video_aspect: str,
+    clip_duration: int | float,
+    limit: int,
+) -> tuple[list[MaterialCandidate], list[DiscoveryDiagnostic]]:
+    title_found, diagnostics = _asset_hub_multi_query_candidates(
+        provider,
+        term=term,
+        source_policy=title_policy,
+        video_aspect=video_aspect,
+        clip_duration=clip_duration,
+        limit=limit,
+    )
+    if len(title_found) >= TITLE_PREFERRED_MIN_CANDIDATES:
+        return title_found, diagnostics
+
+    generic_found, generic_diagnostics = _asset_hub_multi_query_candidates(
+        provider,
+        term=term,
+        source_policy=generic_policy,
+        video_aspect=video_aspect,
+        clip_duration=clip_duration,
+        limit=limit,
+    )
+    merged = _merge_asset_hub_query_results(
+        (title_found, generic_found),
+        video_aspect=video_aspect,
+        clip_duration=clip_duration,
+    )
+    return merged, diagnostics + generic_diagnostics
 
 
 def _dedupe(candidates: list[MaterialCandidate]) -> tuple[MaterialCandidate, ...]:
@@ -366,11 +515,6 @@ def discover_material_candidates(
             active_provider = asset_hub_provider or KurukinAssetProvider()
             source_policy = plan["asset_hub"]["source_policy"]
         for term in terms:
-            queries = [term]
-            if provider == PROVIDER_ASSET_HUB:
-                simplified = _simplify_asset_hub_retry_term(term)
-                if simplified and simplified not in queries:
-                    queries.append(simplified)
             found: list[MaterialCandidate] = []
             try:
                 if provider != PROVIDER_ASSET_HUB:
@@ -378,18 +522,29 @@ def discover_material_candidates(
                     items = material.search_videos_for_provider(provider, term, minimum_duration, video_aspect)
                     found = [candidate for index, item in enumerate(items) if (candidate := _stock_candidate(item, provider=provider, term=term, rank=index)) is not None]
                 else:
-                    for query in queries:
-                        remote_attempts += 1
-                        found = _asset_hub_found_candidates(
+                    title_policy, generic_policy = _title_preferred_policies(source_policy)
+                    query_count = len(_asset_hub_search_queries(term))
+                    remote_attempts += query_count
+                    if title_policy and generic_policy:
+                        found, hub_diagnostics = _search_title_preferred_asset_hub(
                             active_provider,
-                            query=query,
-                            source_policy=source_policy,
-                            original_term=term,
+                            term=term,
+                            title_policy=title_policy,
+                            generic_policy=generic_policy,
+                            video_aspect=video_aspect,
+                            clip_duration=minimum_duration,
+                            limit=20,
                         )
-                        found = [candidate for candidate in found if _is_orientation_compatible(candidate, video_aspect)]
-                        diagnostics.append(DiscoveryDiagnostic(provider, query, "success", "ok", len(found)))
-                        if found:
-                            break
+                    else:
+                        found, hub_diagnostics = _asset_hub_multi_query_candidates(
+                            active_provider,
+                            term=term,
+                            source_policy=source_policy,
+                            video_aspect=video_aspect,
+                            clip_duration=minimum_duration,
+                            limit=20,
+                        )
+                    diagnostics.extend(hub_diagnostics)
             except Exception as exc:
                 if provider == PROVIDER_ASSET_HUB and _is_fatal_asset_hub_error(exc):
                     raise
@@ -399,7 +554,6 @@ def discover_material_candidates(
                     raise MaterialDiscoveryError(f"material provider '{provider}' failed") from exc
                 continue
             if provider != PROVIDER_ASSET_HUB:
-                found = [candidate for candidate in found if _is_orientation_compatible(candidate, video_aspect)]
                 diagnostics.append(DiscoveryDiagnostic(provider, term, "success", "ok", len(found)))
             candidates.extend(found)
             if provider not in succeeded:
@@ -473,11 +627,26 @@ def discover_asset_hub_review_reserve_candidates(
 
     for term in normalized_terms:
         try:
-            assets = provider.search(
-                query=term,
-                source_policy=source_policy,
-                limit=limit_per_term,
-            )
+            title_policy, generic_policy = _title_preferred_policies(source_policy)
+            if title_policy and generic_policy:
+                found, term_diagnostics = _search_title_preferred_asset_hub(
+                    provider,
+                    term=term,
+                    title_policy=title_policy,
+                    generic_policy=generic_policy,
+                    video_aspect=video_aspect,
+                    clip_duration=limit_per_term,
+                    limit=limit_per_term,
+                )
+            else:
+                found, term_diagnostics = _asset_hub_multi_query_candidates(
+                    provider,
+                    term=term,
+                    source_policy=source_policy,
+                    video_aspect=video_aspect,
+                    clip_duration=limit_per_term,
+                    limit=limit_per_term,
+                )
         except Exception as exc:
             if _is_fatal_asset_hub_error(exc):
                 raise
@@ -493,32 +662,15 @@ def discover_asset_hub_review_reserve_candidates(
             )
             continue
 
-        found = [
-            _asset_hub_candidate(
-                asset,
-                term=term,
-                rank=index,
-            )
-            for index, asset in enumerate(assets)
-        ]
-
-        found = [
-            candidate
-            for candidate in found
-            if _is_orientation_compatible(
-                candidate,
-                video_aspect,
-            )
-        ]
-
-        diagnostics.append(
+        diagnostics.extend(
             DiscoveryDiagnostic(
-                PROVIDER_ASSET_HUB,
-                term,
-                "success",
+                item.provider,
+                item.term,
+                item.status,
                 "human_review_reserve",
-                len(found),
+                item.candidate_count,
             )
+            for item in term_diagnostics
         )
 
         candidates.extend(found)
@@ -576,10 +728,11 @@ def discover_asset_hub_title_fallback_candidates(
         _title_only_asset_hub_candidate(asset, title=title, rank=index)
         for index, asset in enumerate(assets)
     ]
-    candidates = [
-        candidate for candidate in candidates
-        if _is_orientation_compatible(candidate, video_aspect)
-    ]
+    candidates = _rank_asset_hub_candidates(
+        candidates,
+        video_aspect=video_aspect,
+        clip_duration=limit,
+    )
     diagnostics = (DiscoveryDiagnostic(PROVIDER_ASSET_HUB, title, "success", "global_title_only_fallback", len(candidates)),)
     succeeded = (PROVIDER_ASSET_HUB,) if candidates else ()
     return MaterialDiscoveryResult(_dedupe(candidates), diagnostics, (PROVIDER_ASSET_HUB,), succeeded, {"stock": (), "asset_hub": (title,)})

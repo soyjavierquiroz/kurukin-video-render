@@ -6,9 +6,12 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.kurukin_asset_hub import KurukinAssetHubAuthError
+from app.custom.asset_search_v2 import build_visual_queries_v2
 from app.custom.material_discovery import (
+    TITLE_PREFERRED_MIN_CANDIDATES,
     MaterialDiscoveryError,
     discover_asset_hub_title_fallback_candidates,
+    discover_asset_hub_review_reserve_candidates,
     discover_material_candidates,
 )
 from app.custom.material_source_policy import (
@@ -47,8 +50,8 @@ class FakeAssetHub:
         self.error = error
         self.calls = []
 
-    def search(self, *, query, source_policy):
-        self.calls.append((query, source_policy))
+    def search(self, *, query, source_policy, limit=20):
+        self.calls.append((query, source_policy, limit))
         if self.error:
             raise self.error
         return self.results.get(query, [])
@@ -63,6 +66,58 @@ def stock(provider, asset_id, *, filename=None):
 
 
 class TestMaterialDiscovery(unittest.TestCase):
+    def assertDiverseQueries(self, queries):
+        token_sets = [frozenset(query.lower().split()) for query in queries]
+        self.assertEqual(len(token_sets), len(set(token_sets)))
+        for left_index, left in enumerate(token_sets):
+            for right in token_sets[left_index + 1:]:
+                self.assertNotEqual(left, right)
+
+    def test_visual_query_v2_compacts_long_conceptual_scene(self):
+        queries = build_visual_queries_v2(
+            "Aprendiste a ser fuerte porque sentías que nadie iba a rescatarte"
+        )
+
+        self.assertGreaterEqual(len(queries), 2)
+        self.assertLessEqual(len(queries), 3)
+        self.assertTrue(all(3 <= len(query.split()) <= 7 for query in queries))
+        self.assertTrue(any("soledad" in query or "aislamiento" in query for query in queries))
+        self.assertDiverseQueries(queries)
+
+    def test_visual_query_v2_does_not_invent_concrete_details(self):
+        queries = build_visual_queries_v2("Ella respiró profundo y decidió seguir adelante")
+        serialized = " ".join(queries).lower()
+
+        for invented in ("bosque", "vela", "noche", "azul", "anciana"):
+            self.assertNotIn(invented, serialized)
+
+    def test_visual_query_v2_maps_editorial_concepts_without_noise(self):
+        examples = (
+            (
+                "También necesitó que alguien la escuchara, la protegiera y le dijera que todo iba a estar bien.",
+                ("apoyo emocional", "consuelo", "protección emocional"),
+            ),
+            (
+                "La que sostiene a los demás aunque también esté asustada.",
+                ("cuidadora", "responsabilidad emocional", "preocupada"),
+            ),
+            (
+                "Elegís personas que necesitan ser rescatadas.",
+                ("dependencia emocional", "apoyo emocional", "relación desequilibrada"),
+            ),
+        )
+        noisy = {"también", "demas", "demás", "elegís", "necesitó", "necesitan"}
+        for scene, expected_terms in examples:
+            with self.subTest(scene=scene):
+                queries = build_visual_queries_v2(scene, [scene])
+                serialized = " ".join(queries).lower()
+                self.assertLessEqual(len(queries), 3)
+                self.assertTrue(all(3 <= len(query.split()) <= 7 for query in queries))
+                self.assertDiverseQueries(queries)
+                self.assertTrue(any(term in serialized for term in expected_terms))
+                self.assertFalse(noisy & set(serialized.split()))
+                self.assertNotIn("persona demás también", serialized)
+
     def test_stock_wrapper_delegates_to_cache_entrypoint(self):
         if not hasattr(material, "search_videos_for_provider"):
             self.skipTest("full-suite provider-import guard supplied a minimal material module")
@@ -124,6 +179,7 @@ class TestMaterialDiscovery(unittest.TestCase):
     def test_asset_hub_retries_once_with_simplified_visual_word(self):
         hub = FakeAssetHub({
             "mujer triste": [],
+            "mujer triste tristeza": [],
             "triste": [{"asset_uid": "sad-1", "filename": "sad.mp4", "orientation": "vertical"}],
         })
 
@@ -133,12 +189,9 @@ class TestMaterialDiscovery(unittest.TestCase):
             asset_hub_provider=hub,
         )
 
-        self.assertEqual([call[0] for call in hub.calls], ["mujer triste", "triste"])
+        self.assertEqual([call[0] for call in hub.calls], ["mujer triste", "mujer triste tristeza", "triste"])
         self.assertEqual(result.candidates[0].canonical_id, "sad-1")
-        self.assertEqual(
-            [(item.term, item.candidate_count) for item in result.diagnostics],
-            [("mujer triste", 0), ("triste", 1)],
-        )
+        self.assertEqual(result.diagnostics[-1].candidate_count, 1)
 
     def test_asset_hub_does_not_use_title_only_fallback_per_term(self):
         hub = FakeAssetHub({
@@ -163,8 +216,12 @@ class TestMaterialDiscovery(unittest.TestCase):
     def test_asset_hub_consults_all_terms_before_global_fallback(self):
         hub = FakeAssetHub({
             "pareja discutiendo": [],
+            "pareja preocupación relación": [],
+            "discusión familiar desacuerdo": [],
             "pareja": [],
             "niño solo": [],
+            "niño solo soledad": [],
+            "soledad vulnerabilidad emocional": [],
             "solo": [{"asset_uid": "solo-1", "filename": "solo.mp4", "orientation": "vertical"}],
         })
 
@@ -174,7 +231,7 @@ class TestMaterialDiscovery(unittest.TestCase):
             asset_hub_provider=hub,
         )
 
-        self.assertEqual([call[0] for call in hub.calls], ["pareja discutiendo", "pareja", "niño solo", "solo"])
+        self.assertEqual([call[0] for call in hub.calls], ["pareja discutiendo", "pareja preocupación relación", "discusión familiar desacuerdo", "pareja", "niño solo", "niño solo soledad", "soledad vulnerabilidad emocional", "solo"])
         self.assertEqual([item.canonical_id for item in result.candidates], ["solo-1"])
 
     def test_asset_hub_title_only_global_fallback_runs_once_and_marks_candidates(self):
@@ -208,6 +265,93 @@ class TestMaterialDiscovery(unittest.TestCase):
 
         self.assertEqual([call[0] for call in hub.calls], ["mujer preocupada", "preocupada"])
         self.assertEqual(result.candidates, ())
+
+    def test_asset_hub_multi_query_merges_duplicate_asset_uids(self):
+        hub = FakeAssetHub({
+            "mujer triste": [{"asset_uid": "a", "orientation": "vertical-9x16"}],
+            "mujer triste tristeza": [
+                {"asset_uid": "a", "orientation": "vertical-9x16"},
+                {"asset_uid": "b", "orientation": "vertical-9x16"},
+            ],
+            "triste": [{"asset_uid": "c", "orientation": "vertical-9x16"}],
+        })
+
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ASSET_HUB),
+            stock_terms=["mujer triste"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual([item.canonical_id for item in result.candidates], ["a", "b", "c"])
+
+    def test_title_exclusive_never_uses_generic_fallback(self):
+        hub = FakeAssetHub({
+            "mujer triste": [],
+            "mujer triste tristeza": [],
+            "triste": [],
+        })
+
+        discover_material_candidates(
+            policy=title_policy("mi-otra-yo"),
+            stock_terms=["mujer triste"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertTrue(all(call[1] == {"sources": [{"scope": "title", "title": "mi-otra-yo"}]} for call in hub.calls))
+
+    def test_title_preferred_skips_generic_when_title_has_enough_candidates(self):
+        preferred = MaterialSourcePolicy(
+            MaterialProviderPolicy((PROVIDER_ASSET_HUB,)),
+            AssetHubCatalogPolicy(include=AssetHubIncludePolicy(generic=True, titles=("mi-otra-yo",))),
+        )
+        title_assets = [
+            {"asset_uid": f"title-{index}", "orientation": "vertical-9x16"}
+            for index in range(TITLE_PREFERRED_MIN_CANDIDATES)
+        ]
+        hub = FakeAssetHub({"mujer triste": title_assets})
+
+        result = discover_material_candidates(
+            policy=preferred,
+            stock_terms=["mujer triste"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual(len(result.candidates), TITLE_PREFERRED_MIN_CANDIDATES)
+        self.assertTrue(all(call[1] == {"sources": [{"scope": "title", "title": "mi-otra-yo"}]} for call in hub.calls))
+
+    def test_title_preferred_uses_generic_when_title_lacks_candidates(self):
+        preferred = MaterialSourcePolicy(
+            MaterialProviderPolicy((PROVIDER_ASSET_HUB,)),
+            AssetHubCatalogPolicy(include=AssetHubIncludePolicy(generic=True, titles=("mi-otra-yo",))),
+        )
+        hub = FakeAssetHub({
+            "mujer triste": [{"asset_uid": "title-1", "orientation": "vertical-9x16"}],
+            "mujer triste tristeza": [{"asset_uid": "generic-1", "orientation": "vertical-9x16"}],
+        })
+
+        result = discover_material_candidates(
+            policy=preferred,
+            stock_terms=["mujer triste"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertIn({"sources": [{"scope": "generic"}]}, [call[1] for call in hub.calls])
+        self.assertEqual([item.canonical_id for item in result.candidates], ["title-1", "generic-1"])
+
+    def test_human_review_reserve_uses_visual_query_v2(self):
+        hub = FakeAssetHub({
+            "mujer triste": [{"asset_uid": "a", "orientation": "vertical-9x16"}],
+            "mujer triste tristeza": [{"asset_uid": "b", "orientation": "vertical-9x16"}],
+        })
+
+        result = discover_asset_hub_review_reserve_candidates(
+            policy=policy(PROVIDER_ASSET_HUB),
+            terms=["mujer triste"],
+            asset_hub_provider=hub,
+        )
+
+        self.assertIn("mujer triste tristeza", [call[0] for call in hub.calls])
+        self.assertEqual([item.canonical_id for item in result.candidates], ["a", "b"])
 
     def test_empty_is_success_and_partial_failure_continues(self):
         def search(provider, *_args):

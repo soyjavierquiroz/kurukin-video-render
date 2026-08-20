@@ -20,10 +20,13 @@ def discovery(*items):
 
 class TestMaterialSelection(unittest.TestCase):
     def test_orientation_priorities(self):
+        vertical_4x5 = candidate("v45", orientation="vertical-4x5")
         vertical = candidate("v", orientation="vertical-9x16")
         square = candidate("s", orientation="square")
         horizontal = candidate("h", orientation="horizontal-16x9")
+        self.assertGreater(orientation_score(vertical_4x5, "9:16"), orientation_score(vertical, "9:16"))
         self.assertGreater(orientation_score(vertical, "9:16"), orientation_score(square, "9:16"))
+        self.assertGreater(orientation_score(vertical, "9:16"), orientation_score(horizontal, "9:16"))
         self.assertGreater(orientation_score(horizontal, "16:9"), orientation_score(vertical, "16:9"))
 
     def test_orientation_hard_filter_accepts_matching_vertical_geometry(self):
@@ -110,6 +113,37 @@ class TestMaterialSelection(unittest.TestCase):
             [d.candidate.search_term for d in result.decisions],
             ["pareja discutiendo", "niño solo", "mujer laptop"],
         )
+
+    def test_vertical_is_preferred_but_horizontal_remains_available(self):
+        items = (
+            candidate("h", rank=1, orientation="horizontal-16x9", duration=5),
+            candidate("v9", rank=1, orientation="vertical-9x16", duration=5),
+            candidate("v45", rank=1, orientation="vertical-4x5", duration=5),
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(*items),
+            video_aspect="9:16",
+            target_duration=15,
+            clip_duration=5,
+        )
+
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["v45", "v9", "h"])
+
+    def test_sufficient_duration_is_preferred_without_dropping_short_clip(self):
+        items = (
+            candidate("short", rank=1, width=1080, height=1920, duration=1),
+            candidate("long", rank=1, width=1080, height=1920, duration=5),
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(*items),
+            video_aspect="9:16",
+            target_duration=10,
+            clip_duration=5,
+        )
+
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["long", "short"])
 
 
 if __name__ == "__main__": unittest.main()

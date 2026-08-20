@@ -71,6 +71,24 @@ class KurukinAssetHubTests(unittest.TestCase):
         body = provider.session.calls[0]["json"]
         self.assertEqual(body["source_policy"], {"sources": [{"scope": "generic"}]})
 
+    def test_search_post_omits_unsupported_filter_fields(self):
+        provider = make_provider([FakeResponse(200, {"assets": []})])
+
+        provider.search(
+            query="woman",
+            limit=20,
+            source_policy={"sources": [{"scope": "generic"}]},
+        )
+
+        body = provider.session.calls[0]["json"]
+        self.assertEqual(set(body), {"query", "limit", "source_policy"})
+        for unsupported in (
+            "orientation", "duration", "min_duration", "max_duration",
+            "media_type", "people_count", "editorial_status", "quality",
+            "title_preferred",
+        ):
+            self.assertNotIn(unsupported, body)
+
     def test_search_without_source_policy_defaults_to_generic_only(self):
         provider = make_provider([FakeResponse(200, {"assets": []})])
 

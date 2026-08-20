@@ -85,7 +85,10 @@ def _positive_number(value: Any) -> float | None:
 
 
 def _is_orientation_compatible(candidate: Any, video_aspect: str) -> bool:
-    """Strictly match portrait/landscape targets using geometry first."""
+    """Return whether candidate orientation is a direct target match.
+
+    Selection uses this as a preference signal, not as a destructive filter.
+    """
     target = _target_orientation(video_aspect)
     if target is None:
         return True
@@ -108,17 +111,24 @@ def orientation_score(candidate: Any, video_aspect: str) -> int:
     orientation = str(getattr(candidate, "orientation", "") or "").lower()
     width, height = getattr(candidate, "width", None), getattr(candidate, "height", None)
     if not orientation and isinstance(width, (int, float)) and isinstance(height, (int, float)):
-        orientation = "portrait" if height > width else "landscape" if width > height else "square"
+        ratio = (float(width) / float(height)) if height else 0
+        if height > width:
+            orientation = "vertical-4x5" if 0.74 <= ratio <= 0.86 else "vertical-9x16"
+        elif width > height:
+            orientation = "horizontal-16x9"
+        else:
+            orientation = "square"
     aspect = _aspect_text(video_aspect).replace(" ", "").lower()
     normalized = orientation.replace("x", ":")
     square = "square" in orientation or normalized == "1:1"
     portrait = any(value in orientation for value in ("portrait", "vertical", "9:16", "4:5"))
     landscape = any(value in orientation for value in ("landscape", "horizontal", "16:9"))
     if aspect in {"9:16", "vertical", "portrait"}:
-        if "9:16" in normalized or portrait and "4:5" not in normalized: return 40
-        if "4:5" in normalized: return 32
+        if "4:5" in normalized: return 44
+        if "9:16" in normalized: return 40
+        if portrait: return 34
         if square: return 18
-        if landscape: return 4
+        if landscape: return 12
     elif aspect in {"16:9", "horizontal", "landscape"}:
         if "16:9" in normalized or landscape: return 40
         if square: return 18
@@ -174,7 +184,6 @@ def select_material_candidates(*, discovery_result: Any, video_aspect: str, targ
     recent, seen, decisions, providers = set(options.recent_dedupe_keys), set(), [], []
     candidates = [
         item for item in (getattr(discovery_result, "candidates", ()) or ())
-        if _is_orientation_compatible(item, options.video_aspect)
     ]
     candidate_layers = (
         [item for item in candidates if not _is_low_priority_fallback(item)],
