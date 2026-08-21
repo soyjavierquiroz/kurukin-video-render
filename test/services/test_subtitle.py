@@ -279,9 +279,11 @@ class TestSubtitleService(unittest.TestCase):
 
         self.assertEqual(report["status"], "ok")
         self.assertEqual(_content_text(items), "First line. Second line.")
-        self.assertEqual(items[0][1], "00:00:00,000 --> 00:00:04,000")
+        self.assertEqual([item[2] for item in items], ["First line.", "Second line."])
+        self.assertEqual(items[0][1], "00:00:00,000 --> 00:00:02,000")
+        self.assertEqual(items[1][1], "00:00:02,000 --> 00:00:04,000")
 
-    def test_semantic_srt_never_outputs_more_than_two_lines_per_cue(self):
+    def test_semantic_srt_never_outputs_internal_newlines(self):
         text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
         whisper = "La fortaleza que un dia te protegio no tiene que convertirse en la prision donde vivas para siempre"
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -292,7 +294,8 @@ class TestSubtitleService(unittest.TestCase):
             items = subtitle.file_to_subtitles(str(subtitle_file))
 
         self.assertTrue(items)
-        self.assertTrue(all(len(item[2].splitlines()) <= 2 for item in items))
+        self.assertTrue(all("\n" not in item[2] for item in items))
+        self.assertEqual(_content_text(items), text)
 
     def test_semantic_short_text_stays_one_cue(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -305,7 +308,7 @@ class TestSubtitleService(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0][2], "Hola mundo.")
 
-    def test_semantic_two_short_sentences_use_natural_line_break(self):
+    def test_semantic_two_short_sentences_use_natural_cue_boundary(self):
         text = "Por eso descansar te da culpa. Recibir te incomoda."
         whisper = "Por eso descansar te da culpa Recibir te incomoda"
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -315,10 +318,14 @@ class TestSubtitleService(unittest.TestCase):
             subtitle.correct(str(subtitle_file), text)
             items = subtitle.file_to_subtitles(str(subtitle_file))
 
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0][2], "Por eso descansar te da culpa.\nRecibir te incomoda.")
+        self.assertEqual(
+            [item[2] for item in items],
+            ["Por eso descansar te da culpa.", "Recibir te incomoda."],
+        )
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all("\n" not in item[2] for item in items))
 
-    def test_semantic_long_text_creates_multiple_cues_instead_of_three_lines(self):
+    def test_semantic_long_text_creates_multiple_plain_text_cues(self):
         text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
         whisper = "La fortaleza que un dia te protegio no tiene que convertirse en la prision donde vivas para siempre"
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -329,8 +336,31 @@ class TestSubtitleService(unittest.TestCase):
             items = subtitle.file_to_subtitles(str(subtitle_file))
 
         self.assertGreater(len(items), 1)
-        self.assertTrue(all(len(item[2].splitlines()) <= 2 for item in items))
+        self.assertTrue(all("\n" not in item[2] for item in items))
         self.assertEqual(_content_text(items), text)
+        self.assertTrue(all(len(item[2]) <= 56 for item in items))
+
+    def test_semantic_long_sentence_splits_without_changing_text(self):
+        text = "¿Te cuesta decir lo que sientes sin preparar antes un discurso completo?"
+        whisper = "Te cuesta decir lo que sientes sin preparar antes un discurso completo"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(
+            [item[2] for item in items],
+            [
+                "¿Te cuesta decir lo que sientes",
+                "sin preparar antes un discurso completo?",
+            ],
+        )
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all("\n" not in item[2] for item in items))
+        self.assertEqual(items[0][1], "00:00:00,000 --> 00:00:03,000")
+        self.assertEqual(items[1][1], "00:00:03,000 --> 00:00:06,000")
 
     def test_semantic_cue_timings_use_first_and_last_aligned_tokens(self):
         text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
@@ -343,7 +373,7 @@ class TestSubtitleService(unittest.TestCase):
             items = subtitle.file_to_subtitles(str(subtitle_file))
 
         self.assertEqual(items[0][1].split(" --> ")[0], "00:00:00,000")
-        first_words = " ".join(items[0][2].splitlines()).split()
+        first_words = items[0][2].split()
         expected_end = _srt_time(len(first_words) * 0.5)
         self.assertEqual(items[0][1].split(" --> ")[1], expected_end)
 
@@ -364,9 +394,9 @@ class TestSubtitleService(unittest.TestCase):
             self.assertGreater(end, start)
             previous_end = end
 
-    def test_semantic_wrap_avoids_function_word_orphan_when_possible(self):
-        text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
-        whisper = "La fortaleza que un dia te protegio no tiene que convertirse en la prision donde vivas para siempre"
+    def test_semantic_cues_avoid_single_word_segments_when_possible(self):
+        text = "Que pedir algo era molestar. Entonces comenzaste a observar antes de hablar."
+        whisper = "Que pedir algo era molestar Entonces comenzaste a observar antes de hablar"
         with tempfile.TemporaryDirectory() as tmp_dir:
             subtitle_file = Path(tmp_dir) / "subtitle.srt"
             _write_word_timed_srt(subtitle_file, whisper)
@@ -374,17 +404,17 @@ class TestSubtitleService(unittest.TestCase):
             subtitle.correct(str(subtitle_file), text)
             items = subtitle.file_to_subtitles(str(subtitle_file))
 
+        self.assertEqual(
+            [item[2] for item in items],
+            [
+                "Que pedir algo era molestar.",
+                "Entonces comenzaste a observar antes de hablar.",
+            ],
+        )
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all("\n" not in item[2] for item in items))
         for item in items:
-            lines = item[2].splitlines()
-            if len(lines) == 2:
-                self.assertNotIn(
-                    lines[0].split()[-1].lower().strip(".,;:!?"),
-                    subtitle.SEMANTIC_ORPHAN_WORDS,
-                )
-                self.assertNotIn(
-                    lines[1].split()[0].lower().strip(".,;:!?"),
-                    subtitle.SEMANTIC_ORPHAN_WORDS,
-                )
+            self.assertGreater(len(item[2].split()), 1)
 
     def test_semantic_compound_token_alignment_still_passes(self):
         original_srt = _srt_block(
