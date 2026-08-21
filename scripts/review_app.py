@@ -60,6 +60,24 @@ def show_flip_checkbox(plan_file: Path, segment_id: str, asset: dict, key: str) 
             st.rerun()
 
 
+def _asset_duration(asset: dict) -> float:
+    metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
+    return float(metadata.get("duration") or 0)
+
+
+def _reorder_backup(plan_file: Path, segment_id: str, backups: list[dict], index: int, delta: int) -> None:
+    target = index + delta
+    if target < 0 or target >= len(backups):
+        return
+    ordered = list(backups)
+    ordered[index], ordered[target] = ordered[target], ordered[index]
+    human_review.reorder_segment_backups(
+        plan_file,
+        segment_id,
+        [str(item.get("asset_uid") or "") for item in ordered],
+    )
+
+
 def script_preview(text: object, limit: int = 420) -> str:
     value = " ".join(str(text or "").split())
     if len(value) <= limit:
@@ -255,6 +273,16 @@ def main() -> None:
             )
         )
 
+        segment_metrics = segment.get("coverage") if isinstance(segment.get("coverage"), dict) else {}
+        target_duration = float(segment_metrics.get("target_duration") or target)
+        covered_duration = float(segment_metrics.get("covered_duration") or (target - scene_gap))
+        missing_duration = float(segment_metrics.get("missing_duration") or scene_gap)
+
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("target_duration", f"{target_duration:.2f}s")
+        metric_cols[1].metric("covered_duration", f"{covered_duration:.2f}s")
+        metric_cols[2].metric("missing_duration", f"{missing_duration:.2f}s")
+
         if scene_gap > 0.01:
             st.warning(
                 f"Scene coverage "
@@ -334,20 +362,9 @@ def main() -> None:
                 f"{segment_id}-selected",
             )
 
-            metadata = (
-                selected.get("metadata")
-                if isinstance(
-                    selected.get(
-                        "metadata"
-                    ),
-                    dict,
-                )
-                else {}
-            )
-
             st.caption(
                 "source duration "
-                f"{float(metadata.get('duration') or 0):.2f}s"
+                f"{_asset_duration(selected):.2f}s"
             )
 
         for index, alternative in enumerate(
@@ -362,23 +379,7 @@ def main() -> None:
                     or ""
                 )
 
-                metadata = (
-                    alternative.get(
-                        "metadata"
-                    )
-                    if isinstance(
-                        alternative.get(
-                            "metadata"
-                        ),
-                        dict,
-                    )
-                    else {}
-                )
-
-                duration = float(
-                    metadata.get("duration")
-                    or 0
-                )
+                duration = _asset_duration(alternative)
 
                 is_backup = (
                     uid in backup_uids
@@ -473,13 +474,9 @@ def main() -> None:
                         )
                         st.rerun()
 
-                elif (
-                    scene_gap > 0.01
-                    and duration
-                    >= human_review.MIN_BACKUP_OUTPUT_SECONDS
-                ):
+                elif duration >= human_review.MIN_BACKUP_OUTPUT_SECONDS:
                     if st.button(
-                        "ADD BACKUP",
+                        "Add as BACKUP",
                         key=(
                             f"backup-add-"
                             f"{segment_id}-"
@@ -498,16 +495,46 @@ def main() -> None:
                         else:
                             st.rerun()
 
-                elif scene_gap <= 0.01:
-                    st.caption(
-                        "Covered by PRIMARY / slowdown"
-                    )
-
                 else:
                     st.caption(
                         "Too short for backup use"
                     )
 
+        if backups:
+            st.markdown("**BACKUPS timeline order**")
+            for backup_index, backup in enumerate(backups):
+                uid = str(backup.get("asset_uid") or "")
+                row = st.columns([0.9, 2.7, 1.1, 1.1, 1.5, 1.5])
+                row[0].write(f"{backup_index + 1}")
+                row[1].caption(f"{uid} · {_asset_duration(backup):.2f}s")
+                if row[2].button("UP", key=f"backup-up-{segment_id}-{uid}", disabled=backup_index == 0):
+                    try:
+                        _reorder_backup(plan_file, segment_id, backups, backup_index, -1)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.rerun()
+                if row[3].button("DOWN", key=f"backup-down-{segment_id}-{uid}", disabled=backup_index == len(backups) - 1):
+                    try:
+                        _reorder_backup(plan_file, segment_id, backups, backup_index, 1)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.rerun()
+                if row[4].button("PROMOTE", key=f"backup-promote-{segment_id}-{uid}"):
+                    try:
+                        human_review.promote_segment_backup(plan_file, segment_id, uid)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.rerun()
+                if row[5].button("REMOVE", key=f"backup-list-remove-{segment_id}-{uid}"):
+                    try:
+                        human_review.set_segment_backup(plan_file, segment_id, uid, False)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.rerun()
 
     st.divider()
 

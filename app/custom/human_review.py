@@ -18,7 +18,10 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from app.custom.asset_search_v2 import build_visual_queries_v2
+from app.custom.asset_search_v2 import (
+    build_visual_queries_v2,
+    normalize_editorial_profile,
+)
 from app.custom.material_discovery import MaterialCandidate
 from app.custom.material_selection import MaterialSelectionDecision
 from app.models.schema import MaterialInfo
@@ -49,6 +52,29 @@ PREVIEW_KEYS = (
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 FLIP_HORIZONTAL_DEFAULT = True
+GENDER_TEXT_FIELDS = (
+    "asset_uid",
+    "canonical_id",
+    "dedupe_key",
+    "filename",
+    "title",
+    "name",
+    "description",
+    "alt",
+    "search_term",
+    "term",
+    "query",
+)
+FEMININE_SIGNALS = {
+    "ella", "ellas", "femenina", "femenino", "hermana", "hija", "joven",
+    "madre", "mama", "mamá", "mujer", "mujeres", "nina", "niña", "senora",
+    "señora", "woman", "women", "girl", "mother", "sister", "daughter",
+}
+MASCULINE_SIGNALS = {
+    "ellos", "masculina", "masculino", "hermano", "hijo", "hombre",
+    "hombres", "nino", "niño", "padre", "papa", "papá", "senor", "señor",
+    "man", "men", "boy", "father", "brother", "son",
+}
 
 
 def utc_timestamp() -> str:
@@ -119,6 +145,73 @@ def _safe_metadata(candidate: Any) -> dict[str, Any]:
     }
 
 
+def _fold_text(text: Any) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        utils.normalize_script_for_subtitle_matching(str(text or "")),
+    ).strip().lower()
+
+
+def _asset_gender_text(asset: Any) -> str:
+    values: list[str] = []
+
+    def add_mapping(mapping: Mapping[str, Any]) -> None:
+        for key in GENDER_TEXT_FIELDS:
+            value = mapping.get(key)
+            if value not in (None, ""):
+                values.append(str(value))
+
+    if isinstance(asset, Mapping):
+        add_mapping(asset)
+        metadata = asset.get("metadata")
+        if isinstance(metadata, Mapping):
+            add_mapping(metadata)
+        search = asset.get("search")
+        if isinstance(search, Mapping):
+            add_mapping(search)
+    else:
+        for key in GENDER_TEXT_FIELDS:
+            value = getattr(asset, key, None)
+            if value not in (None, ""):
+                values.append(str(value))
+        source_info = getattr(asset, "source_info", None)
+        if isinstance(source_info, Mapping):
+            add_mapping(source_info)
+
+    return _fold_text(" ".join(values))
+
+
+def _asset_gender_score(asset: Any) -> int:
+    tokens = set(re.findall(r"[\w]+", _asset_gender_text(asset), flags=re.UNICODE))
+    feminine = len(tokens & {_fold_text(item) for item in FEMININE_SIGNALS})
+    masculine = len(tokens & {_fold_text(item) for item in MASCULINE_SIGNALS})
+    return feminine - masculine
+
+
+def _candidate_matches_editorial_profile(
+    candidate: Any,
+    editorial_profile: Mapping[str, Any] | None,
+) -> bool:
+    # Until Asset Hub exposes audited structured subject metadata, gender is
+    # preference-only. Free-text metadata can boost ranking, but must not hide
+    # otherwise valid candidates from Human Review.
+    return True
+
+
+def _editorial_rank_adjustment(
+    candidate: Any,
+    editorial_profile: Mapping[str, Any] | None,
+) -> int:
+    subject_gender = normalize_editorial_profile(editorial_profile).get("subject_gender")
+    score = _asset_gender_score(candidate)
+    if subject_gender == "feminine":
+        return score
+    if subject_gender == "masculine":
+        return -score
+    return 0
+
+
 def candidate_uid(candidate: Any) -> str:
     return str(getattr(candidate, "canonical_id", "") or getattr(candidate, "dedupe_key", "") or "")
 
@@ -177,6 +270,7 @@ def _ranked_segment_candidates(
     candidate: Any,
     all_candidates: list[Any],
     preferred_terms: list[str] | tuple[str, ...] | None = None,
+    editorial_profile: Mapping[str, Any] | None = None,
 ) -> list[Any]:
     """
     Rank candidates for one scene.
@@ -257,12 +351,27 @@ def _ranked_segment_candidates(
         and item not in preferred_matches
     ]
 
-    return _unique_candidates_by_uid(
+    ranked = _unique_candidates_by_uid(
         preferred_matches
         + [candidate]
         + same_term
         + remaining
     )
+    indexed = list(enumerate(ranked))
+    indexed.sort(
+        key=lambda item: (
+            -_editorial_rank_adjustment(item[1], editorial_profile),
+            item[0],
+        )
+    )
+    return [item for _index, item in indexed]
+
+
+def _visible_editorial_candidates(
+    candidates: list[Any],
+    editorial_profile: Mapping[str, Any] | None,
+) -> list[Any]:
+    return candidates
 
 
 def _select_segment_candidate(ranked_candidates: list[Any], used_selected_asset_uids: set[str]) -> tuple[Any, bool]:
@@ -358,7 +467,7 @@ def set_asset_flip_horizontal(
     if not changed:
         raise ValueError(f"asset {asset_uid} is not available for {segment_id}")
 
-    plan["coverage"] = coverage_summary(plan)
+    refresh_plan_coverage(plan)
     plan["updated_at"] = utc_timestamp()
     write_json_atomic(plan_file, plan)
     return plan
@@ -376,7 +485,7 @@ def set_all_visible_flip_horizontal(
     for _segment_id, asset in _iter_visible_editable_assets(plan):
         asset["flip_horizontal"] = bool(enabled)
 
-    plan["coverage"] = coverage_summary(plan)
+    refresh_plan_coverage(plan)
     plan["updated_at"] = utc_timestamp()
     write_json_atomic(plan_file, plan)
     return plan
@@ -476,16 +585,31 @@ def coverage_summary(
     slowdown, backup usage or scene duration.
     """
 
-    timeline = render_timeline_from_plan(
-        plan
-    )
-
     try:
         audio_duration = float(
             plan.get("duration") or 0
         )
     except (TypeError, ValueError):
         audio_duration = 0.0
+    try:
+        timeline = render_timeline_from_plan(
+            plan
+        )
+    except ValueError:
+        required_duration = max(0.0, audio_duration + 0.10)
+        return {
+            "audio_duration": round(audio_duration, 3),
+            "target_duration": round(required_duration, 3),
+            "required_duration": round(required_duration, 3),
+            "primary_duration": 0.0,
+            "backup_duration": 0.0,
+            "slowdown_gain": 0.0,
+            "approved_duration": 0.0,
+            "covered_duration": 0.0,
+            "missing_duration": round(required_duration, 3),
+            "deficit": round(required_duration, 3),
+            "coverage_ratio": 0.0,
+        }
 
     primary_duration = sum(
         float(piece["output_duration"])
@@ -541,6 +665,10 @@ def coverage_summary(
             audio_duration,
             3,
         ),
+        "target_duration": round(
+            required_duration,
+            3,
+        ),
         "required_duration": round(
             required_duration,
             3,
@@ -561,6 +689,14 @@ def coverage_summary(
             approved_duration,
             3,
         ),
+        "covered_duration": round(
+            approved_duration,
+            3,
+        ),
+        "missing_duration": round(
+            deficit,
+            3,
+        ),
         "deficit": round(
             deficit,
             3,
@@ -570,6 +706,74 @@ def coverage_summary(
             4,
         ),
     }
+
+
+def segment_coverage_metrics(plan: Mapping[str, Any]) -> dict[str, dict[str, float]]:
+    try:
+        timeline = render_timeline_from_plan(plan)
+    except ValueError:
+        timeline = SimpleNamespace(pieces=(), segment_shortfalls=())
+    segments = [
+        segment
+        for segment in (plan.get("segments") or [])
+        if isinstance(segment, Mapping)
+    ]
+    shortfalls = {
+        str(item["segment_id"]): float(item["shortfall"])
+        for item in timeline.segment_shortfalls
+    }
+    covered: dict[str, float] = {}
+    for piece in timeline.pieces:
+        segment_id = str(piece["segment_id"])
+        covered[segment_id] = covered.get(segment_id, 0.0) + float(
+            piece["output_duration"]
+        )
+
+    metrics: dict[str, dict[str, float]] = {}
+    for index, segment in enumerate(segments):
+        segment_id = str(segment.get("segment_id") or f"segment-{index + 1:03d}")
+        try:
+            target = float(segment.get("duration") or 0)
+        except (TypeError, ValueError):
+            target = 0.0
+        if index == len(segments) - 1:
+            target += 0.10
+        missing = max(0.0, float(shortfalls.get(segment_id, 0.0)))
+        scene_covered = max(0.0, float(covered.get(segment_id, 0.0)))
+        metrics[segment_id] = {
+            "target_duration": round(target, 3),
+            "covered_duration": round(scene_covered, 3),
+            "missing_duration": round(missing, 3),
+        }
+    if "timeline-tail" in shortfalls:
+        metrics["timeline-tail"] = {
+            "target_duration": round(float(shortfalls["timeline-tail"]), 3),
+            "covered_duration": 0.0,
+            "missing_duration": round(float(shortfalls["timeline-tail"]), 3),
+        }
+    return metrics
+
+
+def apply_segment_coverage_metrics(plan: dict[str, Any]) -> dict[str, Any]:
+    metrics = segment_coverage_metrics(plan)
+    for index, segment in enumerate(plan.get("segments") or []):
+        if not isinstance(segment, dict):
+            continue
+        segment_id = str(segment.get("segment_id") or f"segment-{index + 1:03d}")
+        segment["coverage"] = metrics.get(
+            segment_id,
+            {
+                "target_duration": 0.0,
+                "covered_duration": 0.0,
+                "missing_duration": 0.0,
+            },
+        )
+    return plan
+
+
+def refresh_plan_coverage(plan: dict[str, Any]) -> dict[str, Any]:
+    plan["coverage"] = coverage_summary(plan)
+    return apply_segment_coverage_metrics(plan)
 
 
 def validate_plan_for_approval(
@@ -735,11 +939,79 @@ def set_segment_backup(
     if not changed:
         raise ValueError(f"segment not found: {segment_id}")
 
-    plan["coverage"] = coverage_summary(plan)
+    refresh_plan_coverage(plan)
     plan["updated_at"] = utc_timestamp()
 
     write_json_atomic(plan_file, plan)
     return plan
+
+
+def reorder_segment_backups(
+    plan_file: Path,
+    segment_id: str,
+    ordered_asset_uids: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    plan = normalize_plan_editorial_fields(read_json(plan_file))
+
+    if plan.get("review_status") == STATUS_APPROVED:
+        raise ValueError("approved production plans are frozen")
+
+    ordered = [str(uid or "").strip() for uid in ordered_asset_uids if str(uid or "").strip()]
+    changed = False
+
+    for segment in plan.get("segments") or []:
+        if segment.get("segment_id") != segment_id:
+            continue
+
+        backups = _unique_assets_by_uid(list(segment.get("backup_assets") or []))
+        by_uid = {_asset_uid_value(asset): asset for asset in backups}
+        unknown = [uid for uid in ordered if uid not in by_uid]
+        if unknown:
+            raise ValueError(
+                f"backup asset is not available for {segment_id}: {unknown[0]}"
+            )
+
+        seen: set[str] = set()
+        reordered = []
+        for uid in ordered:
+            if uid in seen:
+                continue
+            reordered.append(by_uid[uid])
+            seen.add(uid)
+        for asset in backups:
+            uid = _asset_uid_value(asset)
+            if uid not in seen:
+                reordered.append(asset)
+
+        segment["backup_assets"] = reordered
+        changed = True
+        break
+
+    if not changed:
+        raise ValueError(f"segment not found: {segment_id}")
+
+    refresh_plan_coverage(plan)
+    plan["updated_at"] = utc_timestamp()
+    write_json_atomic(plan_file, plan)
+    return plan
+
+
+def promote_segment_backup(
+    plan_file: Path,
+    segment_id: str,
+    asset_uid: str,
+) -> dict[str, Any]:
+    plan = read_json(plan_file)
+    for segment in plan.get("segments") or []:
+        if not isinstance(segment, Mapping) or segment.get("segment_id") != segment_id:
+            continue
+        if any(
+            _asset_uid_value(asset) == asset_uid
+            for asset in segment.get("backup_assets") or []
+        ):
+            return replace_segment_asset(plan_file, segment_id, asset_uid)
+        raise ValueError(f"asset {asset_uid} is not a BACKUP for {segment_id}")
+    raise ValueError(f"segment not found: {segment_id}")
 
 
 def _project_relative_path(path: Path) -> str:
@@ -1681,11 +1953,16 @@ def visual_queries_for_review_segments(
     script_text: str,
     segment_count: int,
     existing_terms: list[str] | tuple[str, ...] | None = None,
+    editorial_profile: Mapping[str, Any] | None = None,
 ) -> list[tuple[str, ...]]:
     """Build scene-scoped Asset Search V2 queries for Human Review."""
     fragments = split_script_for_segments(script_text, segment_count)
     return [
-        build_visual_queries_v2(fragment, existing_terms or ())
+        build_visual_queries_v2(
+            fragment,
+            existing_terms or (),
+            editorial_profile=editorial_profile,
+        )
         for fragment in fragments
     ]
 
@@ -1701,6 +1978,7 @@ def build_plan(
     duration: float,
     aspect_ratio: str,
     visual_style: str,
+    editorial_profile: Mapping[str, Any] | None = None,
     selection_result: Any,
     discovery_result: Any,
     output_path: Path,
@@ -1713,11 +1991,13 @@ def build_plan(
     all_candidates = list(getattr(discovery_result, "candidates", ()) or [])
     selected_decisions = list(getattr(selection_result, "decisions", ()) or [])
     clip_duration = float(getattr(getattr(selection_result, "options", None), "clip_duration", 5) or 5)
+    editorial_profile = normalize_editorial_profile(editorial_profile)
     script_fragments = split_script_for_segments(script_text, len(selected_decisions))
     segment_queries = visual_queries_for_review_segments(
         script_text,
         len(selected_decisions),
         tuple(getattr(selection_result, "search_terms", ()) or ()),
+        editorial_profile,
     )
     review_inputs = [
         (
@@ -1750,10 +2030,16 @@ def build_plan(
             original_candidate,
             all_candidates,
             queries,
+            editorial_profile,
+        )
+
+        visible_ranked_candidates = _visible_editorial_candidates(
+            ranked_candidates,
+            editorial_profile,
         )
 
         candidate, forced_repeat = _select_segment_candidate(
-            ranked_candidates,
+            visible_ranked_candidates,
             used_selected_asset_uids,
         )
 
@@ -1768,7 +2054,7 @@ def build_plan(
                 _script_fragment,
                 queries,
                 original_candidate,
-                ranked_candidates,
+                visible_ranked_candidates,
                 candidate,
                 forced_repeat,
             )
@@ -2073,6 +2359,7 @@ def build_plan(
         "duration": duration,
         "aspect_ratio": aspect_ratio,
         "visual_style": visual_style,
+        "editorial_profile": editorial_profile,
         "review_required": True,
         "review_status": STATUS_PENDING,
         "created_at": existing.get("created_at") or utc_timestamp(),
@@ -2080,7 +2367,7 @@ def build_plan(
         "segments": segments,
         "warnings": collect_warnings(segments, aspect_ratio),
     }
-    plan["coverage"] = coverage_summary(plan)
+    refresh_plan_coverage(plan)
     write_json_atomic(output_path, plan)
     return plan
 
@@ -2219,7 +2506,7 @@ def replace_segment_asset(
     if not changed:
         raise ValueError(f"segment not found: {segment_id}")
 
-    plan["coverage"] = coverage_summary(plan)
+    refresh_plan_coverage(plan)
     plan["updated_at"] = utc_timestamp()
 
     write_json_atomic(plan_file, plan)
@@ -2255,6 +2542,7 @@ def approve_plan(
 
     plan["schema_version"] = SCHEMA_VERSION
     plan["coverage"] = coverage
+    apply_segment_coverage_metrics(plan)
     plan["review_status"] = STATUS_APPROVED
     plan["review_required"] = False
     plan["reviewed_at"] = utc_timestamp()

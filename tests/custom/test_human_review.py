@@ -193,6 +193,97 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertIn("persona culpa agotamiento", segment["search_terms"])
         self.assertNotEqual(segment["search_terms"], ["niña sola"])
 
+    def test_feminine_editorial_profile_boosts_without_hard_filtering(self):
+        masculine = candidate(
+            "asset-man",
+            term="hombre tristeza",
+            source_info={"filename": "hombre_triste.mp4"},
+        )
+        feminine = candidate(
+            "asset-woman",
+            term="mujer tristeza",
+            source_info={"filename": "mujer_triste.mp4"},
+        )
+        girl = candidate(
+            "asset-girl",
+            term="niña vulnerable",
+            source_info={"filename": "nina_vulnerable.mp4"},
+        )
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="Ella necesitaba construir una vida propia.",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            editorial_profile={"subject_gender": "feminine"},
+            selection_result=selection([masculine]),
+            discovery_result=SimpleNamespace(candidates=(masculine, feminine, girl)),
+            output_path=plan_file,
+        )
+
+        segment = plan["segments"][0]
+        visible_uids = [segment["selected_asset"]["asset_uid"]] + [
+            item["asset_uid"] for item in segment["alternatives"]
+        ]
+        self.assertEqual(plan["editorial_profile"], {"subject_gender": "feminine"})
+        self.assertEqual(segment["selected_asset"]["asset_uid"], "asset-woman")
+        self.assertIn("asset-man", visible_uids)
+        self.assertTrue(any("mujer" in term or "niña" in term for term in segment["search_terms"]))
+
+    def test_segment_backup_reorder_and_promote_updates_plan(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="script",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([candidate("asset-1", source_info={"duration": 2})]),
+            discovery_result=SimpleNamespace(
+                candidates=(
+                    candidate("asset-1", source_info={"duration": 2}),
+                    candidate("asset-2"),
+                    candidate("asset-3"),
+                )
+            ),
+            output_path=plan_file,
+        )
+
+        human_review.set_segment_backup(plan_file, "segment-001", "asset-2", True)
+        plan = human_review.set_segment_backup(plan_file, "segment-001", "asset-3", True)
+        self.assertEqual(
+            [item["asset_uid"] for item in plan["segments"][0]["backup_assets"]],
+            ["asset-2", "asset-3"],
+        )
+
+        plan = human_review.reorder_segment_backups(
+            plan_file,
+            "segment-001",
+            ["asset-3", "asset-2"],
+        )
+        self.assertEqual(
+            [item["asset_uid"] for item in plan["segments"][0]["backup_assets"]],
+            ["asset-3", "asset-2"],
+        )
+        self.assertIn("target_duration", plan["segments"][0]["coverage"])
+
+        plan = human_review.promote_segment_backup(plan_file, "segment-001", "asset-3")
+        self.assertEqual(plan["segments"][0]["selected_asset"]["asset_uid"], "asset-3")
+        self.assertNotIn(
+            "asset-3",
+            [item["asset_uid"] for item in plan["segments"][0]["backup_assets"]],
+        )
+
     def test_empty_trailing_script_segment_is_not_selected(self):
         assets = [candidate(f"asset-{index}") for index in range(3)]
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
@@ -307,7 +398,7 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(second["selected_asset"]["asset_uid"], "asset-b")
         self.assertEqual(
             [item["asset_uid"] for item in second["alternatives"]],
-            ["asset-c", "asset-d", "asset-a"],
+            ["asset-d"],
         )
 
     def test_script_fragments_are_contiguous_and_not_full_script(self):
@@ -887,9 +978,22 @@ class TestHumanReviewPlan(unittest.TestCase):
                 "batch_id": "batch",
                 "stem": "story",
                 "task_id": "task-1",
+                "duration": 5,
                 "review_status": human_review.STATUS_PENDING,
                 "visual_style": "none",
-                "segments": [],
+                "segments": [
+                    {
+                        "segment_id": "segment-001",
+                        "duration": 5,
+                        "selected_asset": {
+                            "asset_uid": "asset-1",
+                            "canonical_id": "asset-1",
+                            "dedupe_key": "asset-1",
+                            "metadata": {"duration": 5},
+                        },
+                        "backup_assets": [],
+                    }
+                ],
             },
         )
 

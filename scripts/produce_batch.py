@@ -311,6 +311,7 @@ def make_manifest(
     *,
     production_plan_path: Path | None = None,
     visual_style: str = VISUAL_STYLE_NONE,
+    subject_gender: str = "neutral",
 ) -> dict[str, Any]:
     payload = {
         "batch_id": sanitize_batch_id(job.mp3.parent),
@@ -324,6 +325,7 @@ def make_manifest(
         "subtitle_audio_file": host_to_container(task_dir / "subtitle-audio.wav"),
         "script": script,
         "visual_style": visual_style,
+        "editorial_profile": {"subject_gender": subject_gender},
         "material_title": os.environ.get("MPT_MATERIAL_TITLE", "").strip(),
     }
     if production_plan_path is not None:
@@ -338,6 +340,7 @@ def write_manifest(
     *,
     production_plan_path: Path | None = None,
     visual_style: str = VISUAL_STYLE_NONE,
+    subject_gender: str = "neutral",
 ) -> Path:
     manifest_path = task_dir / "batch-manifest.json"
     write_json_atomic(
@@ -348,6 +351,7 @@ def write_manifest(
             script,
             production_plan_path=production_plan_path,
             visual_style=visual_style,
+            subject_gender=subject_gender,
         ),
     )
     return manifest_path
@@ -547,6 +551,7 @@ def process_job(
     position: str,
     visual_style: str = VISUAL_STYLE_NONE,
     human_review_mode: bool = False,
+    subject_gender: str = "neutral",
 ) -> str:
     task_dir = HOST_ROOT / "storage" / "tasks" / job.task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -568,6 +573,7 @@ def process_job(
         script,
         production_plan_path=review_plan_path if (human_review_mode or approved_review_plan) else None,
         visual_style=visual_style,
+        subject_gender=subject_gender,
     )
     existing_report_entry = dict(job_report_entry(report, job))
     current_visual_style_version = visual_style_version(visual_style)
@@ -742,6 +748,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--position", default="bottom")
     parser.add_argument("--visual-style", choices=VISUAL_STYLE_CHOICES, default=VISUAL_STYLE_NONE)
     parser.add_argument("--human-review", action="store_true")
+    parser.add_argument(
+        "--subject-gender",
+        choices=("feminine", "masculine", "mixed", "neutral"),
+        default="neutral",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -784,6 +795,7 @@ def main(argv: list[str] | None = None) -> int:
                     position=args.position,
                     visual_style=args.visual_style,
                     human_review_mode=args.human_review,
+                    subject_gender=args.subject_gender,
                 )
                 counts[status] = counts.get(status, 0) + 1
             except Exception as exc:

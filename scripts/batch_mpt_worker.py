@@ -358,6 +358,7 @@ def run_master(manifest: dict) -> dict:
         video_count=1,
         video_source="pexels",
         material_source_policy=_material_source_policy(manifest),
+        editorial_profile=manifest.get("editorial_profile") or {},
         custom_audio_file=manifest["audio_file"],
         voice_name="",
         voice_volume=1.0,
@@ -433,6 +434,7 @@ def run_review(manifest: dict) -> dict:
         video_count=1,
         video_source="pexels",
         material_source_policy=_material_source_policy(manifest),
+        editorial_profile=manifest.get("editorial_profile") or {},
         custom_audio_file=manifest["audio_file"],
         voice_name="",
         voice_volume=1.0,
@@ -454,6 +456,7 @@ def run_review(manifest: dict) -> dict:
             "audio_path": manifest.get("host_audio_file") or manifest["audio_file"],
             "script_path": manifest.get("host_text_file") or manifest["text_file"],
             "visual_style": manifest.get("visual_style", "none"),
+            "editorial_profile": manifest.get("editorial_profile") or {},
         },
     )
     result = task.start(manifest["task_id"], params, stop_at="review")

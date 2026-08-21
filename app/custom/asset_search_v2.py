@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 _STOPWORDS = {
@@ -57,6 +57,13 @@ _OBJECTS = {
 _SETTINGS = {
     "casa", "ciudad", "cocina", "escuela", "habitacion", "habitación",
     "hospital", "oficina", "parque", "playa", "sala", "trabajo",
+}
+SUPPORTED_SUBJECT_GENDERS = frozenset(
+    {"feminine", "masculine", "mixed", "neutral"}
+)
+_EDITORIAL_SUBJECT_TERMS = {
+    "feminine": ("mujer", "niña", "madre", "hermana"),
+    "masculine": ("hombre", "niño", "padre", "hermano"),
 }
 
 _CONCEPT_RULES: tuple[tuple[set[str], tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
@@ -217,6 +224,20 @@ def _query(values: Sequence[Any]) -> str:
     return " ".join(parts).strip()
 
 
+def normalize_editorial_profile(value: Mapping[str, Any] | None) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    subject_gender = str(value.get("subject_gender") or "").strip().lower()
+    if subject_gender not in SUPPORTED_SUBJECT_GENDERS:
+        return {}
+    return {"subject_gender": subject_gender}
+
+
+def editorial_subject_terms(editorial_profile: Mapping[str, Any] | None) -> tuple[str, ...]:
+    profile = normalize_editorial_profile(editorial_profile)
+    return _EDITORIAL_SUBJECT_TERMS.get(profile.get("subject_gender", ""), ())
+
+
 def _token_set(query: str) -> frozenset[str]:
     return frozenset(_fold(word) for word in _words(query))
 
@@ -315,6 +336,7 @@ def build_visual_queries_v2(
     scene_text: str,
     existing_terms: Sequence[str] | None = None,
     *,
+    editorial_profile: Mapping[str, Any] | None = None,
     max_queries: int = 3,
 ) -> tuple[str, ...]:
     """Build compact, diverse lexical visual queries without extra AI calls."""
@@ -322,6 +344,7 @@ def build_visual_queries_v2(
     if not scene_tokens:
         return ()
 
+    editorial_terms = editorial_subject_terms(editorial_profile)
     hint_tokens = _clean_tokens(existing_terms or ())
     scene_subjects, scene_actions, scene_moods, scene_objects, scene_settings, scene_concepts = _signals(scene_tokens)
     _, hint_actions, _, hint_objects, hint_settings, hint_concepts = _signals(hint_tokens)
@@ -344,6 +367,25 @@ def build_visual_queries_v2(
     else:
         tokens = list(dict.fromkeys([*scene_tokens, *hint_tokens]))
         subjects, actions, moods, objects, settings, concepts = _signals(tokens)
+
+    if editorial_terms:
+        explicit_subjects = {_fold(item) for item in subjects}
+        matching_editorial_terms = [
+            term
+            for term in editorial_terms
+            if _fold(term) in {_fold(token) for token in scene_tokens}
+        ]
+        editorial_subject = matching_editorial_terms[:1] or editorial_terms[:1]
+        subjects = [
+            *editorial_subject,
+            *[
+                item
+                for item in subjects
+                if _fold(item) not in {_fold(term) for term in editorial_terms}
+            ],
+        ]
+        if not explicit_subjects:
+            concepts = list(concepts)
 
     subject = subjects[:1] or (["persona"] if (actions or moods or concepts) else [])
     relation_subject = subjects[:1] or (["persona"] if (actions or objects or settings) else [])
@@ -383,6 +425,11 @@ def build_visual_queries_v2(
 
     if not queries and (moods or actions or concepts):
         fallback = _query([*subject, *(moods[:2] or concepts[:2]), *actions[:1]])
+        if 3 <= len(fallback.split()) <= 7:
+            queries.append(fallback)
+
+    if not queries and editorial_terms:
+        fallback = _query([editorial_terms[0], *scene_tokens[:4]])
         if 3 <= len(fallback.split()) <= 7:
             queries.append(fallback)
 

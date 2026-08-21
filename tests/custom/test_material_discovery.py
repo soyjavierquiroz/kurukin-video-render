@@ -156,6 +156,17 @@ class TestMaterialDiscovery(unittest.TestCase):
     def test_visual_query_v2_empty_scene_ignores_existing_hint(self):
         self.assertEqual(build_visual_queries_v2("   ", ["niña sola"]), ())
 
+    def test_visual_query_v2_feminine_editorial_profile_prioritizes_feminine_subject(self):
+        queries = build_visual_queries_v2(
+            "Y tú también tienes derecho a construir una vida propia.",
+            editorial_profile={"subject_gender": "feminine"},
+        )
+
+        serialized = " ".join(queries).lower()
+        self.assertTrue(queries)
+        self.assertTrue(any(term in serialized for term in ("mujer", "niña", "madre", "hermana")))
+        self.assertDiverseQueries(queries)
+
     def test_stock_wrapper_delegates_to_cache_entrypoint(self):
         if not hasattr(material, "search_videos_for_provider"):
             self.skipTest("full-suite provider-import guard supplied a minimal material module")

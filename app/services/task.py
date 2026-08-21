@@ -1273,6 +1273,11 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
         duration=float(audio_duration or 0),
         aspect_ratio=str(params.video_aspect),
         visual_style=str(review.get("visual_style") or "none"),
+        editorial_profile=(
+            getattr(params, "editorial_profile", None)
+            or review.get("editorial_profile")
+            or {}
+        ),
         selection_result=selection,
         discovery_result=discovery,
         output_path=output_path,

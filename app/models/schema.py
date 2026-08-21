@@ -101,6 +101,7 @@ class VideoParams(BaseModel):
     asset_hub_strict: bool = True
     material_source_policy: dict | None = None
     asset_hub_terms: list[str] = Field(default_factory=list)
+    editorial_profile: dict | None = None
 
     image_motion_enabled: bool = False
     image_motion_preset: str = ""

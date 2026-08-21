@@ -47,6 +47,7 @@ _KNOWN_VIDEO_PARAMS_FIELDS = {
     "asset_hub_bundle_uid",
     "asset_hub_scene_mode",
     "asset_hub_strict",
+    "editorial_profile",
     "image_motion_enabled",
     "image_motion_preset",
     "image_motion_intensity",
@@ -398,6 +399,7 @@ def _base_mpt_params(job: dict[str, Any]) -> dict[str, Any]:
         "asset_hub_scene_mode": _first_clean_text(
             job.get("asset_hub_scene_mode"), "ordered"
         ),
+        "editorial_profile": deepcopy(job.get("editorial_profile") or {}),
     }
 
 
