@@ -353,14 +353,15 @@ class TestSubtitleService(unittest.TestCase):
         self.assertEqual(
             [item[2] for item in items],
             [
-                "¿Te cuesta decir lo que sientes",
-                "sin preparar antes un discurso completo?",
+                "¿Te cuesta decir lo",
+                "que sientes sin preparar",
+                "antes un discurso completo?",
             ],
         )
         self.assertEqual(_content_text(items), text)
         self.assertTrue(all("\n" not in item[2] for item in items))
-        self.assertEqual(items[0][1], "00:00:00,000 --> 00:00:03,000")
-        self.assertEqual(items[1][1], "00:00:03,000 --> 00:00:06,000")
+        self.assertEqual(items[0][1], "00:00:00,000 --> 00:00:02,000")
+        self.assertEqual(items[1][1], "00:00:02,000 --> 00:00:04,000")
 
     def test_semantic_cue_timings_use_first_and_last_aligned_tokens(self):
         text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
@@ -408,13 +409,29 @@ class TestSubtitleService(unittest.TestCase):
             [item[2] for item in items],
             [
                 "Que pedir algo era molestar.",
-                "Entonces comenzaste a observar antes de hablar.",
+                "Entonces comenzaste a",
+                "observar antes de hablar.",
             ],
         )
         self.assertEqual(_content_text(items), text)
         self.assertTrue(all("\n" not in item[2] for item in items))
         for item in items:
             self.assertGreater(len(item[2].split()), 1)
+
+    def test_semantic_requested_example_splits_into_short_cues(self):
+        text = "Y tú también tienes derecho a construir una vida que no esté organizada alrededor de las necesidades de los demás."
+        whisper = "Y tu tambien tienes derecho a construir una vida que no este organizada alrededor de las necesidades de los demas"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertGreater(len(items), 2)
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all("\n" not in item[2] for item in items))
+        self.assertTrue(all(len(item[2]) <= 48 for item in items))
 
     def test_semantic_compound_token_alignment_still_passes(self):
         original_srt = _srt_block(

@@ -22,23 +22,31 @@ initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
 GLOBAL_OK_THRESHOLD = 0.90
 LINE_MIN_COVERAGE = 0.40
-SEMANTIC_SUBTITLE_TARGET_MIN_CHARS = 24
-SEMANTIC_SUBTITLE_TARGET_MAX_CHARS = 42
-SEMANTIC_SUBTITLE_HARD_CUE_CHARS = 56
-SEMANTIC_SUBTITLE_TARGET_MIN_WORDS = 5
-SEMANTIC_SUBTITLE_TARGET_MAX_WORDS = 8
+SEMANTIC_SUBTITLE_TARGET_MIN_CHARS = 20
+SEMANTIC_SUBTITLE_TARGET_MAX_CHARS = 36
+SEMANTIC_SUBTITLE_SOFT_CUE_CHARS = 42
+SEMANTIC_SUBTITLE_HARD_CUE_CHARS = 48
+SEMANTIC_SUBTITLE_TARGET_MIN_WORDS = 4
+SEMANTIC_SUBTITLE_TARGET_MAX_WORDS = 7
 SEMANTIC_BOUNDARY_CONNECTORS = {
+    "ademas",
+    "además",
     "aunque",
     "como",
     "cuando",
     "donde",
     "entonces",
+    "luego",
     "mientras",
+    "ni",
     "pero",
     "porque",
     "que",
     "sin",
     "si",
+    "tambien",
+    "también",
+    "y",
 }
 SEMANTIC_ORPHAN_WORDS = {
     "aunque",
@@ -572,7 +580,7 @@ def _cue_end_score(words, start, end, total_words):
     ):
         fullness += 35
     elif word_count == 1 and end < total_words:
-        fullness -= 120
+        fullness -= 500 if _is_semantic_orphan(selected[0]["text"]) else 180
     orphan_penalty = 0
     if _is_semantic_orphan(selected[-1]["text"]) and end < total_words:
         orphan_penalty += 80
@@ -604,6 +612,13 @@ def _candidate_cue_end(words, start, total_words):
         return min(total_words, start + 1)
 
     candidates = list(range(start + 1, max_end + 1))
+    multi_word_candidates = [
+        end
+        for end in candidates
+        if end == total_words or len(words[start:end]) > 1
+    ]
+    if multi_word_candidates:
+        candidates = multi_word_candidates
     for minimum_strength in (100, 80, 60, 35):
         matching = [
             end
@@ -630,16 +645,108 @@ def _candidate_cue_end(words, start, total_words):
     )
 
 
+def _span_is_complete_short_sentence(words, start, end):
+    text = _join_semantic_words(words[start:end])
+    return bool(re.search(r"[.!?！？。]$", text)) and len(words[start:end]) <= 2
+
+
+def _balanced_span_score(words, start, end, total_words):
+    selected = words[start:end]
+    if not selected:
+        return None
+    text = _join_semantic_words(selected)
+    char_count = len(text)
+    if char_count > SEMANTIC_SUBTITLE_HARD_CUE_CHARS:
+        return None
+
+    word_count = len(selected)
+    next_word = words[end]["text"] if end < total_words else ""
+    boundary = _semantic_boundary_strength(selected[-1]["text"], next_word)
+    target_chars = (
+        SEMANTIC_SUBTITLE_TARGET_MIN_CHARS
+        + SEMANTIC_SUBTITLE_TARGET_MAX_CHARS
+    ) / 2
+    target_words = (
+        SEMANTIC_SUBTITLE_TARGET_MIN_WORDS
+        + SEMANTIC_SUBTITLE_TARGET_MAX_WORDS
+    ) / 2
+    score = boundary * 4
+    score -= abs(char_count - target_chars) * 5
+    score -= abs(word_count - target_words) * 16
+
+    if SEMANTIC_SUBTITLE_TARGET_MIN_CHARS <= char_count <= SEMANTIC_SUBTITLE_TARGET_MAX_CHARS:
+        score += 90
+    elif char_count <= SEMANTIC_SUBTITLE_SOFT_CUE_CHARS:
+        score += 35
+    else:
+        score -= 140
+
+    if SEMANTIC_SUBTITLE_TARGET_MIN_WORDS <= word_count <= SEMANTIC_SUBTITLE_TARGET_MAX_WORDS:
+        score += 90
+    elif word_count <= 2 and not _span_is_complete_short_sentence(words, start, end):
+        score -= 700
+    elif word_count == 3:
+        score -= 45
+
+    if end < total_words and _is_semantic_orphan(selected[-1]["text"]):
+        score -= 180
+    if end < total_words and _is_semantic_orphan(next_word) and (total_words - end) <= 2:
+        score -= 260
+
+    internal_boundary_penalty = 0
+    for word in selected[:-1]:
+        if _semantic_boundary_strength(word["text"]) >= 60:
+            internal_boundary_penalty += 260
+    score -= internal_boundary_penalty
+
+    if end == total_words:
+        score += 120 if re.search(r"[.!?！？。]$", selected[-1]["text"]) else 30
+
+    return score
+
+
+def _balanced_cue_spans(words):
+    total_words = len(words)
+    if total_words == 0:
+        return []
+
+    best: list[tuple[float, list[tuple[int, int]] | None]] = [(-10**12, None) for _ in range(total_words + 1)]
+    best[total_words] = (0.0, [])
+
+    for start in range(total_words - 1, -1, -1):
+        for end in range(start + 1, total_words + 1):
+            text = _join_semantic_words(words[start:end])
+            if len(text) > SEMANTIC_SUBTITLE_HARD_CUE_CHARS:
+                break
+            span_score = _balanced_span_score(words, start, end, total_words)
+            if span_score is None:
+                continue
+            tail_score, tail_spans = best[end]
+            if tail_spans is None:
+                continue
+            candidate_score = span_score + tail_score
+            if candidate_score > best[start][0]:
+                best[start] = (candidate_score, [(start, end), *tail_spans])
+
+    if best[0][1] is not None:
+        return best[0][1]
+
+    spans = []
+    start = 0
+    while start < total_words:
+        end = _candidate_cue_end(words, start, total_words)
+        spans.append((start, end))
+        start = end
+    return spans
+
+
 def _semantic_subtitle_items(script_lines, token_mapping, whisper_tokens):
     words = _semantic_words_from_alignment(script_lines, token_mapping, whisper_tokens)
     output = []
-    start = 0
     index = 1
-    total_words = len(words)
     previous_end = 0
 
-    while start < total_words:
-        end = _candidate_cue_end(words, start, total_words)
+    for start, end in _balanced_cue_spans(words):
         selected = words[start:end]
         mapped_words = [
             word
@@ -659,7 +766,6 @@ def _semantic_subtitle_items(script_lines, token_mapping, whisper_tokens):
         output.append((index, cue_start, cue_end, _join_semantic_words(selected)))
         previous_end = cue_end
         index += 1
-        start = end
 
     return output
 
