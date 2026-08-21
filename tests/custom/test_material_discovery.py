@@ -166,7 +166,7 @@ class TestMaterialDiscovery(unittest.TestCase):
         self.assertEqual(cache.call_args.args[2:4], ("term", 3))
 
     def test_all_open_providers_are_searched_without_short_circuit(self):
-        hub = FakeAssetHub({"es": [{"asset_uid": "hub-1", "filename": "one.mp4", "orientation": "vertical"}]})
+        hub = FakeAssetHub({"es": [{"asset_uid": "hub-1", "filename": "one.mp4", "orientation": "vertical-9x16"}]})
         calls = []
 
         def search(provider, term, duration, aspect):
@@ -188,9 +188,9 @@ class TestMaterialDiscovery(unittest.TestCase):
 
     def test_identity_dedupe_and_sanitization(self):
         hub = FakeAssetHub({"term": [
-            {"asset_uid": "a", "filename": "same.mp4", "orientation": "vertical", "drive_file_id": "private", "nested": {"API_KEY": "secret"}},
-            {"asset_uid": "b", "filename": "same.mp4", "orientation": "vertical", "remote_path": "/private"},
-            {"asset_uid": "a", "filename": "duplicate.mp4", "orientation": "vertical"},
+            {"asset_uid": "a", "filename": "same.mp4", "orientation": "vertical-9x16", "drive_file_id": "private", "nested": {"API_KEY": "secret"}},
+            {"asset_uid": "b", "filename": "same.mp4", "orientation": "vertical-9x16", "remote_path": "/private"},
+            {"asset_uid": "a", "filename": "duplicate.mp4", "orientation": "vertical-9x16"},
         ]})
         def search(provider, *_args):
             return [stock(provider, "x", filename="same.mp4")]
@@ -203,7 +203,7 @@ class TestMaterialDiscovery(unittest.TestCase):
 
     def test_asset_hub_search_preview_metadata_is_preserved(self):
         hub = FakeAssetHub({"term": [
-            {"asset_uid": "a", "orientation": "vertical", "preview_url": "https://asset-hub.example/a.jpg"},
+            {"asset_uid": "a", "orientation": "vertical-9x16", "preview_url": "https://asset-hub.example/a.jpg"},
         ]})
 
         result = discover_material_candidates(
@@ -218,7 +218,7 @@ class TestMaterialDiscovery(unittest.TestCase):
         hub = FakeAssetHub({
             "mujer triste": [],
             "mujer triste tristeza": [],
-            "triste": [{"asset_uid": "sad-1", "filename": "sad.mp4", "orientation": "vertical"}],
+            "triste": [{"asset_uid": "sad-1", "filename": "sad.mp4", "orientation": "vertical-9x16"}],
         })
 
         result = discover_material_candidates(
@@ -235,7 +235,7 @@ class TestMaterialDiscovery(unittest.TestCase):
         hub = FakeAssetHub({
             "pareja abrazandose": [],
             "pareja": [],
-            "mi-otra-yo": [{"asset_uid": "title-1", "filename": "title.mp4", "orientation": "vertical"}],
+            "mi-otra-yo": [{"asset_uid": "title-1", "filename": "title.mp4", "orientation": "vertical-9x16"}],
         })
 
         result = discover_material_candidates(
@@ -260,7 +260,7 @@ class TestMaterialDiscovery(unittest.TestCase):
             "niño solo": [],
             "niño solo soledad": [],
             "soledad vulnerabilidad emocional": [],
-            "solo": [{"asset_uid": "solo-1", "filename": "solo.mp4", "orientation": "vertical"}],
+            "solo": [{"asset_uid": "solo-1", "filename": "solo.mp4", "orientation": "vertical-9x16"}],
         })
 
         result = discover_material_candidates(
@@ -275,8 +275,8 @@ class TestMaterialDiscovery(unittest.TestCase):
     def test_asset_hub_title_only_global_fallback_runs_once_and_marks_candidates(self):
         hub = FakeAssetHub({
             "mi-otra-yo": [
-                {"asset_uid": "title-1", "filename": "title.mp4", "orientation": "vertical"},
-                {"asset_uid": "title-2", "filename": "title2.mp4", "orientation": "vertical"},
+                {"asset_uid": "title-1", "filename": "title.mp4", "orientation": "vertical-9x16"},
+                {"asset_uid": "title-2", "filename": "title2.mp4", "orientation": "vertical-9x16"},
             ],
         })
 
@@ -392,6 +392,53 @@ class TestMaterialDiscovery(unittest.TestCase):
         self.assertIn({"sources": [{"scope": "generic"}]}, [call[1] for call in hub.calls])
         self.assertEqual([item.canonical_id for item in result.candidates], ["title-1", "generic-1"])
 
+    def test_title_preferred_sufficiency_is_calculated_after_strict_vertical_filter(self):
+        preferred = MaterialSourcePolicy(
+            MaterialProviderPolicy((PROVIDER_ASSET_HUB,)),
+            AssetHubCatalogPolicy(include=AssetHubIncludePolicy(generic=True, titles=("mi-otra-yo",))),
+        )
+        title_assets = [
+            {"asset_uid": f"title-horizontal-{index}", "orientation": "horizontal-16x9"}
+            for index in range(20)
+        ] + [
+            {"asset_uid": "title-vertical-1", "orientation": "vertical-9x16"},
+            {"asset_uid": "title-vertical-2", "orientation": "vertical-4x5"},
+        ]
+        hub = FakeAssetHub({"mujer triste": title_assets})
+
+        result = discover_material_candidates(
+            policy=preferred,
+            stock_terms=["mujer triste"],
+            video_aspect="9:16",
+            asset_hub_provider=hub,
+        )
+
+        self.assertIn({"sources": [{"scope": "generic"}]}, [call[1] for call in hub.calls])
+        self.assertEqual(
+            set(item.canonical_id for item in result.candidates),
+            {"title-vertical-1", "title-vertical-2"},
+        )
+
+    def test_title_exclusive_does_not_generic_fallback_after_strict_vertical_filter(self):
+        hub = FakeAssetHub({
+            "mujer triste": [
+                {"asset_uid": "title-horizontal", "orientation": "horizontal-16x9"},
+                {"asset_uid": "title-vertical", "orientation": "vertical-9x16"},
+            ],
+            "mujer triste tristeza": [],
+            "triste": [],
+        })
+
+        result = discover_material_candidates(
+            policy=title_policy("mi-otra-yo"),
+            stock_terms=["mujer triste"],
+            video_aspect="9:16",
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual([item.canonical_id for item in result.candidates], ["title-vertical"])
+        self.assertTrue(all(call[1] == {"sources": [{"scope": "title", "title": "mi-otra-yo"}]} for call in hub.calls))
+
     def test_human_review_reserve_uses_visual_query_v2(self):
         hub = FakeAssetHub({
             "mujer triste": [{"asset_uid": "a", "orientation": "vertical-9x16"}],
@@ -406,6 +453,25 @@ class TestMaterialDiscovery(unittest.TestCase):
 
         self.assertIn("mujer triste tristeza", [call[0] for call in hub.calls])
         self.assertEqual([item.canonical_id for item in result.candidates], ["a", "b"])
+
+    def test_human_review_reserve_excludes_horizontal_assets_for_vertical_output(self):
+        hub = FakeAssetHub({
+            "mujer triste": [
+                {"asset_uid": "h", "orientation": "horizontal-16x9"},
+                {"asset_uid": "v", "orientation": "vertical-9x16"},
+            ],
+            "mujer triste tristeza": [],
+            "triste": [],
+        })
+
+        result = discover_asset_hub_review_reserve_candidates(
+            policy=policy(PROVIDER_ASSET_HUB),
+            terms=["mujer triste"],
+            video_aspect="9:16",
+            asset_hub_provider=hub,
+        )
+
+        self.assertEqual([item.canonical_id for item in result.candidates], ["v"])
 
     def test_empty_is_success_and_partial_failure_continues(self):
         def search(provider, *_args):

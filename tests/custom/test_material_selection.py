@@ -32,6 +32,12 @@ class TestMaterialSelection(unittest.TestCase):
     def test_orientation_hard_filter_accepts_matching_vertical_geometry(self):
         self.assertTrue(_is_orientation_compatible(candidate("v", width=1080, height=1920), "9:16"))
 
+    def test_orientation_hard_filter_accepts_vertical_9x16_metadata(self):
+        self.assertTrue(_is_orientation_compatible(candidate("v9", orientation="vertical-9x16"), "9:16"))
+
+    def test_orientation_hard_filter_accepts_vertical_4x5_metadata(self):
+        self.assertTrue(_is_orientation_compatible(candidate("v45", orientation="vertical-4x5"), "9:16"))
+
     def test_orientation_hard_filter_excludes_horizontal_from_vertical(self):
         self.assertFalse(_is_orientation_compatible(candidate("h", width=1920, height=1080), "9:16"))
         self.assertFalse(_is_orientation_compatible(candidate("h", width=1920, height=1080), VideoAspect.portrait))
@@ -70,7 +76,7 @@ class TestMaterialSelection(unittest.TestCase):
         self.assertEqual(result.shortfall, 1)
 
     def test_asset_hub_uids_are_not_collapsed(self):
-        result = select_material_candidates(discovery_result=discovery(candidate("kurukin_media:a", provider="asset_hub", orientation="vertical"), candidate("kurukin_media:b", provider="asset_hub", orientation="vertical")), video_aspect="9:16", target_duration=10, clip_duration=5)
+        result = select_material_candidates(discovery_result=discovery(candidate("kurukin_media:a", provider="asset_hub", orientation="vertical-9x16"), candidate("kurukin_media:b", provider="asset_hub", orientation="vertical-9x16")), video_aspect="9:16", target_duration=10, clip_duration=5)
         self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["kurukin_media:a", "kurukin_media:b"])
 
     def test_title_only_candidates_do_not_displace_real_matches(self):
@@ -114,7 +120,7 @@ class TestMaterialSelection(unittest.TestCase):
             ["pareja discutiendo", "niño solo", "mujer laptop"],
         )
 
-    def test_vertical_is_preferred_but_horizontal_remains_available(self):
+    def test_horizontal_asset_never_appears_as_primary_for_vertical_output(self):
         items = (
             candidate("h", rank=1, orientation="horizontal-16x9", duration=5),
             candidate("v9", rank=1, orientation="vertical-9x16", duration=5),
@@ -128,7 +134,22 @@ class TestMaterialSelection(unittest.TestCase):
             clip_duration=5,
         )
 
-        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["v45", "v9", "h"])
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["v45", "v9"])
+
+    def test_horizontal_production_keeps_previous_landscape_filter(self):
+        items = (
+            candidate("h", rank=1, orientation="horizontal-16x9", duration=5),
+            candidate("v9", rank=1, orientation="vertical-9x16", duration=5),
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(*items),
+            video_aspect="16:9",
+            target_duration=10,
+            clip_duration=5,
+        )
+
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["h"])
 
     def test_sufficient_duration_is_preferred_without_dropping_short_clip(self):
         items = (

@@ -23,6 +23,7 @@ from app.custom.material_source_policy import (
     PROVIDER_LOCAL,
     build_discovery_plan,
 )
+from app.custom.material_selection import _is_orientation_compatible
 from app.custom.kurukin_local_visual_picker import pick_local_visual_for_intent
 from app.services import material
 
@@ -314,6 +315,7 @@ def _asset_hub_found_candidates(
     query: str,
     source_policy: Mapping[str, Any],
     original_term: str,
+    video_aspect: str,
     limit: int = 20,
 ) -> list[MaterialCandidate]:
     assets = provider.search(query=query, source_policy=source_policy, limit=limit)
@@ -322,6 +324,8 @@ def _asset_hub_found_candidates(
         if not _asset_hub_is_video_asset(asset):
             continue
         candidate = _asset_hub_candidate(asset, term=query, rank=index)
+        if not _is_orientation_compatible(candidate, video_aspect):
+            continue
         candidate.source_info["visual_query_source_term"] = original_term
         candidates.append(candidate)
     return candidates
@@ -399,6 +403,7 @@ def _asset_hub_multi_query_candidates(
             query=query,
             source_policy=source_policy,
             original_term=term,
+            video_aspect=video_aspect,
             limit=limit,
         )
         diagnostics.append(DiscoveryDiagnostic(PROVIDER_ASSET_HUB, query, "success", "ok", len(found)))
@@ -524,6 +529,11 @@ def discover_material_candidates(
                     remote_attempts += 1
                     items = material.search_videos_for_provider(provider, term, minimum_duration, video_aspect)
                     found = [candidate for index, item in enumerate(items) if (candidate := _stock_candidate(item, provider=provider, term=term, rank=index)) is not None]
+                    found = [
+                        candidate
+                        for candidate in found
+                        if _is_orientation_compatible(candidate, video_aspect)
+                    ]
                 else:
                     title_policy, generic_policy = _title_preferred_policies(source_policy)
                     query_count = len(_asset_hub_search_queries(term))
@@ -727,10 +737,11 @@ def discover_asset_hub_title_fallback_candidates(
             raise
         raise MaterialDiscoveryError("material provider 'asset_hub' failed") from exc
 
-    candidates = [
-        _title_only_asset_hub_candidate(asset, title=title, rank=index)
-        for index, asset in enumerate(assets)
-    ]
+    candidates = []
+    for index, asset in enumerate(assets):
+        candidate = _title_only_asset_hub_candidate(asset, title=title, rank=index)
+        if _is_orientation_compatible(candidate, video_aspect):
+            candidates.append(candidate)
     candidates = _rank_asset_hub_candidates(
         candidates,
         video_aspect=video_aspect,

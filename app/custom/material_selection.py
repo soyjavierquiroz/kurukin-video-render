@@ -85,10 +85,7 @@ def _positive_number(value: Any) -> float | None:
 
 
 def _is_orientation_compatible(candidate: Any, video_aspect: str) -> bool:
-    """Return whether candidate orientation is a direct target match.
-
-    Selection uses this as a preference signal, not as a destructive filter.
-    """
+    """Strictly match portrait/landscape targets using geometry first."""
     target = _target_orientation(video_aspect)
     if target is None:
         return True
@@ -184,6 +181,7 @@ def select_material_candidates(*, discovery_result: Any, video_aspect: str, targ
     recent, seen, decisions, providers = set(options.recent_dedupe_keys), set(), [], []
     candidates = [
         item for item in (getattr(discovery_result, "candidates", ()) or ())
+        if _is_orientation_compatible(item, options.video_aspect)
     ]
     candidate_layers = (
         [item for item in candidates if not _is_low_priority_fallback(item)],
