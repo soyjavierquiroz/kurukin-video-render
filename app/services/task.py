@@ -26,7 +26,7 @@ from app.custom.material_discovery import (
     discover_material_candidates,
 )
 from app.custom.material_selection import select_material_candidates
-from app.custom.material_source_policy import material_source_policy_from_dict
+from app.custom.material_source_policy import build_discovery_plan, material_source_policy_from_dict
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
@@ -1077,8 +1077,12 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
         segment_queries = (
             human_review.visual_queries_for_review_segments(
                 video_script,
-                len(getattr(selection, "decisions", ()) or ()),
+                max(
+                    len(getattr(selection, "decisions", ()) or ()),
+                    int(getattr(selection, "target_count", 0) or 0),
+                ),
                 tuple(params.asset_hub_terms or video_terms),
+                getattr(params, "editorial_profile", None) or {},
             )
             if video_script
             else []
@@ -1259,6 +1263,8 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
         return _mark_task_failed(task_id, "materials", "No usable visual materials found")
 
     review = getattr(params, "human_review", None) or {}
+    policy = material_source_policy_from_dict(params.material_source_policy)
+    discovery_plan = build_discovery_plan(policy)
     output_path = Path(review.get("production_plan_path") or human_review.plan_path(
         str(review.get("batch_id") or "batch"),
         str(review.get("stem") or task_id),
@@ -1278,6 +1284,13 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
             or review.get("editorial_profile")
             or {}
         ),
+        material_source_policy=params.material_source_policy or {},
+        asset_hub_source_policy=(
+            discovery_plan.get("asset_hub", {}).get("source_policy")
+            or {}
+        ),
+        material_title=str(review.get("material_title") or ""),
+        source_policy=str(review.get("source_policy") or ""),
         selection_result=selection,
         discovery_result=discovery,
         output_path=output_path,

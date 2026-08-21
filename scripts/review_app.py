@@ -278,22 +278,29 @@ def main() -> None:
         covered_duration = float(segment_metrics.get("covered_duration") or (target - scene_gap))
         missing_duration = float(segment_metrics.get("missing_duration") or scene_gap)
 
-        metric_cols = st.columns(3)
-        metric_cols[0].metric("target_duration", f"{target_duration:.2f}s")
-        metric_cols[1].metric("covered_duration", f"{covered_duration:.2f}s")
-        metric_cols[2].metric("missing_duration", f"{missing_duration:.2f}s")
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("TARGET", f"{target_duration:.2f}s")
+        metric_cols[1].metric("PRIMARY", f"{primary_output:.2f}s")
+        metric_cols[2].metric("BACKUPS", f"{backup_output:.2f}s")
+        metric_cols[3].metric("COVERED", f"{covered_duration:.2f}s")
+        metric_cols[4].metric("MISSING", f"{missing_duration:.2f}s")
 
-        if scene_gap > 0.01:
+        if missing_duration > 0.01:
+            st.warning(f"NEEDS BACKUP · {missing_duration:.2f}s missing")
+        else:
+            st.success("COVERED")
+
+        if missing_duration > 0.01:
             st.warning(
                 f"Scene coverage "
-                f"{target - scene_gap:.2f}"
-                f"/{target:.2f}s · "
-                f"MISSING {scene_gap:.2f}s"
+                f"{covered_duration:.2f}"
+                f"/{target_duration:.2f}s · "
+                f"MISSING {missing_duration:.2f}s"
             )
         else:
             st.success(
                 f"Scene coverage "
-                f"{target:.2f}/{target:.2f}s"
+                f"{target_duration:.2f}/{target_duration:.2f}s"
             )
 
         if primary_speed < 0.999:
@@ -350,22 +357,26 @@ def main() -> None:
                 "**PRIMARY ✓**"
             )
 
-            show_asset(
-                selected,
-                f"{segment_id}-selected",
-            )
+            if selected.get("asset_uid"):
+                show_asset(
+                    selected,
+                    f"{segment_id}-selected",
+                )
 
-            show_flip_checkbox(
-                plan_file,
-                segment_id,
-                selected,
-                f"{segment_id}-selected",
-            )
+                show_flip_checkbox(
+                    plan_file,
+                    segment_id,
+                    selected,
+                    f"{segment_id}-selected",
+                )
 
-            st.caption(
-                "source duration "
-                f"{_asset_duration(selected):.2f}s"
-            )
+                st.caption(
+                    "source duration "
+                    f"{_asset_duration(selected):.2f}s"
+                )
+            else:
+                st.warning("REVIEW REQUIRED")
+                st.caption("0 visible PRIMARY candidates")
 
         for index, alternative in enumerate(
             alternatives,

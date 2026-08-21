@@ -66,14 +66,16 @@ GENDER_TEXT_FIELDS = (
     "query",
 )
 FEMININE_SIGNALS = {
-    "ella", "ellas", "femenina", "femenino", "hermana", "hija", "joven",
-    "madre", "mama", "mamá", "mujer", "mujeres", "nina", "niña", "senora",
-    "señora", "woman", "women", "girl", "mother", "sister", "daughter",
+    "femenina", "femenino", "hermana", "hija", "madre", "mama", "mamá",
+    "mujer", "mujeres", "nina", "ninas", "niña", "niñas", "senora",
+    "señora", "woman", "women", "girl", "girls", "mother", "sister",
+    "daughter", "female",
 }
 MASCULINE_SIGNALS = {
     "ellos", "masculina", "masculino", "hermano", "hijo", "hombre",
-    "hombres", "nino", "niño", "padre", "papa", "papá", "senor", "señor",
-    "man", "men", "boy", "father", "brother", "son",
+    "hombres", "nino", "ninos", "niño", "niños", "padre", "papa", "papá",
+    "senor", "señor", "man", "men", "boy", "boys", "father", "brother",
+    "son", "male",
 }
 
 
@@ -182,20 +184,39 @@ def _asset_gender_text(asset: Any) -> str:
     return _fold_text(" ".join(values))
 
 
-def _asset_gender_score(asset: Any) -> int:
+def _asset_gender_counts(asset: Any) -> tuple[int, int]:
     tokens = set(re.findall(r"[\w]+", _asset_gender_text(asset), flags=re.UNICODE))
     feminine = len(tokens & {_fold_text(item) for item in FEMININE_SIGNALS})
     masculine = len(tokens & {_fold_text(item) for item in MASCULINE_SIGNALS})
-    return feminine - masculine
+    return feminine, masculine
+
+
+def editorial_gender_evidence(asset: Any) -> str:
+    feminine, masculine = _asset_gender_counts(asset)
+    if feminine and masculine:
+        return "mixed"
+    if feminine:
+        return "feminine"
+    if masculine:
+        return "masculine"
+    return "unknown"
 
 
 def _candidate_matches_editorial_profile(
     candidate: Any,
     editorial_profile: Mapping[str, Any] | None,
 ) -> bool:
-    # Until Asset Hub exposes audited structured subject metadata, gender is
-    # preference-only. Free-text metadata can boost ranking, but must not hide
-    # otherwise valid candidates from Human Review.
+    # Conservative temporary policy until Asset Hub exposes structured subject
+    # metadata. Strict jobs require positive textual evidence and reject
+    # contrary or ambiguous evidence from the metadata we already receive.
+    subject_gender = normalize_editorial_profile(editorial_profile).get("subject_gender")
+    if subject_gender in ("neutral", "mixed", None):
+        return True
+    evidence = editorial_gender_evidence(candidate)
+    if subject_gender == "feminine":
+        return evidence == "feminine"
+    if subject_gender == "masculine":
+        return evidence == "masculine"
     return True
 
 
@@ -204,7 +225,8 @@ def _editorial_rank_adjustment(
     editorial_profile: Mapping[str, Any] | None,
 ) -> int:
     subject_gender = normalize_editorial_profile(editorial_profile).get("subject_gender")
-    score = _asset_gender_score(candidate)
+    feminine, masculine = _asset_gender_counts(candidate)
+    score = feminine - masculine
     if subject_gender == "feminine":
         return score
     if subject_gender == "masculine":
@@ -371,7 +393,11 @@ def _visible_editorial_candidates(
     candidates: list[Any],
     editorial_profile: Mapping[str, Any] | None,
 ) -> list[Any]:
-    return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if _candidate_matches_editorial_profile(candidate, editorial_profile)
+    ]
 
 
 def _select_segment_candidate(ranked_candidates: list[Any], used_selected_asset_uids: set[str]) -> tuple[Any, bool]:
@@ -379,7 +405,7 @@ def _select_segment_candidate(ranked_candidates: list[Any], used_selected_asset_
         uid = candidate_uid(candidate)
         if uid and uid not in used_selected_asset_uids:
             return candidate, False
-    return ranked_candidates[0], True
+    return None, False
 
 
 def _alternative_candidates(
@@ -1241,16 +1267,24 @@ def render_timeline_from_plan(
         primary = segment.get("selected_asset")
 
         if not isinstance(primary, Mapping):
-            raise ValueError(
-                f"{segment_id}: missing PRIMARY"
+            segment_shortfalls.append(
+                {
+                    "segment_id": segment_id,
+                    "shortfall": round(target, 6),
+                }
             )
+            continue
 
         primary_uid = _asset_uid_value(primary)
 
         if not primary_uid:
-            raise ValueError(
-                f"{segment_id}: PRIMARY has no asset_uid"
+            segment_shortfalls.append(
+                {
+                    "segment_id": segment_id,
+                    "shortfall": round(target, 6),
+                }
             )
+            continue
 
         previous = seen_authorized.get(primary_uid)
 
@@ -1292,10 +1326,13 @@ def render_timeline_from_plan(
         available = asset_duration(primary)
 
         if available <= 0:
-            raise ValueError(
-                f"{segment_id}: PRIMARY {primary_uid} "
-                "has unknown or zero duration"
+            segment_shortfalls.append(
+                {
+                    "segment_id": segment_id,
+                    "shortfall": round(target, 6),
+                }
             )
+            continue
 
         # ------------------------------------------------------
         # CASE 1: PRIMARY already covers scene.
@@ -1979,6 +2016,10 @@ def build_plan(
     aspect_ratio: str,
     visual_style: str,
     editorial_profile: Mapping[str, Any] | None = None,
+    material_source_policy: Mapping[str, Any] | None = None,
+    asset_hub_source_policy: Mapping[str, Any] | None = None,
+    material_title: str = "",
+    source_policy: str = "",
     selection_result: Any,
     discovery_result: Any,
     output_path: Path,
@@ -1990,24 +2031,31 @@ def build_plan(
     thumbnails_dir = output_path.parent / "thumbnails"
     all_candidates = list(getattr(discovery_result, "candidates", ()) or [])
     selected_decisions = list(getattr(selection_result, "decisions", ()) or [])
+    target_segment_count = max(
+        len(selected_decisions),
+        int(getattr(selection_result, "target_count", 0) or 0),
+    )
     clip_duration = float(getattr(getattr(selection_result, "options", None), "clip_duration", 5) or 5)
     editorial_profile = normalize_editorial_profile(editorial_profile)
-    script_fragments = split_script_for_segments(script_text, len(selected_decisions))
+    script_fragments = split_script_for_segments(script_text, target_segment_count)
     segment_queries = visual_queries_for_review_segments(
         script_text,
-        len(selected_decisions),
+        target_segment_count,
         tuple(getattr(selection_result, "search_terms", ()) or ()),
         editorial_profile,
     )
     review_inputs = [
         (
-            decision,
+            selected_decisions[index] if index < len(selected_decisions) else None,
             script_fragments[index],
             segment_queries[index] if index < len(segment_queries) else (),
         )
-        for index, decision in enumerate(selected_decisions)
+        for index in range(target_segment_count)
         if index < len(script_fragments)
-        and str(script_fragments[index] or "").strip()
+        and (
+            index >= len(selected_decisions)
+            or str(script_fragments[index] or "").strip()
+        )
     ]
     segments = []
 
@@ -2024,7 +2072,7 @@ def build_plan(
     used_selected_asset_uids: set[str] = set()
 
     for decision, _script_fragment, queries in review_inputs:
-        original_candidate = decision.candidate
+        original_candidate = getattr(decision, "candidate", None)
 
         ranked_candidates = _ranked_segment_candidates(
             original_candidate,
@@ -2043,7 +2091,7 @@ def build_plan(
             used_selected_asset_uids,
         )
 
-        selected_uid = candidate_uid(candidate)
+        selected_uid = candidate_uid(candidate) if candidate is not None else ""
 
         if selected_uid:
             used_selected_asset_uids.add(selected_uid)
@@ -2166,55 +2214,60 @@ def build_plan(
             forced_repeat,
         ) = reserved
 
-        selected_uid = candidate_uid(candidate)
+        selected_uid = candidate_uid(candidate) if candidate is not None else ""
 
         selected_decision = (
             decision
-            if candidate_uid(
-                original_candidate
-            ) == selected_uid
+            if (
+                candidate is not None
+                and original_candidate is not None
+                and candidate_uid(original_candidate) == selected_uid
+            )
             else None
         )
 
-        selected_preview, selected_preview_warnings = (
-            ensure_candidate_preview(
+        selected_asset = None
+        selected_preview_warnings = []
+        if candidate is not None:
+            selected_preview, selected_preview_warnings = (
+                ensure_candidate_preview(
+                    candidate,
+                    thumbnails_dir,
+                )
+            )
+
+            selected_thumb = (
+                selected_preview.get("value")
+                if selected_preview.get("type") == "local"
+                else selected_preview.get(
+                    "placeholder_path",
+                    "",
+                )
+            )
+
+            selected_thumb_url = (
+                selected_preview.get("value")
+                if selected_preview.get("type") == "url"
+                else selected_preview.get(
+                    "source_url",
+                    "",
+                )
+            )
+
+            selected_asset = serialize_candidate(
                 candidate,
-                thumbnails_dir,
+                selected_decision,
+                selected_thumb,
             )
-        )
 
-        selected_thumb = (
-            selected_preview.get("value")
-            if selected_preview.get("type") == "local"
-            else selected_preview.get(
-                "placeholder_path",
-                "",
+            selected_asset["preview"] = (
+                selected_preview
             )
-        )
 
-        selected_thumb_url = (
-            selected_preview.get("value")
-            if selected_preview.get("type") == "url"
-            else selected_preview.get(
-                "source_url",
-                "",
-            )
-        )
-
-        selected_asset = serialize_candidate(
-            candidate,
-            selected_decision,
-            selected_thumb,
-        )
-
-        selected_asset["preview"] = (
-            selected_preview
-        )
-
-        if selected_thumb_url:
-            selected_asset[
-                "thumbnail_url"
-            ] = selected_thumb_url
+            if selected_thumb_url:
+                selected_asset[
+                    "thumbnail_url"
+                ] = selected_thumb_url
 
         alternatives = []
         segment_warnings = list(
@@ -2234,6 +2287,15 @@ def build_plan(
                     "segment_id": (
                         f"segment-{index:03d}"
                     ),
+                }
+            )
+        if selected_asset is None:
+            segment_warnings.append(
+                {
+                    "type": "review_required",
+                    "code": "missing_primary",
+                    "message": "no visible candidate satisfies this review segment",
+                    "segment_id": f"segment-{index:03d}",
                 }
             )
 
@@ -2333,14 +2395,14 @@ def build_plan(
                 "alternatives": alternatives,
                 "feedback": {
                     "original_selected_asset_uid": (
-                        selected_asset.get(
-                            "asset_uid"
-                        )
+                        selected_asset.get("asset_uid")
+                        if isinstance(selected_asset, Mapping)
+                        else ""
                     ),
                     "final_selected_asset_uid": (
-                        selected_asset.get(
-                            "asset_uid"
-                        )
+                        selected_asset.get("asset_uid")
+                        if isinstance(selected_asset, Mapping)
+                        else ""
                     ),
                     "human_changed": False,
                 },
@@ -2360,6 +2422,11 @@ def build_plan(
         "aspect_ratio": aspect_ratio,
         "visual_style": visual_style,
         "editorial_profile": editorial_profile,
+        "material_source_policy": dict(material_source_policy or {}),
+        "asset_hub_source_policy": dict(asset_hub_source_policy or {}),
+        "material_title": str(material_title or ""),
+        "title_scope": str(material_title or ""),
+        "source_policy": str(source_policy or ""),
         "review_required": True,
         "review_status": STATUS_PENDING,
         "created_at": existing.get("created_at") or utc_timestamp(),

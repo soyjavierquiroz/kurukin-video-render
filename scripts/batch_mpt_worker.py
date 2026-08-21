@@ -38,8 +38,12 @@ def _material_source_policy(manifest: dict) -> dict:
     )
 
     title = str(manifest.get("material_title") or "").strip()
+    source_policy = str(manifest.get("source_policy") or "").strip()
 
-    if not title:
+    if source_policy == "title-exclusive" and not title:
+        raise ValueError("source_policy=title-exclusive requires material_title")
+
+    if source_policy != "title-exclusive" and not title:
         return open_sources_policy().to_dict()
 
     return MaterialSourcePolicy(
@@ -457,6 +461,8 @@ def run_review(manifest: dict) -> dict:
             "script_path": manifest.get("host_text_file") or manifest["text_file"],
             "visual_style": manifest.get("visual_style", "none"),
             "editorial_profile": manifest.get("editorial_profile") or {},
+            "material_title": manifest.get("material_title") or "",
+            "source_policy": manifest.get("source_policy") or "",
         },
     )
     result = task.start(manifest["task_id"], params, stop_at="review")

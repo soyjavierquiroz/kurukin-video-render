@@ -312,6 +312,8 @@ def make_manifest(
     production_plan_path: Path | None = None,
     visual_style: str = VISUAL_STYLE_NONE,
     subject_gender: str = "neutral",
+    material_title: str = "",
+    source_policy: str = "",
 ) -> dict[str, Any]:
     payload = {
         "batch_id": sanitize_batch_id(job.mp3.parent),
@@ -326,7 +328,8 @@ def make_manifest(
         "script": script,
         "visual_style": visual_style,
         "editorial_profile": {"subject_gender": subject_gender},
-        "material_title": os.environ.get("MPT_MATERIAL_TITLE", "").strip(),
+        "material_title": material_title.strip(),
+        "source_policy": source_policy.strip(),
     }
     if production_plan_path is not None:
         payload["production_plan_path"] = host_to_container(production_plan_path)
@@ -341,6 +344,8 @@ def write_manifest(
     production_plan_path: Path | None = None,
     visual_style: str = VISUAL_STYLE_NONE,
     subject_gender: str = "neutral",
+    material_title: str = "",
+    source_policy: str = "",
 ) -> Path:
     manifest_path = task_dir / "batch-manifest.json"
     write_json_atomic(
@@ -352,6 +357,8 @@ def write_manifest(
             production_plan_path=production_plan_path,
             visual_style=visual_style,
             subject_gender=subject_gender,
+            material_title=material_title,
+            source_policy=source_policy,
         ),
     )
     return manifest_path
@@ -552,6 +559,8 @@ def process_job(
     visual_style: str = VISUAL_STYLE_NONE,
     human_review_mode: bool = False,
     subject_gender: str = "neutral",
+    material_title: str = "",
+    source_policy: str = "",
 ) -> str:
     task_dir = HOST_ROOT / "storage" / "tasks" / job.task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -574,6 +583,8 @@ def process_job(
         production_plan_path=review_plan_path if (human_review_mode or approved_review_plan) else None,
         visual_style=visual_style,
         subject_gender=subject_gender,
+        material_title=material_title,
+        source_policy=source_policy,
     )
     existing_report_entry = dict(job_report_entry(report, job))
     current_visual_style_version = visual_style_version(visual_style)
@@ -753,6 +764,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("feminine", "masculine", "mixed", "neutral"),
         default="neutral",
     )
+    parser.add_argument("--material-title", default=os.environ.get("MPT_MATERIAL_TITLE", "").strip())
+    parser.add_argument(
+        "--source-policy",
+        choices=("", "open", "title-exclusive"),
+        default=os.environ.get("MPT_SOURCE_POLICY", "").strip(),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -796,6 +813,8 @@ def main(argv: list[str] | None = None) -> int:
                     visual_style=args.visual_style,
                     human_review_mode=args.human_review,
                     subject_gender=args.subject_gender,
+                    material_title=args.material_title,
+                    source_policy=args.source_policy,
                 )
                 counts[status] = counts.get(status, 0) + 1
             except Exception as exc:

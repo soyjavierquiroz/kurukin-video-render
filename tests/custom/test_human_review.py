@@ -21,7 +21,7 @@ if TASK_DEPS_AVAILABLE:
     from app.services import task
 
 
-def candidate(uid, term="term", provider="pexels", url=None, source_info=None):
+def candidate(uid, term="term", provider="pexels", url=None, source_info=None, duration=5, width=1080, height=1920, orientation="portrait"):
     return MaterialCandidate(
         provider=provider,
         canonical_id=uid,
@@ -29,10 +29,10 @@ def candidate(uid, term="term", provider="pexels", url=None, source_info=None):
         search_term=term,
         rank=1,
         url=url if url is not None else f"https://example.test/{uid}.mp4",
-        duration=5,
-        width=1080,
-        height=1920,
-        orientation="portrait",
+        duration=duration,
+        width=width,
+        height=height,
+        orientation=orientation,
         source_info=source_info or {},
     )
 
@@ -118,6 +118,34 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertLessEqual(len(plan["segments"][0]["alternatives"]), 3)
         self.assertTrue(Path(plan["segments"][0]["selected_asset"]["thumbnail_path"]).exists())
         self.assertTrue(plan["segments"][0]["selected_asset"]["flip_horizontal"])
+
+    def test_build_plan_preserves_material_scope_policy(self):
+        selected = candidate("asset-1", provider="asset_hub", source_info={"title": "mi-otra-yo"})
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="script",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            material_source_policy={"providers": {"enabled": ["asset_hub"]}},
+            asset_hub_source_policy={"sources": [{"scope": "title", "title": "mi-otra-yo"}]},
+            material_title="mi-otra-yo",
+            source_policy="title-exclusive",
+            selection_result=selection([selected]),
+            discovery_result=SimpleNamespace(candidates=(selected,)),
+            output_path=plan_file,
+        )
+
+        self.assertEqual(plan["material_title"], "mi-otra-yo")
+        self.assertEqual(plan["title_scope"], "mi-otra-yo")
+        self.assertEqual(plan["source_policy"], "title-exclusive")
+        self.assertEqual(plan["asset_hub_source_policy"], {"sources": [{"scope": "title", "title": "mi-otra-yo"}]})
 
     def test_selected_assets_prefer_unused_candidates_across_segments(self):
         assets = [candidate(uid) for uid in ("asset-a", "asset-b", "asset-c")]
@@ -233,8 +261,68 @@ class TestHumanReviewPlan(unittest.TestCase):
         ]
         self.assertEqual(plan["editorial_profile"], {"subject_gender": "feminine"})
         self.assertEqual(segment["selected_asset"]["asset_uid"], "asset-woman")
-        self.assertIn("asset-man", visible_uids)
+        self.assertNotIn("asset-man", visible_uids)
         self.assertTrue(any("mujer" in term or "niña" in term for term in segment["search_terms"]))
+
+    def test_feminine_strict_visible_candidates(self):
+        masculine = candidate("asset-man", term="hombre triste", source_info={"title": "hombre triste"})
+        boy = candidate("asset-boy", term="niño solo", source_info={"title": "niño solo"})
+        feminine = candidate("asset-woman", term="mujer triste", source_info={"title": "mujer triste"})
+        girl = candidate("asset-girl", term="niña sola", source_info={"title": "niña sola"})
+        unknown = candidate("asset-unknown", term="persona triste", source_info={"title": "persona triste"})
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="Ella estaba triste.",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            editorial_profile={"subject_gender": "feminine"},
+            selection_result=selection([masculine]),
+            discovery_result=SimpleNamespace(candidates=(masculine, boy, feminine, girl, unknown)),
+            output_path=plan_file,
+        )
+
+        visible_uids = [plan["segments"][0]["selected_asset"]["asset_uid"]] + [
+            item["asset_uid"] for item in plan["segments"][0]["alternatives"]
+        ]
+        self.assertIn("asset-woman", visible_uids)
+        self.assertIn("asset-girl", visible_uids)
+        self.assertNotIn("asset-man", visible_uids)
+        self.assertNotIn("asset-boy", visible_uids)
+        self.assertNotIn("asset-unknown", visible_uids)
+
+    def test_neutral_does_not_filter_and_mixed_allows_both(self):
+        masculine = candidate("asset-man", term="hombre triste", source_info={"title": "hombre triste"})
+        feminine = candidate("asset-woman", term="mujer triste", source_info={"title": "mujer triste"})
+        for subject_gender in ("neutral", "mixed"):
+            with self.subTest(subject_gender=subject_gender):
+                plan_file = self.root / f"storage/review_queue/batch/{subject_gender}/production-plan.json"
+                plan = human_review.build_plan(
+                    batch_id="batch",
+                    task_id="task-1",
+                    stem=subject_gender,
+                    audio_path="/tmp/audio.mp3",
+                    script_path="/tmp/story.txt",
+                    script_text="Dos personas.",
+                    duration=5,
+                    aspect_ratio="9:16",
+                    visual_style="none",
+                    editorial_profile={"subject_gender": subject_gender},
+                    selection_result=selection([masculine]),
+                    discovery_result=SimpleNamespace(candidates=(masculine, feminine)),
+                    output_path=plan_file,
+                )
+                visible_uids = [plan["segments"][0]["selected_asset"]["asset_uid"]] + [
+                    item["asset_uid"] for item in plan["segments"][0]["alternatives"]
+                ]
+                self.assertIn("asset-man", visible_uids)
+                self.assertIn("asset-woman", visible_uids)
 
     def test_segment_backup_reorder_and_promote_updates_plan(self):
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
@@ -284,6 +372,103 @@ class TestHumanReviewPlan(unittest.TestCase):
             [item["asset_uid"] for item in plan["segments"][0]["backup_assets"]],
         )
 
+    def test_segment_targets_follow_timeline_not_primary_duration(self):
+        short = candidate("asset-short", source_info={"title": "mujer"}, duration=2)
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        result = selection([short])
+
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="Una escena larga.",
+            duration=9,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=result,
+            discovery_result=SimpleNamespace(candidates=(short,)),
+            output_path=plan_file,
+        )
+
+        coverage = plan["segments"][0]["coverage"]
+        self.assertAlmostEqual(coverage["target_duration"], 5.1, places=3)
+        self.assertLess(coverage["covered_duration"], coverage["target_duration"])
+
+    def test_global_missing_requires_segment_missing(self):
+        assets = [candidate(f"asset-{index}", duration=2) for index in range(1, 6)]
+        result = MaterialSelectionResult(
+            MaterialSelectionOptions("9:16", 46.8, 5),
+            tuple(decision(item) for item in assets),
+            10,
+            5,
+            5,
+            False,
+            ("term",),
+            10,
+        )
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="Uno. Dos. Tres. Cuatro. Cinco. Seis. Siete. Ocho. Nueve. Diez.",
+            duration=46.8,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=result,
+            discovery_result=SimpleNamespace(candidates=tuple(assets)),
+            output_path=plan_file,
+        )
+
+        global_missing = plan["coverage"]["missing_duration"]
+        segment_missing = sum(segment["coverage"]["missing_duration"] for segment in plan["segments"])
+        segment_target = sum(segment["coverage"]["target_duration"] for segment in plan["segments"])
+        self.assertGreater(global_missing, 0)
+        self.assertTrue(any(segment["coverage"]["missing_duration"] > 0 for segment in plan["segments"]))
+        self.assertAlmostEqual(segment_target, plan["coverage"]["target_duration"], places=3)
+        self.assertAlmostEqual(segment_missing, global_missing, delta=0.01)
+
+    def test_backup_reduces_missing_duration(self):
+        primary = candidate("asset-primary", duration=2)
+        backup = candidate("asset-backup", duration=2)
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="Una escena.",
+            duration=5,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([primary]),
+            discovery_result=SimpleNamespace(candidates=(primary, backup)),
+            output_path=plan_file,
+        )
+        before = human_review.read_json(plan_file)["segments"][0]["coverage"]["missing_duration"]
+        plan = human_review.set_segment_backup(plan_file, "segment-001", "asset-backup", True)
+        after = plan["segments"][0]["coverage"]["missing_duration"]
+        self.assertLess(after, before)
+
+    def test_batch_manifest_title_exclusive_policy_has_no_generic_fallback(self):
+        manifest = {"material_title": "mi-otra-yo", "source_policy": "title-exclusive"}
+
+        policy = batch_mpt_worker._material_source_policy(manifest)
+
+        self.assertEqual(policy["providers"]["enabled"], ("asset_hub",))
+        self.assertEqual(policy["asset_hub"]["include"]["titles"], ("mi-otra-yo",))
+        self.assertFalse(policy["asset_hub"]["include"]["generic"])
+
+    def test_batch_manifest_title_exclusive_requires_title(self):
+        with self.assertRaises(ValueError):
+            batch_mpt_worker._material_source_policy({"source_policy": "title-exclusive"})
+
     def test_empty_trailing_script_segment_is_not_selected(self):
         assets = [candidate(f"asset-{index}") for index in range(3)]
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
@@ -307,7 +492,7 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertTrue(all(segment["script_text"].strip() for segment in plan["segments"]))
         self.assertEqual([segment["segment_id"] for segment in plan["segments"]], ["segment-001", "segment-002"])
 
-    def test_exhausted_candidate_pool_allows_repeat_with_warning(self):
+    def test_exhausted_candidate_pool_marks_segment_for_review(self):
         asset_a = candidate("asset-a")
         asset_b = candidate("asset-b")
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
@@ -328,17 +513,21 @@ class TestHumanReviewPlan(unittest.TestCase):
         )
 
         self.assertEqual(
-            [segment["selected_asset"]["asset_uid"] for segment in plan["segments"]],
-            ["asset-a", "asset-b", "asset-a"],
+            [
+                segment["selected_asset"]["asset_uid"]
+                if isinstance(segment.get("selected_asset"), dict)
+                else ""
+                for segment in plan["segments"]
+            ],
+            ["asset-a", "asset-b", ""],
         )
-        warning = next(item for item in plan["warnings"] if item.get("type") == "forced_asset_repeat")
+        warning = next(item for item in plan["warnings"] if item.get("type") == "review_required")
         self.assertEqual(warning["segment_id"], "segment-003")
-        self.assertEqual(warning["asset_uid"], "asset-a")
         segment_warning = next(
             item for item in plan["segments"][2]["warnings"]
-            if item.get("type") == "forced_asset_repeat"
+            if item.get("type") == "review_required"
         )
-        self.assertEqual(segment_warning["asset_uid"], "asset-a")
+        self.assertEqual(segment_warning["code"], "missing_primary")
 
     def test_selected_and_alternatives_are_unique_and_capped_at_three(self):
         selected = candidate("asset-a")
