@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 import math
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Mapping
 
 from app.custom.asset_hub_manifest import (
     get_asset_hub_job_assets_dir,
+    validate_asset_hub_bundle_uid,
     validate_asset_hub_renderer_manifest,
 )
 from app.custom.kurukin_asset_hub import (
@@ -300,13 +301,7 @@ def resolve_renderer_manifest_path(
 ) -> str:
     """Return the physical renderer manifest path for a materialized bundle."""
 
-    clean_uid = _clean_text(bundle_uid)
-    if not clean_uid:
-        raise ValueError("bundle_uid is required")
-    uid_path = PurePosixPath(clean_uid)
-    if uid_path.is_absolute() or "/" in clean_uid or "\\" in clean_uid or ".." in uid_path.parts:
-        raise ValueError("bundle_uid cannot contain path separators or parent paths")
-
+    clean_uid = validate_asset_hub_bundle_uid(bundle_uid)
     base = Path(root).resolve() if root is not None else get_asset_hub_job_assets_dir().resolve()
     manifest_path = (base / clean_uid / "manifests" / "renderer-manifest.json").resolve(
         strict=False

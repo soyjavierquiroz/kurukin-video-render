@@ -303,6 +303,153 @@ class TestAssetHubRendererManifest(AssetHubFixtureMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             asset_hub_manifest.extract_asset_hub_local_assets(manifest)
 
+    def test_extract_prefers_relative_path_over_producer_local_path(self):
+        manifest = self.make_manifest(
+            scenes=[
+                {
+                    "scene_id": "scene-0",
+                    "scene_index": 0,
+                    "assets": [
+                        {
+                            "asset_uid": "drive-test",
+                            "asset_id": "drive-test",
+                            "status": "ready",
+                            "type": "video",
+                            "filename": "foo.mp4",
+                            "local_path": (
+                                "/var/lib/kurukin-asset-hub-pilot/job-assets/"
+                                "jab_test/assets/foo.mp4"
+                            ),
+                            "relative_path": "assets/foo.mp4",
+                        }
+                    ],
+                }
+            ]
+        )
+        expected_path = Path("/data/job-assets/jab_test/assets/foo.mp4")
+
+        with patch.object(
+            asset_hub_manifest,
+            "get_asset_hub_job_assets_dir",
+            return_value=Path("/data/job-assets"),
+        ):
+            with patch.object(Path, "is_file", return_value=True):
+                assets = asset_hub_manifest.extract_asset_hub_local_assets(manifest)
+
+        self.assertEqual(assets[0]["local_path"], str(expected_path))
+
+    def test_extract_rejects_relative_path_parent_traversal(self):
+        manifest = self.make_manifest(
+            scenes=[
+                {
+                    "scene_id": "scene-0",
+                    "scene_index": 0,
+                    "assets": [
+                        {
+                            "asset_uid": "drive-test",
+                            "asset_id": "drive-test",
+                            "status": "ready",
+                            "type": "video",
+                            "filename": "foo.mp4",
+                            "local_path": "/data/job-assets/jab_test/assets/foo.mp4",
+                            "relative_path": "../../etc/passwd",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        with self.assertRaises(ValueError):
+            asset_hub_manifest.extract_asset_hub_local_assets(manifest)
+
+    def test_extract_rejects_absolute_relative_path(self):
+        manifest = self.make_manifest(
+            scenes=[
+                {
+                    "scene_id": "scene-0",
+                    "scene_index": 0,
+                    "assets": [
+                        {
+                            "asset_uid": "drive-test",
+                            "asset_id": "drive-test",
+                            "status": "ready",
+                            "type": "video",
+                            "filename": "foo.mp4",
+                            "local_path": "/data/job-assets/jab_test/assets/foo.mp4",
+                            "relative_path": "/etc/passwd",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        with self.assertRaises(ValueError):
+            asset_hub_manifest.extract_asset_hub_local_assets(manifest)
+
+    def test_extract_local_path_fallback_passes_without_relative_path(self):
+        manifest = self.make_manifest(
+            scenes=[
+                {
+                    "scene_id": "scene-0",
+                    "scene_index": 0,
+                    "assets": [
+                        {
+                            "asset_uid": "drive-test",
+                            "asset_id": "drive-test",
+                            "status": "ready",
+                            "type": "video",
+                            "filename": "foo.mp4",
+                            "local_path": "/data/job-assets/jab_test/assets/foo.mp4",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        with patch.object(
+            asset_hub_manifest,
+            "get_asset_hub_job_assets_dir",
+            return_value=Path("/data/job-assets"),
+        ):
+            with patch.object(Path, "is_file", return_value=True):
+                assets = asset_hub_manifest.extract_asset_hub_local_assets(manifest)
+
+        self.assertEqual(
+            assets[0]["local_path"],
+            "/data/job-assets/jab_test/assets/foo.mp4",
+        )
+
+    def test_extract_rejects_producer_local_path_without_relative_path(self):
+        manifest = self.make_manifest(
+            scenes=[
+                {
+                    "scene_id": "scene-0",
+                    "scene_index": 0,
+                    "assets": [
+                        {
+                            "asset_uid": "drive-test",
+                            "asset_id": "drive-test",
+                            "status": "ready",
+                            "type": "video",
+                            "filename": "foo.mp4",
+                            "local_path": (
+                                "/var/lib/kurukin-asset-hub-pilot/job-assets/"
+                                "jab_test/assets/foo.mp4"
+                            ),
+                        }
+                    ],
+                }
+            ]
+        )
+
+        with patch.object(
+            asset_hub_manifest,
+            "get_asset_hub_job_assets_dir",
+            return_value=Path("/data/job-assets"),
+        ):
+            with self.assertRaises(ValueError):
+                asset_hub_manifest.extract_asset_hub_local_assets(manifest)
+
     def test_strict_true_fails_missing_file(self):
         self.video_a.unlink()
         with self.assertRaises(ValueError):

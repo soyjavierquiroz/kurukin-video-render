@@ -260,6 +260,7 @@ class KurukinAssetHubTests(unittest.TestCase):
 
     def test_parse_renderer_manifest_ready_assets(self):
         manifest = {
+            "bundle_uid": "bundle",
             "scenes": [
                 {
                     "assets": [
@@ -267,10 +268,11 @@ class KurukinAssetHubTests(unittest.TestCase):
                             "asset_uid": "drive-a",
                             "status": "ready",
                             "local_path": "/data/job-assets/bundle/clip.mp4",
-                            "relative_path": "bundle/clip.mp4",
+                            "relative_path": "clip.mp4",
                             "size_bytes": 123,
                             "sha256": "abc",
                             "drive_file_id": "ignored",
+                            "custom_metadata": {"kept": True},
                         }
                     ]
                 }
@@ -284,11 +286,213 @@ class KurukinAssetHubTests(unittest.TestCase):
             [
                 {
                     "asset_uid": "drive-a",
+                    "status": "ready",
                     "local_path": "/data/job-assets/bundle/clip.mp4",
-                    "relative_path": "bundle/clip.mp4",
+                    "relative_path": "clip.mp4",
                     "size_bytes": 123,
                     "sha256": "abc",
+                    "drive_file_id": "ignored",
+                    "custom_metadata": {"kept": True},
                 }
+            ],
+        )
+
+    def test_relative_path_preferred_over_producer_local_path(self):
+        bundle_uid = "jab_ddfda73efc434ce4937df245a26dd798"
+        manifest = {
+            "bundle_uid": bundle_uid,
+            "scenes": [
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-a",
+                            "status": "ready",
+                            "local_path": (
+                                "/var/lib/kurukin-asset-hub-pilot/job-assets/"
+                                f"{bundle_uid}/assets/foo.mp4"
+                            ),
+                            "relative_path": "assets/foo.mp4",
+                        }
+                    ]
+                }
+            ],
+        }
+
+        assets = resolve_ready_asset_paths(manifest)
+
+        self.assertEqual(
+            assets[0]["local_path"],
+            f"/data/job-assets/{bundle_uid}/assets/foo.mp4",
+        )
+
+    def test_relative_path_resolves_inside_bundle_root(self):
+        manifest = {
+            "bundle_uid": "jab_test",
+            "scenes": [
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-a",
+                            "status": "ready",
+                            "local_path": "/var/lib/producer/job-assets/jab_test/assets/foo.mp4",
+                            "relative_path": "assets/foo.mp4",
+                        }
+                    ]
+                }
+            ],
+        }
+
+        self.assertEqual(
+            resolve_ready_asset_paths(manifest)[0]["local_path"],
+            "/data/job-assets/jab_test/assets/foo.mp4",
+        )
+
+    def test_relative_path_parent_traversal_is_rejected(self):
+        manifest = {
+            "bundle_uid": "jab_test",
+            "scenes": [
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-a",
+                            "status": "ready",
+                            "local_path": "/data/job-assets/jab_test/assets/foo.mp4",
+                            "relative_path": "../../etc/passwd",
+                        }
+                    ]
+                }
+            ],
+        }
+
+        with self.assertRaises(KurukinAssetHubValidationError):
+            resolve_ready_asset_paths(manifest)
+
+    def test_absolute_relative_path_is_rejected(self):
+        manifest = {
+            "bundle_uid": "jab_test",
+            "scenes": [
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-a",
+                            "status": "ready",
+                            "local_path": "/data/job-assets/jab_test/assets/foo.mp4",
+                            "relative_path": "/etc/passwd",
+                        }
+                    ]
+                }
+            ],
+        }
+
+        with self.assertRaises(KurukinAssetHubValidationError):
+            resolve_ready_asset_paths(manifest)
+
+    def test_local_path_fallback_passes_when_relative_path_missing(self):
+        manifest = {
+            "bundle_uid": "jab_test",
+            "scenes": [
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-a",
+                            "status": "ready",
+                            "local_path": "/data/job-assets/jab_test/assets/foo.mp4",
+                        }
+                    ]
+                }
+            ],
+        }
+
+        self.assertEqual(
+            resolve_ready_asset_paths(manifest)[0]["local_path"],
+            "/data/job-assets/jab_test/assets/foo.mp4",
+        )
+
+    def test_local_path_fallback_rejects_producer_path_when_relative_path_missing(self):
+        manifest = {
+            "bundle_uid": "jab_test",
+            "scenes": [
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-a",
+                            "status": "ready",
+                            "local_path": "/var/lib/kurukin-asset-hub-pilot/job-assets/jab_test/assets/foo.mp4",
+                        }
+                    ]
+                }
+            ],
+        }
+
+        with self.assertRaises(KurukinAssetHubValidationError):
+            resolve_ready_asset_paths(manifest)
+
+    def test_asset_metadata_is_preserved_when_paths_are_resolved(self):
+        manifest = {
+            "bundle_uid": "jab_test",
+            "scenes": [
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-a",
+                            "status": "ready",
+                            "local_path": "/var/lib/producer/job-assets/jab_test/assets/foo.mp4",
+                            "relative_path": "assets/foo.mp4",
+                            "duration_seconds": 5.5,
+                            "rank": 2,
+                            "source": {"scope": "title"},
+                        }
+                    ]
+                }
+            ],
+        }
+
+        asset = resolve_ready_asset_paths(manifest)[0]
+
+        self.assertEqual(asset["asset_uid"], "drive-a")
+        self.assertEqual(asset["duration_seconds"], 5.5)
+        self.assertEqual(asset["rank"], 2)
+        self.assertEqual(asset["source"], {"scope": "title"})
+
+    def test_multiple_scenes_assets_resolve_all_relative_paths(self):
+        manifest = {
+            "bundle_uid": "jab_test",
+            "scenes": [
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-a",
+                            "status": "ready",
+                            "local_path": "/var/lib/producer/job-assets/jab_test/assets/a.mp4",
+                            "relative_path": "assets/a.mp4",
+                        }
+                    ]
+                },
+                {
+                    "assets": [
+                        {
+                            "asset_uid": "drive-b",
+                            "status": "ready",
+                            "local_path": "/var/lib/producer/job-assets/jab_test/assets/b.mp4",
+                            "relative_path": "assets/b.mp4",
+                        },
+                        {
+                            "asset_uid": "drive-c",
+                            "status": "ready",
+                            "local_path": "/var/lib/producer/job-assets/jab_test/assets/c.mp4",
+                            "relative_path": "assets/c.mp4",
+                        },
+                    ]
+                },
+            ],
+        }
+
+        self.assertEqual(
+            [asset["local_path"] for asset in resolve_ready_asset_paths(manifest)],
+            [
+                "/data/job-assets/jab_test/assets/a.mp4",
+                "/data/job-assets/jab_test/assets/b.mp4",
+                "/data/job-assets/jab_test/assets/c.mp4",
             ],
         )
 

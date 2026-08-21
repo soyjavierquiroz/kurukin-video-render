@@ -1,6 +1,6 @@
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -76,6 +76,47 @@ def resolve_asset_hub_asset_path(
     require_file: bool = True,
 ) -> Path:
     return _resolve_path_under_base(path, base_dir=base_dir, require_file=require_file)
+
+
+def validate_asset_hub_bundle_uid(bundle_uid: str) -> str:
+    clean_uid = str(bundle_uid or "").strip()
+    if not clean_uid:
+        raise ValueError("bundle_uid is required")
+    uid_path = PurePosixPath(clean_uid)
+    if (
+        uid_path.is_absolute()
+        or "/" in clean_uid
+        or "\\" in clean_uid
+        or ".." in uid_path.parts
+    ):
+        raise ValueError("bundle_uid cannot contain path separators or parent paths")
+    return clean_uid
+
+
+def resolve_asset_hub_bundle_relative_path(
+    bundle_uid: str,
+    relative_path: str,
+    base_dir: Path | None = None,
+    *,
+    require_file: bool = False,
+) -> Path:
+    clean_uid = validate_asset_hub_bundle_uid(bundle_uid)
+    clean_path = str(relative_path or "").strip()
+    if not clean_path:
+        raise ValueError("asset hub relative_path is required")
+
+    requested = PurePosixPath(clean_path)
+    if requested.is_absolute():
+        raise ValueError("asset hub relative_path must be relative")
+    if ".." in requested.parts:
+        raise ValueError("asset hub relative_path cannot contain parent paths")
+
+    bundle_root = _resolve_base_dir(base_dir) / clean_uid
+    return _resolve_path_under_base(
+        clean_path,
+        base_dir=bundle_root,
+        require_file=require_file,
+    )
 
 
 def load_asset_hub_renderer_manifest(
@@ -159,8 +200,27 @@ def _asset_order(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(assets)
 
 
-def _asset_path_value(asset: dict[str, Any]) -> str:
-    return str(asset.get("local_path") or asset.get("relative_path") or "")
+def _resolve_manifest_asset_path(
+    asset: dict[str, Any],
+    bundle_uid: str,
+    *,
+    base_dir: Path | None = None,
+    require_file: bool = True,
+) -> Path:
+    relative_path = str(asset.get("relative_path") or "").strip()
+    if relative_path:
+        return resolve_asset_hub_bundle_relative_path(
+            bundle_uid,
+            relative_path,
+            base_dir=base_dir,
+            require_file=require_file,
+        )
+
+    return resolve_asset_hub_asset_path(
+        str(asset.get("local_path") or ""),
+        base_dir=base_dir,
+        require_file=require_file,
+    )
 
 
 def extract_asset_hub_local_assets(
@@ -186,8 +246,9 @@ def extract_asset_hub_local_assets(
                 if asset_type not in allowed:
                     raise ValueError(f"unsupported asset hub asset type: {asset_type}")
 
-                resolved_path = resolve_asset_hub_asset_path(
-                    _asset_path_value(asset),
+                resolved_path = _resolve_manifest_asset_path(
+                    asset,
+                    manifest["bundle_uid"],
                     base_dir=base_dir,
                     require_file=True,
                 )

@@ -14,6 +14,7 @@ import requests
 from app.custom.asset_hub_manifest import (
     DEFAULT_ASSET_HUB_JOB_ASSETS_DIR,
     is_asset_hub_asset_ready,
+    resolve_asset_hub_bundle_relative_path,
 )
 
 
@@ -175,6 +176,7 @@ def resolve_ready_asset_paths(
     materialized_root: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     ready_assets: list[dict[str, Any]] = []
+    bundle_uid = _clean_text(manifest.get("bundle_uid"))
     for scene in _manifest_scenes(manifest):
         if not isinstance(scene, Mapping):
             continue
@@ -182,19 +184,36 @@ def resolve_ready_asset_paths(
             if not isinstance(asset, Mapping) or not is_asset_hub_asset_ready(dict(asset)):
                 continue
             normalized = normalize_asset_identity(asset)
-            local_path = validate_materialized_path(
-                _clean_text(asset.get("local_path")),
-                materialized_root=materialized_root,
-            )
-            ready_assets.append(
+            relative_path = _clean_text(asset.get("relative_path"))
+            if relative_path:
+                try:
+                    local_path = str(
+                        resolve_asset_hub_bundle_relative_path(
+                            bundle_uid,
+                            relative_path,
+                            base_dir=Path(materialized_root) if materialized_root else None,
+                            require_file=False,
+                        )
+                    )
+                except ValueError as exc:
+                    raise KurukinAssetHubValidationError(str(exc)) from exc
+            else:
+                local_path = validate_materialized_path(
+                    _clean_text(asset.get("local_path")),
+                    materialized_root=materialized_root,
+                )
+
+            resolved_asset = dict(asset)
+            resolved_asset.update(
                 {
                     "asset_uid": normalized["asset_uid"],
                     "local_path": local_path,
-                    "relative_path": _clean_text(asset.get("relative_path")),
+                    "relative_path": relative_path,
                     "size_bytes": asset.get("size_bytes"),
                     "sha256": _clean_text(asset.get("sha256")),
                 }
             )
+            ready_assets.append(resolved_asset)
     return ready_assets
 
 
