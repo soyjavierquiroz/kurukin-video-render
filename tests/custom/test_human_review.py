@@ -119,6 +119,31 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertTrue(Path(plan["segments"][0]["selected_asset"]["thumbnail_path"]).exists())
         self.assertTrue(plan["segments"][0]["selected_asset"]["flip_horizontal"])
 
+    def test_extended_asset_hub_metadata_survives_primary_suggested_and_backup(self):
+        metadata = {
+            "duration": 7.1, "width": 1080, "height": 1350, "orientation": "vertical-4x5",
+            "primary_theme": "vulnerabilidad", "primary_topic": "aceptar ayuda",
+            "visual_description": "Una mujer sentada mirando hacia un lado.",
+            "action_description": "Permanece quieta con expresión preocupada.",
+            "contains_people": True, "people_count": 1, "visual_presentation": "feminine",
+            "visual_presentation_confidence": 0.98, "person_visibility": "clear",
+        }
+        selected = candidate("asset-primary", provider="asset_hub", source_info=metadata, duration=7.1, width=1080, height=1350, orientation="vertical-4x5")
+        suggested = candidate("asset-suggested", provider="asset_hub", source_info=metadata, duration=7.1, width=1080, height=1350, orientation="vertical-4x5")
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        plan = human_review.build_plan(
+            batch_id="batch", task_id="task-1", stem="story", audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt", script_text="script", duration=5, aspect_ratio="9:16",
+            visual_style="none", selection_result=selection([selected]),
+            discovery_result=SimpleNamespace(candidates=(selected, suggested)), output_path=plan_file,
+        )
+        human_review.set_segment_backup(plan_file, "segment-001", "asset-suggested", True)
+        persisted = human_review.read_json(plan_file)["segments"][0]
+
+        for asset in (persisted["selected_asset"], persisted["alternatives"][0], persisted["backup_assets"][0]):
+            self.assertEqual(asset["metadata"], metadata)
+
     def test_build_plan_preserves_material_scope_policy(self):
         selected = candidate("asset-1", provider="asset_hub", source_info={"title": "mi-otra-yo"})
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"

@@ -65,6 +65,58 @@ def _asset_duration(asset: dict) -> float:
     return float(metadata.get("duration") or 0)
 
 
+def _asset_metadata(asset: dict) -> dict:
+    return asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
+
+
+def _asset_ratio(metadata: dict) -> str:
+    try:
+        width = int(metadata.get("width"))
+        height = int(metadata.get("height"))
+    except (TypeError, ValueError):
+        return ""
+    if width <= 0 or height <= 0:
+        return ""
+    from math import gcd
+    divisor = gcd(width, height)
+    return f"{width // divisor}x{height // divisor}"
+
+
+def show_asset_metadata(asset: dict) -> None:
+    """Render concise, optional editorial metadata supplied by Asset Hub."""
+    metadata = _asset_metadata(asset)
+    duration = _asset_duration(asset)
+    ratio = _asset_ratio(metadata)
+    technical = []
+    if duration > 0:
+        technical.append(f"Duration: {duration:.1f}s")
+    if ratio:
+        technical.append(ratio)
+    if technical:
+        st.caption(" · ".join(technical))
+
+    for label, key in (("Topic", "primary_topic"), ("Theme", "primary_theme")):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            st.caption(f"{label}: {value}")
+
+    people = []
+    count = metadata.get("people_count")
+    if count not in (None, ""):
+        people.append(str(count))
+    for key in ("visual_presentation", "person_visibility"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            people.append(value)
+    if people:
+        st.caption(f"People: {' · '.join(people)}")
+
+    for label, key in (("Visual", "visual_description"), ("Action", "action_description")):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            st.caption(f"{label}: {value}")
+
+
 def _reorder_backup(plan_file: Path, segment_id: str, backups: list[dict], index: int, delta: int) -> None:
     target = index + delta
     if target < 0 or target >= len(backups):
@@ -370,10 +422,7 @@ def main() -> None:
                     f"{segment_id}-selected",
                 )
 
-                st.caption(
-                    "source duration "
-                    f"{_asset_duration(selected):.2f}s"
-                )
+                show_asset_metadata(selected)
             else:
                 st.warning("REVIEW REQUIRED")
                 st.caption("0 visible PRIMARY candidates")
@@ -448,6 +497,7 @@ def main() -> None:
                         else ""
                     )
                 )
+                show_asset_metadata(alternative)
 
                 if st.button(
                     "MAKE PRIMARY",

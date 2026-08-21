@@ -64,6 +64,23 @@ class TestMaterialSelection(unittest.TestCase):
         self.assertEqual(result.decisions[0].candidate.dedupe_key, "high")
         self.assertEqual(result.selected_count, 3)
 
+    def test_extended_editorial_metadata_does_not_change_selection_or_coverage(self):
+        best = candidate(
+            "best", rank=1, width=1080, height=1920, duration=5,
+            source_info={"primary_topic": "aceptar ayuda", "people_count": 1, "visual_presentation": "feminine"},
+        )
+        other = candidate(
+            "other", rank=2, width=1080, height=1920, duration=5,
+            source_info={"primary_topic": "otro", "people_count": 2, "visual_presentation": "mixed"},
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(best, other), video_aspect="9:16", target_duration=10, clip_duration=5,
+        )
+
+        self.assertEqual([item.candidate.dedupe_key for item in result.decisions], ["best", "other"])
+        self.assertEqual(result.covered_terms, ("one",))
+
     def test_diversity_recent_fallback_no_duplicates_and_shortfall(self):
         items = (candidate("p1", provider="pexels", rank=1, width=1280, height=720),
                  candidate("p2", provider="pexels", rank=1, width=1280, height=720),

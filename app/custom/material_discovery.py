@@ -252,6 +252,10 @@ def _asset_hub_candidate(asset: Mapping[str, Any], *, term: str, rank: int) -> M
         key: source[key] for key in (
             "filename", "media_type", "orientation", "duration", "width", "height",
             "scope", "brand", "title", "title_type",
+            "primary_theme", "primary_topic", "visual_description",
+            "action_description", "contains_people", "people_count",
+            "visual_presentation", "visual_presentation_confidence",
+            "person_visibility",
         )
         if key in source
     }

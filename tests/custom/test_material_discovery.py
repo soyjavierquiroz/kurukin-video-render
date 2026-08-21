@@ -225,6 +225,68 @@ class TestMaterialDiscovery(unittest.TestCase):
 
         self.assertEqual(result.candidates[0].source_info["preview_url"], "https://asset-hub.example/a.jpg")
 
+    def test_asset_hub_search_preserves_extended_editorial_metadata(self):
+        hub = FakeAssetHub({"term": [{
+            "asset_uid": "editorial-1",
+            "filename": "woman.mp4",
+            "duration": 7.1,
+            "width": 1080,
+            "height": 1350,
+            "orientation": "vertical-4x5",
+            "primary_theme": "vulnerabilidad",
+            "primary_topic": "aceptar ayuda",
+            "visual_description": "Una mujer sentada mirando hacia un lado.",
+            "action_description": "Permanece quieta con expresión preocupada.",
+            "contains_people": True,
+            "people_count": 1,
+            "visual_presentation": "feminine",
+            "visual_presentation_confidence": 0.98,
+            "person_visibility": "clear",
+        }]})
+
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ASSET_HUB), stock_terms=["term"], asset_hub_provider=hub,
+        )
+
+        item = result.candidates[0]
+        self.assertEqual((item.duration, item.width, item.height, item.orientation), (7.1, 1080, 1350, "vertical-4x5"))
+        self.assertEqual(item.source_info["primary_theme"], "vulnerabilidad")
+        self.assertEqual(item.source_info["primary_topic"], "aceptar ayuda")
+        self.assertEqual(item.source_info["visual_description"], "Una mujer sentada mirando hacia un lado.")
+        self.assertEqual(item.source_info["action_description"], "Permanece quieta con expresión preocupada.")
+        self.assertEqual(
+            {key: item.source_info[key] for key in ("contains_people", "people_count", "visual_presentation", "visual_presentation_confidence", "person_visibility")},
+            {"contains_people": True, "people_count": 1, "visual_presentation": "feminine", "visual_presentation_confidence": 0.98, "person_visibility": "clear"},
+        )
+
+    def test_asset_hub_search_preserves_null_optional_descriptions(self):
+        hub = FakeAssetHub({"term": [{
+            "asset_uid": "editorial-null",
+            "orientation": "vertical-9x16",
+            "visual_description": None,
+            "action_description": None,
+        }]})
+
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ASSET_HUB), stock_terms=["term"], asset_hub_provider=hub,
+        )
+
+        self.assertIsNone(result.candidates[0].source_info["visual_description"])
+        self.assertIsNone(result.candidates[0].source_info["action_description"])
+
+    def test_asset_hub_landscape_result_is_still_filtered_for_vertical_jobs(self):
+        hub = FakeAssetHub({"term": [
+            {"asset_uid": "vertical", "width": 1080, "height": 1920, "orientation": "vertical-9x16"},
+            {"asset_uid": "landscape", "width": 1920, "height": 1080, "orientation": "landscape-16x9"},
+        ]})
+
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ASSET_HUB), stock_terms=["term"], asset_hub_provider=hub,
+            video_aspect="9:16",
+        )
+
+        self.assertEqual([item.canonical_id for item in result.candidates], ["vertical"])
+
     def test_asset_hub_retries_once_with_simplified_visual_word(self):
         hub = FakeAssetHub({
             "mujer triste": [],
