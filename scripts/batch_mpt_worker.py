@@ -480,8 +480,16 @@ def run_subtitles(manifest: dict) -> dict:
     subtitle.compute_type = "int8"
 
     subtitle_file = Path(manifest["task_dir"]) / "subtitle.srt"
-    raw_audio = manifest["subtitle_audio_file"]
-    subtitle.create(raw_audio, subtitle_file.as_posix())
+    # The approved batch contract aligns directly against its canonical MP3.
+    # Do not require a master-derived WAV; faster-whisper reads MP3 via PyAV.
+    raw_audio = str(manifest["audio_file"])
+    audio_path = Path(raw_audio)
+    if not audio_path.is_file() or audio_path.stat().st_size <= 0:
+        raise RuntimeError(f"canonical MP3 audio missing for subtitles: {raw_audio}")
+    try:
+        subtitle.create(raw_audio, subtitle_file.as_posix())
+    except Exception as exc:
+        raise RuntimeError(f"Whisper could not decode canonical MP3 {raw_audio}: {exc}") from exc
     if not subtitle_file.is_file() or subtitle_file.stat().st_size <= 0:
         raise RuntimeError("Whisper subtitle generation failed: subtitle.srt missing or empty")
     report = subtitle.correct(subtitle_file.as_posix(), manifest["script"])

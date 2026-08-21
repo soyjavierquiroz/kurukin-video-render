@@ -39,6 +39,8 @@ WARM_SEPIA_FILTERGRAPH = (
     "colorchannelmixer=rr=1.045:rg=0.025:rb=0.000:gr=0.012:gg=0.990:gb=0.000:br=-0.015:bg=0.018:bb=0.860"
 )
 VIDEO_DURATION_TOLERANCE_SECONDS = 0.35
+CANONICAL_ALIGNMENT_SOURCE = "MP3"
+SUBTITLE_WAV_REQUIRED = False
 
 
 class BatchValidationError(Exception):
@@ -137,6 +139,47 @@ def valid_file(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
+def valid_mp4(path: Path) -> bool:
+    """Cheap gate for reusable video artifacts.
+
+    Do not treat a non-empty file as a render result: ffprobe must be able to
+    read it, it must contain video, and it must have a positive duration.
+    """
+    if not valid_file(path):
+        return False
+    try:
+        info = ffprobe_media(path)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError, ValueError):
+        return False
+    return bool(info["has_video"] and info["duration"] and info["duration"] > 0)
+
+
+def valid_srt(path: Path) -> bool:
+    """Return whether *path* contains at least one parseable SRT cue."""
+    if not valid_file(path):
+        return False
+    try:
+        from app.custom.subtitle_optimizer import parse_srt
+
+        return bool(parse_srt(path.read_text(encoding="utf-8-sig")))
+    except (OSError, UnicodeError):
+        return False
+
+
+def ensure_similar_duration(master: Path, output: Path) -> None:
+    """Reject a delivery video whose duration materially differs from master."""
+    master_duration = ffprobe_media(master)["duration"]
+    output_duration = ffprobe_media(output)["duration"]
+    if not master_duration or not output_duration:
+        raise StageError(f"duration unavailable for delivery validation: {output}")
+    delta = abs(master_duration - output_duration)
+    if delta > VIDEO_DURATION_TOLERANCE_SECONDS:
+        raise StageError(
+            f"delivery duration differs from master by {delta:.3f}s "
+            f"(tolerance {VIDEO_DURATION_TOLERANCE_SECONDS:.3f}s)"
+        )
+
+
 def ffprobe_media(path: Path) -> dict[str, Any]:
     result = subprocess.run(
         [
@@ -201,9 +244,13 @@ def validate_styled_master(master: Path, styled_master: Path) -> None:
 
 
 def approved_report(report: dict[str, Any]) -> bool:
+    try:
+        confidence = float(report.get("confidence") or 0)
+    except (TypeError, ValueError):
+        return False
     return (
         report.get("status") in {"ok", "custom_srt"}
-        and float(report.get("confidence") or 0) >= APPROVAL_CONFIDENCE
+        and confidence >= APPROVAL_CONFIDENCE
         and report.get("review_required") is False
     )
 
@@ -324,7 +371,6 @@ def make_manifest(
         "host_audio_file": job.mp3.as_posix(),
         "text_file": host_to_container(job.txt),
         "host_text_file": job.txt.as_posix(),
-        "subtitle_audio_file": host_to_container(task_dir / "subtitle-audio.wav"),
         "script": script,
         "visual_style": visual_style,
         "editorial_profile": {"subject_gender": subject_gender},
@@ -621,10 +667,12 @@ def process_job(
         return human_review.STATUS_PENDING
 
     update_job(report, report_path, job, status="master")
-    if valid_file(master):
+    if valid_mp4(master):
         print("  MASTER      SKIP")
     else:
         run_worker(manifest, "master", logs_dir / f"{job.stem}-mpt.log")
+        if not valid_mp4(master):
+            raise StageError(f"master did not produce a valid video: {master}")
         print("  MASTER      OK")
 
     update_job(
@@ -663,19 +711,20 @@ def process_job(
         styled_master=styled_master.as_posix() if visual_style == VISUAL_STYLE_WARM_SEPIA else None,
     )
 
-    if valid_file(subtitle) and approved_report(subtitle_report(task_dir)):
+    if valid_srt(subtitle) and approved_report(subtitle_report(task_dir)):
         report_data = subtitle_report(task_dir)
         print(f"  SUBTITLES   SKIP confidence={float(report_data.get('confidence', 0)):.3f}")
     elif job.srt:
         shutil.copy2(job.srt, subtitle)
         report_data = write_custom_srt_report(task_dir)
+        if not valid_srt(subtitle):
+            raise StageError(f"custom subtitle is not a valid SRT: {job.srt}")
         print("  SUBTITLES   OK confidence=1.000 custom_srt")
     else:
-        extract_subtitle_audio(video_for_delivery, task_dir / "subtitle-audio.wav", logs_dir / f"{job.stem}-whisper.log")
         run_worker(manifest, "subtitles", logs_dir / f"{job.stem}-whisper.log")
         report_data = subtitle_report(task_dir)
         confidence = float(report_data.get("confidence") or 0)
-        if approved_report(report_data):
+        if valid_srt(subtitle) and approved_report(report_data):
             print(f"  SUBTITLES   OK confidence={confidence:.3f}")
         else:
             print(f"  SUBTITLES   REVIEW confidence={confidence:.3f}")
@@ -703,11 +752,12 @@ def process_job(
         styled_master=styled_master.as_posix() if visual_style == VISUAL_STYLE_WARM_SEPIA else None,
     )
 
-    final_subtitled_current = valid_file(final_subtitled) and delivery_output_is_current(
-        existing_report_entry,
-        video_for_delivery,
-        visual_style,
-    )
+    final_subtitled_current = valid_mp4(final_subtitled)
+    if final_subtitled_current:
+        try:
+            ensure_similar_duration(video_for_delivery, final_subtitled)
+        except (StageError, subprocess.CalledProcessError, json.JSONDecodeError):
+            final_subtitled_current = False
     if final_subtitled_current:
         print("  HYPERFRAMES SKIP")
     else:
@@ -720,6 +770,9 @@ def process_job(
             preset,
             position,
         )
+        if not valid_mp4(final_subtitled):
+            raise StageError(f"HyperFrames did not produce a valid video: {final_subtitled}")
+        ensure_similar_duration(video_for_delivery, final_subtitled)
         print("  HYPERFRAMES OK")
 
     link_or_copy(final_subtitled, batch_final, replace=not final_subtitled_current)
@@ -754,7 +807,13 @@ def dry_run(input_dir: Path, jobs: list[Job], visual_style: str = VISUAL_STYLE_N
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Produce an MPT batch from MP3/TXT pairs")
-    parser.add_argument("input_dir")
+    parser.add_argument("input_dir", nargs="?")
+    parser.add_argument("--approved-plan", help="frozen approved production-plan.json to produce")
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help="run the approved-plan production pipeline (master, subtitles, HyperFrames)",
+    )
     parser.add_argument("--preset", default="editorial-gold")
     parser.add_argument("--position", default="bottom")
     parser.add_argument("--visual-style", choices=VISUAL_STYLE_CHOICES, default=VISUAL_STYLE_NONE)
@@ -776,6 +835,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.approved_plan or args.production:
+        if not args.production or not args.approved_plan or args.input_dir:
+            print("--production requires --approved-plan and does not accept input_dir", file=sys.stderr)
+            return 1
+        try:
+            status = process_approved_review_plan(
+                args.approved_plan,
+                preset=args.preset,
+                position=args.position,
+            )
+        except Exception as exc:
+            print(f"PRODUCTION FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        return 0 if status == "completed" else 2
+
+    if not args.input_dir:
+        print("input_dir is required unless --production --approved-plan is used", file=sys.stderr)
+        return 1
     input_dir = Path(args.input_dir).resolve()
     try:
         jobs = scan_input(input_dir)
@@ -879,13 +956,21 @@ def process_approved_review_plan(
 
     batch_id = str(plan.get("batch_id") or sanitize_batch_id(script_path.parent))
     stem = str(plan.get("stem") or script_path.stem)
-    job = Job(stem, audio, script_path, script_path.with_suffix(".srt") if script_path.with_suffix(".srt").is_file() else None, batch_id)
+    # Approved production plans are frozen.  Alignment comes from their
+    # canonical MP3, never from an incidental sidecar next to the script.
+    job = Job(stem, audio, script_path, None, batch_id)
     job.task_id = str(plan.get("task_id") or job.task_id)
     batch_output_dir = HOST_ROOT / "storage" / "batch_outputs" / batch_id
     batch_output_dir.mkdir(parents=True, exist_ok=True)
     report_path = batch_output_dir / REPORT_NAME
     report = init_report(batch_id, [job], report_path)
     write_json_atomic(report_path, report)
+    plan_visual_style = str(plan.get("visual_style") or VISUAL_STYLE_NONE)
+    if visual_style is not None and visual_style != plan_visual_style:
+        raise StageError(
+            "approved plan visual_style is frozen: "
+            f"{plan_visual_style!r} (requested {visual_style!r})"
+        )
     return process_job(
         job,
         index=1,
@@ -895,7 +980,7 @@ def process_approved_review_plan(
         report_path=report_path,
         preset=preset,
         position=position,
-        visual_style=visual_style or str(plan.get("visual_style") or VISUAL_STYLE_NONE),
+        visual_style=plan_visual_style,
         human_review_mode=False,
     )
 
