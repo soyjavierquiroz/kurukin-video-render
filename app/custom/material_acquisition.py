@@ -68,7 +68,36 @@ def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
         if os.path.exists(temporary): os.unlink(temporary)
 
 
-def _asset_hub_materials(decisions: list[Any], task_id: str, provider: Any) -> tuple[list[MaterialInfo], str]:
+def _approved_plan_asset_hub_uids(plan: Mapping[str, Any]) -> list[str]:
+    """Return the frozen Asset Hub selection required by an approved plan."""
+    from app.custom import human_review
+
+    if plan.get("review_status") != human_review.STATUS_APPROVED:
+        raise MaterialAcquisitionError("production plan is not approved")
+    selection = human_review.selection_result_from_plan(plan)
+    return [
+        str(decision.candidate.canonical_id)
+        for decision in getattr(selection, "decisions", ())
+        if getattr(decision.candidate, "provider", "") == "asset_hub"
+    ]
+
+
+def _asset_hub_materials(
+    decisions: list[Any],
+    task_id: str,
+    provider: Any,
+    *,
+    approved_plan: Mapping[str, Any] | None = None,
+) -> tuple[list[MaterialInfo], str]:
+    selected_uids = [str(decision.candidate.canonical_id) for decision in decisions]
+    if approved_plan is not None:
+        plan_selected_uids = _approved_plan_asset_hub_uids(approved_plan)
+        if selected_uids != plan_selected_uids:
+            raise MaterialAcquisitionError(
+                "approved plan selected_asset_uids do not match bundle "
+                "selected_asset_uids; materialization blocked"
+            )
+
     by_term: dict[str, list[Any]] = {}
     for decision in decisions:
         candidate = decision.candidate
@@ -87,7 +116,6 @@ def _asset_hub_materials(decisions: list[Any], task_id: str, provider: Any) -> t
         if _status_code(exc) == 503:
             raise MaterialAcquisitionUnavailable("Asset Hub materialization is temporarily unavailable (503)") from exc
         raise
-    selected_uids = [decision.candidate.canonical_id for decision in decisions]
     assets_by_uid = {
         str(asset.get("asset_uid")): asset
         for asset in extract_asset_hub_local_assets(manifest, strict=True)
@@ -115,7 +143,8 @@ def _asset_hub_materials(decisions: list[Any], task_id: str, provider: Any) -> t
 
 
 def acquire_selected_materials(*, selection_result: Any, task_id: str,
-                               asset_hub_provider: Any = None) -> MaterialAcquisitionResult:
+                               asset_hub_provider: Any = None,
+                               approved_plan: Mapping[str, Any] | None = None) -> MaterialAcquisitionResult:
     """Download stock to a task directory and materialize Asset Hub once.
 
     No task lifecycle or render parameters are changed here.
@@ -126,7 +155,13 @@ def acquire_selected_materials(*, selection_result: Any, task_id: str,
     if hub and asset_hub_provider is None:
         asset_hub_provider = KurukinAssetProvider()
     hub_infos, bundle_uid = ([], None)
-    if hub: hub_infos, bundle_uid = _asset_hub_materials(hub, task_id, asset_hub_provider)
+    if hub:
+        hub_infos, bundle_uid = _asset_hub_materials(
+            hub,
+            task_id,
+            asset_hub_provider,
+            approved_plan=approved_plan,
+        )
     hub_by_key = {decision.candidate.dedupe_key: info for decision, info in zip(hub, hub_infos)}
     result, manifest_items = [], []
     materials_dir.mkdir(parents=True, exist_ok=True)

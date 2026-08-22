@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.custom.material_discovery import MaterialCandidate
-from app.custom.material_acquisition import MaterialAcquisitionUnavailable, acquire_selected_materials
+from app.custom.material_acquisition import MaterialAcquisitionError, MaterialAcquisitionUnavailable, acquire_selected_materials
 from app.models.schema import MaterialInfo
 from app.services import material as material_service
 
@@ -20,6 +20,25 @@ class TestMaterialAcquisition(unittest.TestCase):
     def setUp(self): self.tmp = tempfile.TemporaryDirectory()
     def tearDown(self): self.tmp.cleanup()
     def storage(self, sub="", create=False): return str(Path(self.tmp.name) / sub)
+
+    def approved_plan(self, asset_uids):
+        return {
+            "review_status": "approved",
+            "duration": len(asset_uids) * 5,
+            "segments": [
+                {
+                    "segment_id": f"segment-{index:03d}",
+                    "duration": 5,
+                    "selected_asset": {
+                        "asset_uid": asset_uid,
+                        "provider": "asset_hub",
+                        "metadata": {"duration": 5},
+                    },
+                    "backup_assets": [],
+                }
+                for index, asset_uid in enumerate(asset_uids, 1)
+            ],
+        }
 
     def test_stock_downloads_to_task_dir_and_manifest_is_safe(self):
         candidate = MaterialCandidate("pexels", "pexels:1", "pexels:1", "cat", url="https://download/1", source_info={"token": "bad"})
@@ -89,6 +108,42 @@ class TestMaterialAcquisition(unittest.TestCase):
         self.assertEqual([item.url for item in result.materials], [str(selected_path)])
         payload = json.loads(Path(result.manifest_path).read_text())
         self.assertEqual([item["canonical_id"] for item in payload["selected"]], ["uid-a"])
+
+    def test_approved_plan_assets_are_the_bundle_selection(self):
+        selected = [MaterialCandidate("asset_hub", uid, f"hub:{uid}", "plan") for uid in ("A", "B", "C")]
+        wire_result = {"asset_hub": {"bundle_uid": "bundle"}}
+        bundle_dir = Path(self.tmp.name) / "bundle"
+        bundle_dir.mkdir()
+        assets = []
+        for asset_uid in ("A", "B", "C"):
+            path = bundle_dir / f"{asset_uid}.mp4"
+            path.write_text("video")
+            assets.append({"asset_uid": asset_uid, "type": "video", "filename": path.name, "local_path": str(path), "status": "ready"})
+        manifest = {"manifest_version": "1.0", "generated_by": "kurukin-asset-hub", "bundle_uid": "bundle", "status": "ready", "scenes": [{"scene_id": "scene-001", "scene_index": 1, "assets": assets}]}
+        with patch.dict("os.environ", {"ASSET_HUB_MATERIALIZED_ROOT": self.tmp.name}), patch("app.custom.material_acquisition.utils.storage_dir", self.storage), patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle", return_value=wire_result) as wire:
+            result = acquire_selected_materials(
+                selection_result=SimpleNamespace(decisions=tuple(decision(item) for item in selected)),
+                task_id="t1",
+                asset_hub_provider=SimpleNamespace(get_renderer_manifest=lambda _uid: manifest),
+                approved_plan=self.approved_plan(["A", "B", "C"]),
+            )
+        self.assertEqual([info.source_info["asset_id"] for info in result.materials], ["A", "B", "C"])
+        self.assertEqual(
+            [asset_uid for scene in wire.call_args.args[0]["scenes"] for asset_uid in scene["selected_asset_uids"]],
+            ["A", "B", "C"],
+        )
+
+    def test_approved_plan_bundle_drift_blocks_before_materialization(self):
+        selected = MaterialCandidate("asset_hub", "B", "hub:B", "plan")
+        with patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle") as wire:
+            with self.assertRaisesRegex(MaterialAcquisitionError, "selected_asset_uids.*materialization blocked"):
+                acquire_selected_materials(
+                    selection_result=SimpleNamespace(decisions=(decision(selected),)),
+                    task_id="t1",
+                    asset_hub_provider=object(),
+                    approved_plan=self.approved_plan(["A"]),
+                )
+        wire.assert_not_called()
 
     def test_503_and_traversal_are_clear(self):
         hub = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")

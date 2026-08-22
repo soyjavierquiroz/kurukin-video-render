@@ -322,18 +322,14 @@ def validate_human_review_job(
             "production plan task_id"
         )
 
-    errors, warnings = (
-        human_review.validate_plan_for_approval(
-            plan
-        )
-    )
+    integrity = human_review.validate_approved_plan_integrity(plan)
 
-    if errors:
+    if not integrity["ok"]:
         raise PreflightError(
-            "production plan validation failed: "
+            "approved production plan integrity failed: "
             + "; ".join(
                 str(error)
-                for error in errors
+                for error in integrity["errors"]
             )
         )
 
@@ -425,6 +421,7 @@ def validate_human_review_job(
             result = acquire_selected_materials(
                 selection_result=selection,
                 task_id=preflight_task_id,
+                approved_plan=plan,
             )
 
             materials = list(

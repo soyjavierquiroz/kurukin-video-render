@@ -388,6 +388,7 @@ def run_master(manifest: dict) -> dict:
         acquisition = acquire_selected_materials(
             selection_result=selection,
             task_id=manifest["task_id"],
+            approved_plan=plan,
         )
 
         staged_materials, timeline_dir = (
