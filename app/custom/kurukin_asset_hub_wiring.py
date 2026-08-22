@@ -8,12 +8,11 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any, Mapping
 
 from app.custom.asset_hub_manifest import (
-    get_asset_hub_job_assets_dir,
-    validate_asset_hub_bundle_uid,
     validate_asset_hub_renderer_manifest,
 )
 from app.custom.kurukin_asset_hub import (
@@ -58,6 +57,9 @@ class KurukinAssetHubMaterializationNotReady(KurukinAssetHubWiringError):
 
 
 logger = logging.getLogger(__name__)
+
+
+_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
 def _clean_text(value: Any) -> str:
@@ -327,20 +329,30 @@ def build_asset_hub_bundle_scenes(
 
 
 def resolve_renderer_manifest_path(
-    bundle_uid: str,
-    root: str | Path | None = None,
+    task_id: str,
+    task_root: str | Path | None = None,
 ) -> str:
-    """Return the physical renderer manifest path for a materialized bundle."""
+    """Return Kurukin's task-local renderer manifest path.
 
-    clean_uid = validate_asset_hub_bundle_uid(bundle_uid)
-    base = Path(root).resolve() if root is not None else get_asset_hub_job_assets_dir().resolve()
-    manifest_path = (base / clean_uid / "manifests" / "renderer-manifest.json").resolve(
+    The Asset Hub bundle is immutable source input.  The renderer manifest is
+    a derived Kurukin artifact, even though it references files in that bundle.
+    """
+
+    clean_task_id = _clean_text(task_id)
+    if not _TASK_ID.fullmatch(clean_task_id):
+        raise ValueError("task_id must contain only letters, digits, '_' or '-'")
+    base = (
+        Path(task_root).resolve()
+        if task_root is not None
+        else (Path.cwd() / "storage" / "tasks").resolve()
+    )
+    manifest_path = (base / clean_task_id / "renderer-manifest.json").resolve(
         strict=False
     )
     try:
         manifest_path.relative_to(base)
     except ValueError as exc:
-        raise ValueError("renderer manifest path must stay under asset hub root") from exc
+        raise ValueError("renderer manifest path must stay under task root") from exc
     return manifest_path.as_posix()
 
 
@@ -602,6 +614,7 @@ def wire_explicit_asset_hub_bundle(
     *,
     created_by: str = "money-printer-turbo",
     root: str | Path | None = None,
+    task_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Create and materialize an explicitly selected Asset Hub bundle."""
 
@@ -663,8 +676,9 @@ def wire_explicit_asset_hub_bundle(
 
             validate_asset_hub_renderer_manifest(rebuilt_manifest)
             validate_explicit_manifest_selection(rebuilt_manifest, bundle_scenes)
-            manifest_path = resolve_renderer_manifest_path(bundle_uid, root=root)
+            manifest_path = resolve_renderer_manifest_path(job_id, task_root=task_root)
             _write_renderer_manifest(manifest_path, rebuilt_manifest)
+            logger.info("ASSET HUB MANIFEST WRITE %s", manifest_path)
             asset_count = sum(len(scene["assets"]) for scene in rebuilt_manifest["scenes"])
             logger.info(
                 "ASSET HUB MANIFEST OK scenes=%s assets=%s",
@@ -682,8 +696,8 @@ def wire_explicit_asset_hub_bundle(
     return {
         "asset_hub": {
             "renderer_manifest_path": resolve_renderer_manifest_path(
-                bundle_uid,
-                root=root,
+                job_id,
+                task_root=task_root,
             ),
             "bundle_uid": bundle_uid,
             "scene_mode": "ordered",

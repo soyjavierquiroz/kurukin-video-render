@@ -24,6 +24,7 @@ ALLOWED_SUBTITLE_MODES = {"whisper", "edge", "custom_srt", "none"}
 ALLOWED_SUBTITLE_PROVIDERS = {"whisper", "edge"}
 ALLOWED_ASSET_HUB_SCENE_MODES = {"ordered"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_KURUKIN_TASKS_DIR = PROJECT_ROOT.parent / "storage" / "tasks"
 RENDER_QUALITY_ALIASES = {
     "draft": "draft_720p",
     "draft_720p": "draft_720p",
@@ -236,10 +237,18 @@ def normalize_asset_hub_manifest_path(
     requested = Path(value.strip())
     candidate = requested if requested.is_absolute() else base / requested
     resolved = candidate.resolve(strict=False)
+    task_root = DEFAULT_KURUKIN_TASKS_DIR.resolve()
     try:
         resolved.relative_to(base)
-    except ValueError as exc:
-        raise LocalJobWrapperError(f"{label} must stay under {base}") from exc
+    except ValueError:
+        # Asset Hub materializations are immutable inputs.  Kurukin's rebuilt
+        # renderer manifest is the one approved derived artifact allowed here.
+        try:
+            resolved.relative_to(task_root)
+        except ValueError as exc:
+            raise LocalJobWrapperError(
+                f"{label} must stay under {base} or {task_root}"
+            ) from exc
 
     if resolved.suffix.lower() != ".json":
         raise LocalJobWrapperError(f"{label} must point to a .json file")

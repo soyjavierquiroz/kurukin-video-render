@@ -82,6 +82,7 @@ class TestMaterialAcquisition(unittest.TestCase):
         self.assertEqual(result.materials[0].url, str(shared))
         self.assertTrue(wire.called)
         self.assertNotIn("brand_slug", wire.call_args.args[0])
+        self.assertEqual(wire.call_args.kwargs["task_root"], Path(self.tmp.name) / "tasks")
 
     def test_asset_hub_manifest_extras_do_not_enter_materials(self):
         selected = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")

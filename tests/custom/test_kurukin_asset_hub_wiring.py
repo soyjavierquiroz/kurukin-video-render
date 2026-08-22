@@ -314,8 +314,9 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
                 intent, provider,
                 {"segment-001": ["drive-a"], "segment-002": ["drive-b", "drive-backup"]},
                 root=root,
+                task_root=root,
             )
-            local = json.loads(Path(resolve_renderer_manifest_path("jab_test", root=root)).read_text())
+            local = json.loads(Path(resolve_renderer_manifest_path("mpt-001", task_root=root)).read_text())
 
         self.assertEqual([scene["scene_id"] for scene in local["scenes"]], ["segment-001", "segment-002"])
         self.assertEqual(
@@ -323,6 +324,68 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
             ["drive-b", "drive-backup"],
         )
         self.assertEqual(len(provider.materialize_calls), 1)
+
+    def test_read_only_asset_bundle_rebuilds_only_in_task_directory(self):
+        manifest = self._manifest_for_root("/data/job-assets")
+        manifest["scenes"][0]["scene_id"] = "stale-remote-one"
+        manifest["scenes"][1]["scene_id"] = "stale-remote-two"
+        provider = FakeProvider(manifest=manifest)
+        intent = {
+            "task_id": "alejarte-001",
+            "scenes": [
+                {"scene_id": "segment-001", "script_scene": "one"},
+                {"scene_id": "segment-002", "script_scene": "two"},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "job-assets"
+            task_root = Path(tmp) / "tasks"
+            self._rebase_manifest(manifest, str(source_root))
+            for scene in manifest["scenes"]:
+                for asset in scene["assets"]:
+                    path = Path(asset["local_path"])
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("source", encoding="utf-8")
+            bundle_dir = source_root / "jab_test"
+            os.chmod(bundle_dir, 0o555)
+            original_mkstemp = tempfile.mkstemp
+            temp_dirs = []
+
+            def capture_mkstemp(*args, **kwargs):
+                temp_dirs.append(Path(kwargs["dir"]).resolve())
+                return original_mkstemp(*args, **kwargs)
+
+            try:
+                with mock.patch(
+                    "app.custom.kurukin_asset_hub_wiring.tempfile.mkstemp",
+                    side_effect=capture_mkstemp,
+                ):
+                    result = wire_explicit_asset_hub_bundle(
+                        intent,
+                        provider,
+                        {"segment-001": ["drive-a"], "segment-002": ["drive-b"]},
+                        root=source_root,
+                        task_root=task_root,
+                    )
+            finally:
+                os.chmod(bundle_dir, 0o755)
+
+            manifest_path = Path(result["asset_hub"]["renderer_manifest_path"])
+            local = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest_path, task_root / "alejarte-001" / "renderer-manifest.json")
+        self.assertTrue(all(path == manifest_path.parent for path in temp_dirs))
+        self.assertFalse((source_root / "jab_test" / "manifests").exists())
+        self.assertEqual([scene["scene_id"] for scene in local["scenes"]], ["segment-001", "segment-002"])
+        self.assertEqual(
+            [asset["asset_uid"] for scene in local["scenes"] for asset in scene["assets"]],
+            ["drive-a", "drive-b"],
+        )
+        self.assertEqual(
+            [asset["local_path"] for scene in local["scenes"] for asset in scene["assets"]],
+            [str(source_root / "jab_test" / "scene-001" / "clip-a.mp4"), str(source_root / "jab_test" / "scene-002" / "clip-b.mp4")],
+        )
 
     def test_missing_exact_uid_forces_one_rematerialization_then_blocks(self):
         manifest = self._manifest_for_root("/data/job-assets")
@@ -377,8 +440,9 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
             wire_explicit_asset_hub_bundle(
                 make_intent(), provider,
                 {"scene-001": ["drive-a"], "scene-002": ["drive-b"]}, root=root,
+                task_root=root,
             )
-            local = json.loads(Path(resolve_renderer_manifest_path("jab_test", root=root)).read_text())
+            local = json.loads(Path(resolve_renderer_manifest_path("mpt-001", task_root=root)).read_text())
         self.assertEqual(
             [asset["asset_uid"] for scene in local["scenes"] for asset in scene["assets"]],
             ["drive-a", "drive-b"],
@@ -807,47 +871,30 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
 
     def test_resolve_renderer_manifest_path_default(self):
         self.assertEqual(
-            resolve_renderer_manifest_path("jab_xxx"),
-            "/data/job-assets/jab_xxx/manifests/renderer-manifest.json",
+            resolve_renderer_manifest_path("mpt-xxx"),
+            "/opt/moneyprinterturbo/storage/tasks/mpt-xxx/renderer-manifest.json",
         )
 
-    def test_resolve_renderer_manifest_path_uses_materialized_root_env(self):
-        with mock.patch.dict(
-            os.environ,
-            {
-                "ASSET_HUB_MATERIALIZED_ROOT": "/tmp/custom-assets",
-                "ASSET_HUB_JOB_ASSETS_DIR": "/tmp/legacy-assets",
-            },
-        ):
-            result = resolve_renderer_manifest_path("jab_x")
+    def test_resolve_renderer_manifest_path_uses_task_root(self):
+        result = resolve_renderer_manifest_path("mpt-x", task_root="/tmp/kurukin-tasks")
 
         self.assertEqual(
             result,
-            "/tmp/custom-assets/jab_x/manifests/renderer-manifest.json",
+            "/tmp/kurukin-tasks/mpt-x/renderer-manifest.json",
         )
 
-    def test_resolve_renderer_manifest_path_empty_env_falls_back_to_default(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            os.environ["ASSET_HUB_MATERIALIZED_ROOT"] = ""
-            result = resolve_renderer_manifest_path("jab_x")
-
-        self.assertEqual(
-            result,
-            "/data/job-assets/jab_x/manifests/renderer-manifest.json",
-        )
-
-    def test_bundle_uid_parent_path_rejected(self):
+    def test_task_id_parent_path_rejected(self):
         with self.assertRaises(ValueError):
-            resolve_renderer_manifest_path("../bundle")
+            resolve_renderer_manifest_path("../task")
 
     def test_manifest_path_does_not_escape_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "job-assets"
             root.mkdir()
 
-            result = resolve_renderer_manifest_path("jab_safe", root=root)
+            result = resolve_renderer_manifest_path("mpt-safe", task_root=root)
 
-        self.assertTrue(result.endswith("/jab_safe/manifests/renderer-manifest.json"))
+        self.assertTrue(result.endswith("/mpt-safe/renderer-manifest.json"))
         self.assertIn("job-assets", result)
 
     def test_final_result_has_asset_hub_renderer_manifest_path(self):
@@ -862,7 +909,7 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
 
         self.assertEqual(
             result["asset_hub"]["renderer_manifest_path"],
-            "/data/job-assets/jab_test/manifests/renderer-manifest.json",
+            "/opt/moneyprinterturbo/storage/tasks/mpt-001/renderer-manifest.json",
         )
 
     def test_missing_job_id_does_not_create_bundle(self):

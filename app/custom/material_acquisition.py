@@ -207,7 +207,14 @@ def _asset_hub_materials(
     intent = {"task_id": task_id, "scenes": scenes}
     selection = {scene["scene_id"]: scene["selected_asset_uids"] for scene in scenes}
     try:
-        wired = wire_explicit_asset_hub_bundle(intent, provider, selection)
+        # Asset Hub contributes immutable source media only.  Its derived
+        # renderer manifest belongs beside this task's other artifacts.
+        wired = wire_explicit_asset_hub_bundle(
+            intent,
+            provider,
+            selection,
+            task_root=_task_paths(task_id)[0].parent,
+        )
         bundle_uid = wired["asset_hub"]["bundle_uid"]
         manifest = provider.get_renderer_manifest(bundle_uid)
     except Exception as exc:
