@@ -29,6 +29,7 @@ class TestMaterialAcquisition(unittest.TestCase):
                 {
                     "segment_id": f"segment-{index:03d}",
                     "duration": 5,
+                    "script_text": f"Approved narration {index}",
                     "selected_asset": {
                         "asset_uid": asset_uid,
                         "provider": "asset_hub",
@@ -136,6 +137,26 @@ class TestMaterialAcquisition(unittest.TestCase):
             [scene["scene_id"] for scene in wire.call_args.args[0]["scenes"]],
             ["segment-001", "segment-002", "segment-003"],
         )
+        self.assertEqual(
+            [scene["script_scene"] for scene in wire.call_args.args[0]["scenes"]],
+            ["Approved narration 1", "Approved narration 2", "Approved narration 3"],
+        )
+
+    def test_pixabay_does_not_use_asset_hub_or_require_approved_fields(self):
+        pixabay = MaterialCandidate(
+            "pixabay", "pixabay:1", "pixabay:1", "forest", url="https://download/1"
+        )
+        downloaded = Path(self.tmp.name) / "tasks/t1/materials/pixabay.mp4"
+        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), \
+             patch("app.custom.material_acquisition.KurukinAssetProvider") as hub, \
+             patch("app.custom.material_acquisition.material.download_material_candidate", return_value=str(downloaded), create=True) as download:
+            result = acquire_selected_materials(
+                selection_result=SimpleNamespace(decisions=(decision(pixabay),)),
+                task_id="t1",
+            )
+        hub.assert_not_called()
+        download.assert_called_once()
+        self.assertEqual(result.materials[0].provider, "pixabay")
 
     def test_approved_plan_bundle_drift_blocks_before_materialization(self):
         selected = MaterialCandidate("asset_hub", "B", "hub:B", "plan")

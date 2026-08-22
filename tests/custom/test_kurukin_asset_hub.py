@@ -191,6 +191,10 @@ class KurukinAssetHubTests(unittest.TestCase):
         payload = provider.session.calls[0]["json"]
         self.assertNotIn("brand_slug", payload)
         self.assertEqual(
+            set(payload["scenes"][0]),
+            {"scene_id", "scene_index", "script_scene", "selected_asset_uids"},
+        )
+        self.assertEqual(
             payload["scenes"][0]["selected_asset_uids"],
             ["drive-a", "drive-b"],
         )
@@ -257,6 +261,17 @@ class KurukinAssetHubTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["scenes"][0]["count"], 2)
+
+    def test_force_is_sent_only_for_stale_bundle_recreation(self):
+        regular = build_explicit_bundle_payload(
+            job_id="mpt-001", scenes=[{"selected_asset_uids": ["drive-a"]}]
+        )
+        forced = build_explicit_bundle_payload(
+            job_id="mpt-001", scenes=[{"selected_asset_uids": ["drive-a"]}], force=True
+        )
+
+        self.assertNotIn("force", regular)
+        self.assertEqual(forced["force"], True)
 
     def test_parse_renderer_manifest_ready_assets(self):
         manifest = {

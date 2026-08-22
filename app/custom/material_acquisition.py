@@ -98,6 +98,19 @@ def _approved_plan_scene_ids_for_uids(plan: Mapping[str, Any], asset_uids: list[
     return [scenes_by_uid.get(uid, "") for uid in asset_uids]
 
 
+def _approved_plan_scene_text_by_id(plan: Mapping[str, Any]) -> dict[str, str]:
+    """Return the approved narration used by Asset Hub's supported scene schema."""
+    scene_text: dict[str, str] = {}
+    for segment in plan.get("segments") or []:
+        if not isinstance(segment, Mapping):
+            continue
+        scene_id = str(segment.get("segment_id") or "").strip()
+        text = str(segment.get("script_text") or "").strip()
+        if scene_id:
+            scene_text[scene_id] = text
+    return scene_text
+
+
 def _asset_hub_materials(
     decisions: list[Any],
     task_id: str,
@@ -129,9 +142,25 @@ def _asset_hub_materials(
         if not approved_scene_id:
             raise MaterialAcquisitionError("approved Asset Hub scene_id is required")
         by_scene.setdefault(approved_scene_id, []).append(decision.candidate)
+    approved_scene_text = (
+        _approved_plan_scene_text_by_id(approved_plan)
+        if approved_plan is not None
+        else {}
+    )
     scenes = []
     for index, (scene_id, candidates) in enumerate(by_scene.items(), 1):
+        # ``script_scene`` is required by the deployed Asset Hub endpoint.
+        # It is API metadata only; the approved segment ID remains the local
+        # deterministic mapping key used for the renderer manifest.
+        script_scene = approved_scene_text.get(scene_id, "")
+        if not script_scene:
+            script_scene = str(getattr(candidates[0], "search_term", "") or "").strip()
+        if not script_scene:
+            raise MaterialAcquisitionError(
+                f"Asset Hub scene {scene_id} is missing required script_scene"
+            )
         scenes.append({"scene_id": scene_id, "scene_index": index,
+                       "script_scene": script_scene,
                        "selected_asset_uids": [candidate.canonical_id for candidate in candidates]})
     intent = {"task_id": task_id, "scenes": scenes}
     selection = {scene["scene_id"]: scene["selected_asset_uids"] for scene in scenes}

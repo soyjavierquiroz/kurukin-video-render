@@ -195,6 +195,8 @@ def _stage_human_review_timeline(
         playback_speed = float(
             piece["playback_speed"]
         )
+        source_start = max(0.0, float(piece.get("source_start") or 0.0))
+        freeze_seconds = max(0.0, float(piece.get("freeze_seconds") or 0.0))
 
         flip_horizontal = bool(
             piece.get(
@@ -236,6 +238,20 @@ def _stage_human_review_timeline(
                 f"(PTS-STARTPTS)/{playback_speed:.6f}"
             ),
         ]
+        if source_start > 0:
+            filters[0] = (
+                f"trim=start={source_start:.6f}:"
+                f"duration={source_duration:.6f}"
+            )
+        if freeze_seconds > 0:
+            filters.append(f"tpad=stop_mode=clone:stop_duration={freeze_seconds:.6f}")
+            print(
+                f"timeline {segment_id} FREEZE asset={uid} duration={freeze_seconds:.3f}s"
+            )
+        elif role == "extend":
+            print(f"timeline timeline-tail EXTEND asset={uid} duration={output_duration:.3f}s")
+        elif role == "loop":
+            print(f"timeline timeline-tail LOOP asset={uid} duration={output_duration:.3f}s")
         if flip_horizontal:
             filters.append("hflip")
         vf = ",".join(filters)

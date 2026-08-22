@@ -249,6 +249,7 @@ def build_explicit_bundle_payload(
     scenes: list[Mapping[str, Any]],
     created_by: str = DEFAULT_CREATED_BY,
     brand_slug: str = "",
+    force: bool = False,
 ) -> dict[str, Any]:
     clean_job_id = _clean_text(job_id)
     if not clean_job_id:
@@ -263,6 +264,10 @@ def build_explicit_bundle_payload(
     clean_brand_slug = _clean_text(brand_slug)
     if clean_brand_slug:
         payload["brand_slug"] = clean_brand_slug
+    # ``force`` is part of Asset Hub's create-bundle contract.  It is used
+    # only when replacing a stale bundle for the same frozen production job.
+    if force:
+        payload["force"] = True
     return payload
 
 
@@ -402,12 +407,14 @@ class KurukinAssetProvider:
         scenes: list[Mapping[str, Any]],
         created_by: str = DEFAULT_CREATED_BY,
         brand_slug: str = "",
+        force: bool = False,
     ) -> dict[str, Any]:
         payload = build_explicit_bundle_payload(
             job_id=job_id,
             scenes=scenes,
             created_by=created_by,
             brand_slug=brand_slug,
+            force=force,
         )
         return self._request("POST", "/api/jobs/asset-bundles", json_body=payload, max_attempts=1)
 

@@ -541,6 +541,10 @@ def wire_explicit_asset_hub_bundle(
                 job_id=job_id,
                 scenes=bundle_scenes,
                 created_by=created_by,
+                # Asset Hub otherwise reuses a ready bundle by job_id.  A
+                # retry after a stale-manifest mismatch must recreate the
+                # exact same frozen selection, never discover replacements.
+                force=attempt > 0,
             )
             bundle_uid = _extract_bundle_uid(create_response)
             if not bundle_uid:
