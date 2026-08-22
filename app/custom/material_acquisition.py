@@ -74,12 +74,41 @@ def _approved_plan_asset_hub_uids(plan: Mapping[str, Any]) -> list[str]:
 
     if plan.get("review_status") != human_review.STATUS_APPROVED:
         raise MaterialAcquisitionError("production plan is not approved")
-    selection = human_review.selection_result_from_plan(plan)
     return [
-        str(decision.candidate.canonical_id)
-        for decision in getattr(selection, "decisions", ())
-        if getattr(decision.candidate, "provider", "") == "asset_hub"
+        uid
+        for scene in _approved_plan_asset_hub_scenes(plan)
+        for uid in scene["selected_asset_uids"]
     ]
+
+
+def _approved_plan_asset_hub_scenes(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return frozen segment-scoped Asset Hub primary and backup UID maps."""
+    scenes: list[dict[str, Any]] = []
+    for segment in plan.get("segments") or []:
+        if not isinstance(segment, Mapping):
+            continue
+        scene_id = str(segment.get("segment_id") or "").strip()
+        if not scene_id:
+            continue
+        uids = []
+        for asset in [segment.get("selected_asset"), *(segment.get("backup_assets") or [])]:
+            if not isinstance(asset, Mapping):
+                continue
+            provider = str(asset.get("provider") or asset.get("source") or "").strip()
+            if provider != "asset_hub":
+                continue
+            uid = str(asset.get("asset_uid") or asset.get("canonical_id") or "").strip()
+            if uid:
+                uids.append(uid)
+        if uids:
+            scenes.append(
+                {
+                    "scene_id": scene_id,
+                    "script_scene": str(segment.get("script_text") or "").strip(),
+                    "selected_asset_uids": list(dict.fromkeys(uids)),
+                }
+            )
+    return scenes
 
 
 def _approved_plan_scene_ids_for_uids(plan: Mapping[str, Any], asset_uids: list[str]) -> list[str]:
@@ -122,7 +151,7 @@ def _asset_hub_materials(
     selected_uids = [str(decision.candidate.canonical_id) for decision in decisions]
     if approved_plan is not None:
         plan_selected_uids = _approved_plan_asset_hub_uids(approved_plan)
-        if selected_uids != plan_selected_uids:
+        if any(uid not in plan_selected_uids for uid in selected_uids):
             raise MaterialAcquisitionError(
                 "approved plan selected_asset_uids do not match bundle "
                 "selected_asset_uids; materialization blocked"
@@ -147,8 +176,21 @@ def _asset_hub_materials(
         if approved_plan is not None
         else {}
     )
-    scenes = []
+    if approved_plan is not None:
+        scenes = [
+            {
+                "scene_id": scene["scene_id"],
+                "scene_index": index,
+                "script_scene": scene["script_scene"],
+                "selected_asset_uids": scene["selected_asset_uids"],
+            }
+            for index, scene in enumerate(_approved_plan_asset_hub_scenes(approved_plan), 1)
+        ]
+    else:
+        scenes = []
     for index, (scene_id, candidates) in enumerate(by_scene.items(), 1):
+        if approved_plan is not None:
+            continue
         # ``script_scene`` is required by the deployed Asset Hub endpoint.
         # It is API metadata only; the approved segment ID remains the local
         # deterministic mapping key used for the renderer manifest.

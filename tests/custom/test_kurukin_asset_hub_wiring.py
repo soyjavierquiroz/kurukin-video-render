@@ -289,7 +289,42 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
 
         self.assertEqual(result["asset_hub"]["bundle_uid"], "jab_test")
 
-    def test_exact_manifest_selection_missing_scene_fails(self):
+    def test_wrong_asset_hub_scene_names_rebuild_frozen_segments_by_uid(self):
+        manifest = self._manifest_for_root("/data/job-assets")
+        # Simulate an Asset Hub grouping unrelated to Kurukin segment IDs and
+        # reverse response order.  The approved mapping must still win.
+        manifest["scenes"][0]["scene_id"] = "mother"
+        manifest["scenes"][1]["scene_id"] = "daughter"
+        manifest["scenes"].reverse()
+        backup = dict(manifest["scenes"][0]["assets"][0])
+        backup.update({"asset_uid": "drive-backup", "filename": "backup.mp4"})
+        manifest["scenes"][0]["assets"].append(backup)
+        provider = FakeProvider(manifest=manifest)
+        intent = {
+            "task_id": "mpt-001",
+            "scenes": [
+                {"scene_id": "segment-001", "script_scene": "one"},
+                {"scene_id": "segment-002", "script_scene": "two"},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as root:
+            self._rebase_manifest(manifest, root)
+            wire_explicit_asset_hub_bundle(
+                intent, provider,
+                {"segment-001": ["drive-a"], "segment-002": ["drive-b", "drive-backup"]},
+                root=root,
+            )
+            local = json.loads(Path(resolve_renderer_manifest_path("jab_test", root=root)).read_text())
+
+        self.assertEqual([scene["scene_id"] for scene in local["scenes"]], ["segment-001", "segment-002"])
+        self.assertEqual(
+            [asset["asset_uid"] for asset in local["scenes"][1]["assets"]],
+            ["drive-b", "drive-backup"],
+        )
+        self.assertEqual(len(provider.materialize_calls), 1)
+
+    def test_missing_exact_uid_forces_one_rematerialization_then_blocks(self):
         manifest = self._manifest_for_root("/data/job-assets")
         manifest["scenes"] = manifest["scenes"][:1]
         provider = FakeProvider(manifest=manifest)
@@ -301,8 +336,8 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
                 {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
             )
 
-        self.assertEqual(len(provider.create_calls), 1)
-        self.assertEqual(len(provider.materialize_calls), 1)
+        self.assertEqual(len(provider.create_calls), 2)
+        self.assertEqual([call["force"] for call in provider.materialize_calls], [False, True])
 
     def test_exact_manifest_selection_missing_asset_fails(self):
         manifest = self._manifest_for_root("/data/job-assets")
@@ -328,7 +363,7 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
                 {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
             )
 
-    def test_exact_manifest_selection_extra_asset_fails(self):
+    def test_extra_unapproved_asset_is_excluded_from_local_manifest(self):
         manifest = self._manifest_for_root("/data/job-assets")
         extra = dict(manifest["scenes"][1]["assets"][0])
         extra["asset_uid"] = "drive-extra"
@@ -337,14 +372,19 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
         manifest["scenes"][1]["assets"].append(extra)
         provider = FakeProvider(manifest=manifest)
 
-        with self.assertRaises(KurukinAssetHubWiringError):
+        with tempfile.TemporaryDirectory() as root:
+            self._rebase_manifest(manifest, root)
             wire_explicit_asset_hub_bundle(
-                make_intent(),
-                provider,
-                {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
+                make_intent(), provider,
+                {"scene-001": ["drive-a"], "scene-002": ["drive-b"]}, root=root,
             )
+            local = json.loads(Path(resolve_renderer_manifest_path("jab_test", root=root)).read_text())
+        self.assertEqual(
+            [asset["asset_uid"] for scene in local["scenes"] for asset in scene["assets"]],
+            ["drive-a", "drive-b"],
+        )
 
-    def test_exact_manifest_selection_extra_scene_fails(self):
+    def test_extra_asset_hub_scene_is_excluded_from_local_manifest(self):
         manifest = self._manifest_for_root("/data/job-assets")
         manifest["scenes"].append(
             {
@@ -363,26 +403,32 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
         )
         provider = FakeProvider(manifest=manifest)
 
-        with self.assertRaises(KurukinAssetHubWiringError):
+        with tempfile.TemporaryDirectory() as root:
+            self._rebase_manifest(manifest, root)
             wire_explicit_asset_hub_bundle(
                 make_intent(),
                 provider,
                 {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
+                root=root,
             )
+        self.assertEqual(len(provider.materialize_calls), 1)
 
-    def test_exact_manifest_selection_duplicate_manifest_scene_id_fails(self):
+    def test_duplicate_asset_hub_scene_id_self_heals_without_rematerialization(self):
         manifest = self._manifest_for_root("/data/job-assets")
         duplicate = dict(manifest["scenes"][1])
         duplicate["scene_index"] = 3
         manifest["scenes"].append(duplicate)
         provider = FakeProvider(manifest=manifest)
 
-        with self.assertRaises(KurukinAssetHubWiringError):
+        with tempfile.TemporaryDirectory() as root:
+            self._rebase_manifest(manifest, root)
             wire_explicit_asset_hub_bundle(
                 make_intent(),
                 provider,
                 {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
+                root=root,
             )
+        self.assertEqual(len(provider.materialize_calls), 1)
 
     def test_exact_manifest_selection_duplicate_expected_scene_id_fails(self):
         manifest = self._manifest_for_root("/data/job-assets")
@@ -696,7 +742,7 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
         stale["scenes"][0]["assets"][0]["asset_uid"] = "wrong-approved-never"
         provider = FakeProvider(manifest=stale)
 
-        with self.assertRaisesRegex(KurukinAssetHubWiringError, "does not match explicit"):
+        with self.assertRaisesRegex(KurukinAssetHubWiringError, "missing exact selected_asset_uids"):
             wire_explicit_asset_hub_bundle(
                 make_intent(), provider,
                 {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
@@ -986,6 +1032,12 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
                 }
             ],
         }
+
+    @staticmethod
+    def _rebase_manifest(manifest: dict, root: str) -> None:
+        for scene in manifest["scenes"]:
+            for asset in scene["assets"]:
+                asset["local_path"] = asset["local_path"].replace("/data/job-assets", root, 1)
 
     def _single_scene_manifest_with_statuses(
         self,

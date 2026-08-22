@@ -43,9 +43,12 @@ class TestMaterialAcquisition(unittest.TestCase):
 
     def test_stock_downloads_to_task_dir_and_manifest_is_safe(self):
         candidate = MaterialCandidate("pexels", "pexels:1", "pexels:1", "cat", url="https://download/1", source_info={"token": "bad"})
-        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), patch("app.custom.material_acquisition.material.download_material_candidate", return_value=str(Path(self.tmp.name) / "tasks/t1/materials/a.mp4"), create=True) as download:
+        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), \
+             patch("app.custom.material_acquisition.KurukinAssetProvider") as hub, \
+             patch("app.custom.material_acquisition.material.download_material_candidate", return_value=str(Path(self.tmp.name) / "tasks/t1/materials/a.mp4"), create=True) as download:
             result = acquire_selected_materials(selection_result=SimpleNamespace(decisions=(decision(candidate),)), task_id="t1")
         self.assertIn("tasks/t1/materials", download.call_args.args[1])
+        hub.assert_not_called()
         self.assertEqual(result.materials[0].provider, "pexels")
         payload = json.loads(Path(result.manifest_path).read_text())
         self.assertNotIn("token", str(payload).lower())
@@ -141,6 +144,35 @@ class TestMaterialAcquisition(unittest.TestCase):
             [scene["script_scene"] for scene in wire.call_args.args[0]["scenes"]],
             ["Approved narration 1", "Approved narration 2", "Approved narration 3"],
         )
+
+    def test_approved_asset_hub_backups_stay_in_their_frozen_segment(self):
+        selected = [MaterialCandidate("asset_hub", "A", "hub:A", "plan")]
+        plan = self.approved_plan(["A", "B"])
+        plan["segments"][0]["backup_assets"] = [{
+            "asset_uid": "A-backup", "provider": "asset_hub", "metadata": {"duration": 5},
+        }]
+        bundle_dir = Path(self.tmp.name) / "bundle"
+        bundle_dir.mkdir()
+        assets = []
+        for uid in ("A", "A-backup", "B"):
+            path = bundle_dir / f"{uid}.mp4"
+            path.write_text("video")
+            assets.append({"asset_uid": uid, "type": "video", "filename": path.name,
+                           "local_path": str(path), "status": "ready"})
+        manifest = {"manifest_version": "1.0", "generated_by": "kurukin-asset-hub",
+                    "bundle_uid": "bundle", "status": "ready",
+                    "scenes": [{"scene_id": "unrelated", "assets": assets}]}
+        with patch.dict("os.environ", {"ASSET_HUB_MATERIALIZED_ROOT": self.tmp.name}), \
+             patch("app.custom.material_acquisition.utils.storage_dir", self.storage), \
+             patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle", return_value={"asset_hub": {"bundle_uid": "bundle"}}) as wire:
+            acquire_selected_materials(
+                selection_result=SimpleNamespace(decisions=(decision(selected[0]),)), task_id="t1",
+                asset_hub_provider=SimpleNamespace(get_renderer_manifest=lambda _uid: manifest), approved_plan=plan,
+            )
+        self.assertEqual(wire.call_args.args[0]["scenes"], [
+            {"scene_id": "segment-001", "scene_index": 1, "script_scene": "Approved narration 1", "selected_asset_uids": ["A", "A-backup"]},
+            {"scene_id": "segment-002", "scene_index": 2, "script_scene": "Approved narration 2", "selected_asset_uids": ["B"]},
+        ])
 
     def test_pixabay_does_not_use_asset_hub_or_require_approved_fields(self):
         pixabay = MaterialCandidate(

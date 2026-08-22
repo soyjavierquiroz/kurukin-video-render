@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+import logging
 import math
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping
 
 from app.custom.asset_hub_manifest import (
@@ -51,6 +55,9 @@ class KurukinAssetHubSelectionRequired(KurukinAssetHubWiringError):
 
 class KurukinAssetHubMaterializationNotReady(KurukinAssetHubWiringError):
     """Raised when Asset Hub materialization has not reached a ready state."""
+
+
+logger = logging.getLogger(__name__)
 
 
 def _clean_text(value: Any) -> str:
@@ -515,6 +522,79 @@ def validate_explicit_manifest_selection(
         )
 
 
+def _ready_assets_by_uid(manifest: Mapping[str, Any], *, root: str | Path | None) -> dict[str, dict[str, Any]]:
+    """Index ready Asset Hub materialization data by immutable asset UID.
+
+    Asset Hub owns these paths and media fields, but deliberately does not own
+    Kurukin's frozen scene identifiers.  Sorting makes a duplicate UID's
+    choice deterministic even if the endpoint changes response ordering.
+    """
+    assets = resolve_ready_asset_paths(
+        _manifest_for_ready_path_resolution(manifest), materialized_root=root,
+    )
+    indexed: dict[str, dict[str, Any]] = {}
+    for asset in sorted(
+        assets,
+        key=lambda item: (
+            validate_asset_uid(item.get("asset_uid")),
+            _clean_text(item.get("local_path")),
+            _clean_text(item.get("relative_path")),
+            _clean_text(item.get("filename")),
+        ),
+    ):
+        indexed.setdefault(validate_asset_uid(asset.get("asset_uid")), dict(asset))
+    return indexed
+
+
+def _rebuild_renderer_manifest(
+    manifest: Mapping[str, Any],
+    expected_bundle_scenes: list[Mapping[str, Any]],
+    *,
+    root: str | Path | None,
+) -> dict[str, Any]:
+    """Locally join frozen Kurukin scenes to Asset Hub materialized UIDs."""
+    assets_by_uid = _ready_assets_by_uid(manifest, root=root)
+    required_uids = [
+        validate_asset_uid(asset_uid)
+        for scene in expected_bundle_scenes
+        for asset_uid in _as_list(scene.get("selected_asset_uids"))
+    ]
+    missing = [uid for uid in dict.fromkeys(required_uids) if uid not in assets_by_uid]
+    if missing:
+        raise KurukinAssetHubWiringError(
+            "renderer manifest is missing exact selected_asset_uids: " + ", ".join(missing)
+        )
+
+    rebuilt = deepcopy(dict(manifest))
+    rebuilt["scenes"] = [
+        {
+            "scene_id": _clean_text(scene.get("scene_id")),
+            "scene_index": index,
+            "assets": [
+                deepcopy(assets_by_uid[validate_asset_uid(asset_uid)])
+                for asset_uid in dict.fromkeys(_as_list(scene.get("selected_asset_uids")))
+            ],
+        }
+        for index, scene in enumerate(expected_bundle_scenes, start=1)
+    ]
+    return rebuilt
+
+
+def _write_renderer_manifest(path: str, manifest: Mapping[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".renderer-manifest-", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def wire_explicit_asset_hub_bundle(
     intent: Mapping[str, Any],
     provider: Any,
@@ -533,8 +613,9 @@ def wire_explicit_asset_hub_bundle(
     if not job_id:
         raise KurukinAssetHubWiringError("job_id is required")
 
-    # A prior bundle/manifest may be stale.  Retry only once, recreating from
-    # the exact frozen UIDs; this never invokes discovery or substitution.
+    # A missing exact UID may be rematerialized once.  Scene IDs are Kurukin
+    # state, not an Asset Hub contract, so a stale remote scene map self-heals
+    # locally without another materialization request.
     for attempt in range(2):
         try:
             create_response = provider.create_bundle(
@@ -561,19 +642,40 @@ def wire_explicit_asset_hub_bundle(
             manifest_bundle_uid = _clean_text(manifest.get("bundle_uid"))
             if manifest_bundle_uid and manifest_bundle_uid != bundle_uid:
                 raise KurukinAssetHubWiringError("renderer manifest bundle_uid does not match created bundle_uid")
-            validate_explicit_manifest_selection(manifest, bundle_scenes)
-            ready_assets = resolve_ready_asset_paths(
-                _manifest_for_ready_path_resolution(manifest), materialized_root=root,
+            try:
+                rebuilt_manifest = _rebuild_renderer_manifest(
+                    manifest, bundle_scenes, root=root,
+                )
+            except KurukinAssetHubWiringError as exc:
+                if attempt:
+                    raise
+                # This retry is strictly for absent frozen UIDs.  It never
+                # treats an Asset Hub scene ID mismatch as a rematerialization
+                # problem and never permits a replacement asset.
+                if "missing exact selected_asset_uids" not in str(exc):
+                    raise
+                continue
+
+            try:
+                validate_explicit_manifest_selection(manifest, bundle_scenes)
+            except KurukinAssetHubWiringError:
+                logger.info("ASSET HUB MANIFEST REBUILD reason=scene-map-stale")
+
+            validate_asset_hub_renderer_manifest(rebuilt_manifest)
+            validate_explicit_manifest_selection(rebuilt_manifest, bundle_scenes)
+            manifest_path = resolve_renderer_manifest_path(bundle_uid, root=root)
+            _write_renderer_manifest(manifest_path, rebuilt_manifest)
+            asset_count = sum(len(scene["assets"]) for scene in rebuilt_manifest["scenes"])
+            logger.info(
+                "ASSET HUB MANIFEST OK scenes=%s assets=%s",
+                len(rebuilt_manifest["scenes"]), asset_count,
             )
-            if not ready_assets:
-                raise KurukinAssetHubMaterializationNotReady(REASON_ASSET_HUB_MATERIALIZATION_NOT_READY)
             break
         except KurukinAssetHubMaterializationNotReady:
             if attempt:
                 raise
-        except KurukinAssetHubWiringError as exc:
-            if attempt or "does not match explicit selected_asset_uids" not in str(exc):
-                raise
+        except KurukinAssetHubWiringError:
+            raise
     else:  # pragma: no cover - the retry paths either break or raise.
         raise KurukinAssetHubMaterializationNotReady(REASON_ASSET_HUB_MATERIALIZATION_NOT_READY)
 
