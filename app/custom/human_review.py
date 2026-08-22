@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -44,6 +45,15 @@ MAX_PREVIEW_BYTES = 2 * 1024 * 1024
 PREFERRED_PLAYBACK_SPEED = 0.90
 HARD_MIN_PLAYBACK_SPEED = 0.85
 MIN_BACKUP_OUTPUT_SECONDS = 0.75
+# Coverage is persisted for display, but it is never authoritative.  Keep a
+# small tolerance for the rounded values stored in production plans.
+COVERAGE_TOLERANCE_SECONDS = 0.01
+# The renderer can safely hold the final rendered piece for a short audio
+# overrun.  This is deliberately limited: a longer unsegmented tail still
+# needs an explicitly approved visual segment.
+MAX_SEGMENT_FREEZE_SECONDS = 1.25
+MAX_TIMELINE_AUTOFILL_SECONDS = 5.0
+_LOG = logging.getLogger(__name__)
 PREVIEW_KEYS = (
     "thumbnail_url", "thumbnail", "preview_url", "preview", "poster_url", "poster",
     "image_url", "image", "keyframe_url", "keyframe", "cover_url", "cover",
@@ -578,14 +588,7 @@ def _usable_asset_duration(
     if not isinstance(asset, Mapping):
         return 0.0
 
-    metadata = asset.get("metadata")
-    if not isinstance(metadata, Mapping):
-        metadata = {}
-
-    try:
-        duration = float(metadata.get("duration") or 0)
-    except (TypeError, ValueError):
-        duration = 0.0
+    duration = _asset_source_duration(asset)
 
     if duration <= 0:
         return 0.0
@@ -599,6 +602,26 @@ def _usable_asset_duration(
         return min(duration, cap)
 
     return duration
+
+
+def _asset_source_duration(asset: Mapping[str, Any] | None) -> float:
+    """Return the frozen asset duration used by the renderer timeline.
+
+    Human Review's canonical plan representation stores source metadata under
+    ``asset.metadata``.  In particular, do not substitute a scene target for
+    a missing source duration: doing so would make cached coverage appear
+    valid without any renderable media behind it.
+    """
+    if not isinstance(asset, Mapping):
+        return 0.0
+    metadata = asset.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return 0.0
+    try:
+        duration = float(metadata.get("duration") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return duration if duration > 0 else 0.0
 
 
 def coverage_summary(
@@ -649,6 +672,12 @@ def coverage_summary(
         if piece["role"] == "BACKUP"
     )
 
+    recovery_duration = sum(
+        float(piece["output_duration"])
+        for piece in timeline.pieces
+        if piece["role"] in {"FREEZE", "EXTEND", "LOOP"}
+    )
+
     slowdown_gain = sum(
         max(
             0.0,
@@ -662,6 +691,7 @@ def coverage_summary(
     approved_duration = (
         primary_duration
         + backup_duration
+        + recovery_duration
     )
 
     required_duration = float(
@@ -771,11 +801,22 @@ def segment_coverage_metrics(plan: Mapping[str, Any]) -> dict[str, dict[str, flo
             "covered_duration": round(scene_covered, 3),
             "missing_duration": round(missing, 3),
         }
-    if "timeline-tail" in shortfalls:
+    try:
+        required_duration = max(0.0, float(plan.get("duration") or 0) + 0.10)
+    except (TypeError, ValueError):
+        required_duration = 0.0
+    scene_target = sum(item["target_duration"] for item in metrics.values())
+    tail = max(0.0, required_duration - scene_target)
+    if tail > 0.01:
+        tail_covered = sum(
+            float(piece["output_duration"])
+            for piece in timeline.pieces
+            if piece["segment_id"] == "timeline-tail"
+        )
         metrics["timeline-tail"] = {
-            "target_duration": round(float(shortfalls["timeline-tail"]), 3),
-            "covered_duration": 0.0,
-            "missing_duration": round(float(shortfalls["timeline-tail"]), 3),
+            "target_duration": round(tail, 3),
+            "covered_duration": round(tail_covered, 3),
+            "missing_duration": round(max(0.0, tail - tail_covered), 3),
         }
     return metrics
 
@@ -800,6 +841,226 @@ def apply_segment_coverage_metrics(plan: dict[str, Any]) -> dict[str, Any]:
 def refresh_plan_coverage(plan: dict[str, Any]) -> dict[str, Any]:
     plan["coverage"] = coverage_summary(plan)
     return apply_segment_coverage_metrics(plan)
+
+
+def resolve_human_review_segment_duration(
+    segment: Mapping[str, Any],
+    target_duration: float,
+) -> dict[str, Any]:
+    """Resolve one approved segment using the Human Review timeline policy.
+
+    This is deliberately the single source of truth for duration feasibility:
+    callers receive the pieces the renderer will use and any remaining
+    shortfall.  It never selects an alternative; only the frozen primary and
+    explicitly approved backups are considered.
+    """
+    target = max(0.0, float(target_duration or 0))
+    primary = segment.get("selected_asset")
+    if not isinstance(primary, Mapping) or not _asset_uid_value(primary):
+        return {"pieces": [], "shortfall": target}
+
+    available = _asset_source_duration(primary)
+    if available <= 0:
+        return {"pieces": [], "shortfall": target}
+
+    def piece(
+        role: str,
+        asset: Mapping[str, Any],
+        source_duration: float,
+        output_duration: float,
+        playback_speed: float,
+    ) -> dict[str, Any]:
+        return {
+            "role": role,
+            "asset": asset,
+            "source_duration": source_duration,
+            "output_duration": output_duration,
+            "playback_speed": playback_speed,
+        }
+
+    if available >= target:
+        return {"pieces": [piece("PRIMARY", primary, target, target, 1.0)], "shortfall": 0.0}
+
+    required_speed = available / target if target > 0 else 1.0
+    if required_speed >= HARD_MIN_PLAYBACK_SPEED:
+        return {
+            "pieces": [piece("PRIMARY", primary, available, target, required_speed)],
+            "shortfall": 0.0,
+        }
+
+    backups = _unique_assets_by_uid(list(segment.get("backup_assets") or []))
+    primary_output = min(target, available / PREFERRED_PLAYBACK_SPEED)
+    remaining = max(0.0, target - primary_output)
+    usable_backups = [
+        backup for backup in backups
+        if _asset_source_duration(backup) >= MIN_BACKUP_OUTPUT_SECONDS
+    ]
+
+    # A short remainder becomes a proper backup cut when reducing the primary
+    # slowdown can do so within the same hard floor.
+    if (
+        usable_backups
+        and 0.0001 < remaining < MIN_BACKUP_OUTPUT_SECONDS
+        and target > MIN_BACKUP_OUTPUT_SECONDS
+    ):
+        desired_primary_output = target - MIN_BACKUP_OUTPUT_SECONDS
+        if desired_primary_output >= available:
+            candidate_speed = available / desired_primary_output
+            if HARD_MIN_PLAYBACK_SPEED <= candidate_speed <= 1.0:
+                primary_output = desired_primary_output
+                remaining = MIN_BACKUP_OUTPUT_SECONDS
+
+    pieces = [piece(
+        "PRIMARY", primary, available, primary_output,
+        available / primary_output if primary_output > 0 else 1.0,
+    )]
+    for backup in usable_backups:
+        if remaining <= 0.0001:
+            break
+        use = min(_asset_source_duration(backup), remaining)
+        if use < MIN_BACKUP_OUTPUT_SECONDS:
+            continue
+        pieces.append(piece("BACKUP", backup, use, use, 1.0))
+        remaining -= use
+
+    if 0.0001 < remaining <= MAX_SEGMENT_FREEZE_SECONDS and pieces:
+        final_piece = pieces[-1]
+        pieces.append(piece(
+            "FREEZE", final_piece["asset"], 0.04, remaining, 1.0,
+        ) | {"freeze_seconds": remaining, "source_start": max(0.0, _asset_source_duration(final_piece["asset"]) - 0.04)})
+        remaining = 0.0
+
+    return {"pieces": pieces, "shortfall": max(0.0, remaining)}
+
+
+def can_resolve_human_review_segment_duration(
+    segment: Mapping[str, Any],
+    target_duration: float,
+) -> bool:
+    """Whether the current frozen approvals can span this segment."""
+    return resolve_human_review_segment_duration(segment, target_duration)["shortfall"] == 0.0
+
+
+def validate_approved_plan_integrity(
+    plan: Mapping[str, Any],
+    *,
+    require_approved: bool = True,
+) -> dict[str, Any]:
+    """Recompute and validate the frozen evidence behind an approved plan.
+
+    The stored coverage summary is a cache for the review UI.  This validator
+    deliberately derives its result with the same timeline helpers used by
+    Human Review and rendering, so it cannot certify a plan from stale cache
+    values alone.
+    """
+    errors: list[str] = []
+    if require_approved and plan.get("review_status") != STATUS_APPROVED:
+        errors.append("review_status is not approved")
+
+    segments = plan.get("segments") or []
+    if not segments:
+        errors.append("production plan has no segments")
+
+    valid_segments = [item for item in segments if isinstance(item, Mapping)]
+    if len(valid_segments) != len(segments):
+        errors.append("production plan contains an invalid segment")
+
+    for index, segment in enumerate(valid_segments):
+        segment_id = str(segment.get("segment_id") or f"segment-{index + 1:03d}")
+        try:
+            target = float(segment.get("duration") or 0)
+        except (TypeError, ValueError):
+            target = 0.0
+        if target <= 0:
+            errors.append(f"{segment_id} has no usable target_duration")
+
+        primary = segment.get("selected_asset")
+        primary_uid = _asset_uid_value(primary)
+        if not isinstance(primary, Mapping) or not primary_uid:
+            errors.append(f"{segment_id} has no selected_asset")
+            continue
+
+        primary_duration = _asset_source_duration(primary)
+        if primary_duration <= 0:
+            errors.append(
+                f"{segment_id} primary {primary_uid} has no usable duration"
+            )
+
+        for backup in segment.get("backup_assets") or []:
+            backup_uid = _asset_uid_value(backup) if isinstance(backup, Mapping) else ""
+            if not isinstance(backup, Mapping) or not backup_uid:
+                errors.append(f"{segment_id} has an invalid backup_asset")
+            elif _asset_source_duration(backup) <= 0:
+                errors.append(
+                    f"{segment_id} backup {backup_uid} has no usable duration"
+                )
+
+    try:
+        recomputed_coverage = coverage_summary(plan)
+        segment_metrics = segment_coverage_metrics(plan)
+    except (TypeError, ValueError) as exc:
+        errors.append(f"coverage recomputation failed: {exc}")
+        recomputed_coverage = {}
+        segment_metrics = {}
+
+    if recomputed_coverage:
+        stored_coverage = plan.get("coverage")
+        if isinstance(stored_coverage, Mapping):
+            for key in ("target_duration", "covered_duration", "missing_duration"):
+                try:
+                    stored = float(stored_coverage.get(key))
+                    recomputed = float(recomputed_coverage[key])
+                except (KeyError, TypeError, ValueError):
+                    errors.append(f"stored coverage has invalid {key}")
+                    continue
+                if abs(stored - recomputed) > COVERAGE_TOLERANCE_SECONDS:
+                    _LOG.info(
+                        "COVERAGE REFRESH stored_missing=%.3f recomputed_missing=%.3f",
+                        float(stored_coverage.get("missing_duration") or 0),
+                        float(recomputed_coverage["missing_duration"]),
+                    )
+
+        segment_target = sum(
+            float(metrics["target_duration"])
+            for metrics in segment_metrics.values()
+        )
+        segment_missing = sum(
+            float(metrics["missing_duration"])
+            for metrics in segment_metrics.values()
+        )
+        if abs(segment_target - float(recomputed_coverage["target_duration"])) > COVERAGE_TOLERANCE_SECONDS:
+            errors.append(
+                "segment target coverage differs from global target: "
+                f"segments={segment_target:.3f} global={float(recomputed_coverage['target_duration']):.3f}"
+            )
+        if abs(segment_missing - float(recomputed_coverage["missing_duration"])) > COVERAGE_TOLERANCE_SECONDS:
+            errors.append(
+                "segment missing coverage differs from global missing: "
+                f"segments={segment_missing:.3f} global={float(recomputed_coverage['missing_duration']):.3f}"
+            )
+        # Coverage is a cached accounting view.  Renderability is instead
+        # determined segment-by-segment by the same resolver as the renderer.
+        for index, segment in enumerate(valid_segments):
+            target = float(segment.get("duration") or 0)
+            if index == len(valid_segments) - 1:
+                target += 0.10
+            if target > 0 and not can_resolve_human_review_segment_duration(segment, target):
+                shortfall = resolve_human_review_segment_duration(segment, target)["shortfall"]
+                errors.append(
+                    f"insufficient approved visual coverage: {shortfall:.2f}s missing in "
+                    f"{segment.get('segment_id') or f'segment-{index + 1:03d}'}"
+                )
+        tail = segment_metrics.get("timeline-tail", {}).get("missing_duration", 0.0)
+        if float(tail) > COVERAGE_TOLERANCE_SECONDS:
+            errors.append(f"insufficient approved visual coverage: {float(tail):.2f}s timeline tail")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "coverage": recomputed_coverage,
+        "segment_coverage": segment_metrics,
+        "stored_coverage": plan.get("coverage"),
+    }
 
 
 def validate_plan_for_approval(
@@ -1184,29 +1445,6 @@ def render_timeline_from_plan(
     seen_authorized: dict[str, str] = {}
     total_scene_target = 0.0
 
-    def asset_duration(
-        asset: Mapping[str, Any],
-    ) -> float:
-        metadata = (
-            asset.get("metadata")
-            if isinstance(
-                asset.get("metadata"),
-                Mapping,
-            )
-            else {}
-        )
-
-        try:
-            return max(
-                0.0,
-                float(
-                    metadata.get("duration")
-                    or 0
-                ),
-            )
-        except (TypeError, ValueError):
-            return 0.0
-
     def append_piece(
         *,
         segment_id: str,
@@ -1215,6 +1453,7 @@ def render_timeline_from_plan(
         source_duration: float,
         output_duration: float,
         playback_speed: float,
+        **extra: Any,
     ) -> None:
         uid = _asset_uid_value(asset)
 
@@ -1242,6 +1481,7 @@ def render_timeline_from_plan(
                     playback_speed,
                     6,
                 ),
+                **extra,
             }
         )
 
@@ -1323,206 +1563,62 @@ def render_timeline_from_plan(
 
             seen_authorized[backup_uid] = segment_id
 
-        available = asset_duration(primary)
+        resolution = resolve_human_review_segment_duration(segment, target)
+        for resolved_piece in resolution["pieces"]:
+            append_piece(segment_id=segment_id, **resolved_piece)
 
-        if available <= 0:
+        if resolution["shortfall"] > 0.0:
             segment_shortfalls.append(
                 {
                     "segment_id": segment_id,
-                    "shortfall": round(target, 6),
+                    "shortfall": round(resolution["shortfall"], 6),
                 }
             )
-            continue
 
-        # ------------------------------------------------------
-        # CASE 1: PRIMARY already covers scene.
-        # ------------------------------------------------------
-
-        if available >= target:
+    # A tail is not a new semantic scene.  Once every approved scene is
+    # renderable, continue only the final frozen asset for a bounded audio
+    # overrun.  Never add or rediscover an asset here.
+    unsegmented_shortfall = max(0.0, required_duration - total_scene_target)
+    if (
+        unsegmented_shortfall > 0.01
+        and unsegmented_shortfall <= MAX_TIMELINE_AUTOFILL_SECONDS
+        and not segment_shortfalls
+        and pieces
+    ):
+        final_piece = pieces[-1]
+        final_asset = final_piece["asset"]
+        source_total = _asset_source_duration(final_asset)
+        source_used = float(final_piece["source_duration"])
+        remaining = unsegmented_shortfall
+        unused = max(0.0, source_total - source_used)
+        if unused > 0.0001:
+            extend = min(unused, remaining)
             append_piece(
-                segment_id=segment_id,
-                role="PRIMARY",
-                asset=primary,
-                source_duration=target,
-                output_duration=target,
-                playback_speed=1.0,
+                segment_id="timeline-tail", role="EXTEND", asset=final_asset,
+                source_duration=extend, output_duration=extend, playback_speed=1.0,
+                source_start=source_used,
             )
-            continue
-
-        required_speed = (
-            available / target
-            if target > 0
-            else 1.0
-        )
-
-        # ------------------------------------------------------
-        # CASE 2: mild slowdown (>= 0.90x) completes scene.
-        # ------------------------------------------------------
-
-        if required_speed >= PREFERRED_PLAYBACK_SPEED:
+            remaining -= extend
+        while remaining > 0.0001 and source_total > 0.0001:
+            replay = min(source_total, remaining)
             append_piece(
-                segment_id=segment_id,
-                role="PRIMARY",
-                asset=primary,
-                source_duration=available,
-                output_duration=target,
-                playback_speed=required_speed,
+                segment_id="timeline-tail", role="LOOP", asset=final_asset,
+                source_duration=replay, output_duration=replay, playback_speed=1.0,
+                source_start=0.0,
             )
-            continue
-
-        # ------------------------------------------------------
-        # CASE 3: 0.85x–0.90x completes scene.
-        #
-        # We accept the deeper slowdown because it avoids inserting
-        # a tiny extra shot.
-        # ------------------------------------------------------
-
-        if required_speed >= HARD_MIN_PLAYBACK_SPEED:
+            remaining -= replay
+        if remaining > 0.0001:
             append_piece(
-                segment_id=segment_id,
-                role="PRIMARY",
-                asset=primary,
-                source_duration=available,
-                output_duration=target,
-                playback_speed=required_speed,
+                segment_id="timeline-tail", role="FREEZE", asset=final_asset,
+                source_duration=0.04, output_duration=remaining, playback_speed=1.0,
+                source_start=max(0.0, source_total - 0.04), freeze_seconds=remaining,
             )
-            continue
-
-        # ------------------------------------------------------
-        # CASE 4: PRIMARY cannot safely cover scene alone.
-        #
-        # Start at preferred 0.90x and let an explicitly approved
-        # backup cover the remainder.
-        # ------------------------------------------------------
-
-        primary_output = min(
-            target,
-            available / PREFERRED_PLAYBACK_SPEED,
-        )
-
-        remaining = max(
-            0.0,
-            target - primary_output,
-        )
-
-        usable_backups = [
-            backup
-            for backup in backups
-            if asset_duration(backup)
-            >= MIN_BACKUP_OUTPUT_SECONDS
-        ]
-
-        # If the remaining cut would be a flash (< 0.75s), allocate
-        # a proper 0.75s backup shot and reduce slowdown instead.
-        #
-        # Example:
-        #   primary available = 4.125
-        #   target = 5.000
-        #
-        # Instead of:
-        #   4.583 primary @ 0.90x + 0.417 backup
-        #
-        # use:
-        #   4.250 primary @ 0.97x + 0.750 backup
-        if (
-            usable_backups
-            and 0.0001 < remaining
-            < MIN_BACKUP_OUTPUT_SECONDS
-            and target > MIN_BACKUP_OUTPUT_SECONDS
-        ):
-            desired_primary_output = (
-                target - MIN_BACKUP_OUTPUT_SECONDS
-            )
-
-            if desired_primary_output >= available:
-                candidate_speed = (
-                    available
-                    / desired_primary_output
-                )
-
-                if (
-                    candidate_speed
-                    >= HARD_MIN_PLAYBACK_SPEED
-                    and candidate_speed <= 1.0
-                ):
-                    primary_output = (
-                        desired_primary_output
-                    )
-                    remaining = (
-                        MIN_BACKUP_OUTPUT_SECONDS
-                    )
-
-        primary_speed = (
-            available / primary_output
-            if primary_output > 0
-            else 1.0
-        )
-
-        append_piece(
-            segment_id=segment_id,
-            role="PRIMARY",
-            asset=primary,
-            source_duration=available,
-            output_duration=primary_output,
-            playback_speed=primary_speed,
-        )
-
-        # ------------------------------------------------------
-        # Explicit approved backups only.
-        # ------------------------------------------------------
-
-        for backup in usable_backups:
-            if remaining <= 0.0001:
-                break
-
-            backup_available = asset_duration(
-                backup
-            )
-
-            use = min(
-                backup_available,
-                remaining,
-            )
-
-            # Never intentionally create a micro-cut.
-            if use < MIN_BACKUP_OUTPUT_SECONDS:
-                continue
-
-            append_piece(
-                segment_id=segment_id,
-                role="BACKUP",
-                asset=backup,
-                source_duration=use,
-                output_duration=use,
-                playback_speed=1.0,
-            )
-
-            remaining -= use
-
-        remaining = max(
-            0.0,
-            remaining,
-        )
-
-        if remaining > 0.01:
-            segment_shortfalls.append(
-                {
-                    "segment_id": segment_id,
-                    "shortfall": round(
-                        remaining,
-                        6,
-                    ),
-                }
-            )
+            remaining = 0.0
+        unsegmented_shortfall = remaining
 
     # If there are too few scenes to span the whole audio, report
     # that as an explicit timeline-tail shortfall instead of letting
     # combine_videos() silently loop.
-    unsegmented_shortfall = max(
-        0.0,
-        required_duration - total_scene_target,
-    )
-
     if unsegmented_shortfall > 0.01:
         segment_shortfalls.append(
             {
@@ -1602,9 +1698,14 @@ def selection_result_from_plan(
     decisions: list[
         MaterialSelectionDecision
     ] = []
+    # Decisions deliberately remain the established public selection type.  Keep
+    # the frozen scene identity alongside them so production materialization can
+    # request Asset Hub bundles by approved segment, never by search term.
+    decision_segment_ids: list[str] = []
 
     primary_count = 0
     backup_count = 0
+    materialized_uids: set[str] = set()
 
     for piece in timeline.pieces:
         segment_id = str(
@@ -1618,12 +1719,15 @@ def selection_result_from_plan(
 
         asset = piece["asset"]
 
-        decisions.append(
-            _selection_decision_from_plan_asset(
-                asset,
-                segment,
+        # Timeline autofill may replay/freeze the final approved asset.  It
+        # remains one frozen selection and must be materialized only once.
+        uid = str(piece["asset_uid"])
+        if uid not in materialized_uids:
+            decisions.append(
+                _selection_decision_from_plan_asset(asset, segment)
             )
-        )
+            decision_segment_ids.append(segment_id)
+            materialized_uids.add(uid)
 
         if piece["role"] == "PRIMARY":
             primary_count += 1
@@ -1635,6 +1739,7 @@ def selection_result_from_plan(
         primary_count=primary_count,
         backup_count=backup_count,
         timeline=timeline,
+        decision_segment_ids=tuple(decision_segment_ids),
     )
 
 
@@ -2589,6 +2694,12 @@ def approve_plan(
     plan = normalize_plan_editorial_fields(read_json(plan_file))
 
     if plan.get("review_status") == STATUS_APPROVED:
+        integrity = validate_approved_plan_integrity(plan)
+        if not integrity["ok"]:
+            raise ValueError(
+                "cannot approve production plan:\n- "
+                + "\n- ".join(integrity["errors"])
+            )
         enqueue_approved_plan(
             plan_file,
             plan,
@@ -2601,6 +2712,12 @@ def approve_plan(
         allow_insufficient_coverage=allow_insufficient_coverage,
     )
 
+    integrity = validate_approved_plan_integrity(
+        plan,
+        require_approved=False,
+    )
+    errors.extend(integrity["errors"])
+
     if errors:
         raise ValueError(
             "cannot approve production plan:\n- "
@@ -2608,7 +2725,7 @@ def approve_plan(
         )
 
     plan["schema_version"] = SCHEMA_VERSION
-    plan["coverage"] = coverage
+    plan["coverage"] = integrity["coverage"] or coverage
     apply_segment_coverage_metrics(plan)
     plan["review_status"] = STATUS_APPROVED
     plan["review_required"] = False

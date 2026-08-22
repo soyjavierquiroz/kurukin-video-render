@@ -14,6 +14,7 @@ from app.models.schema import VideoParams
 from app.models.schema import MaterialInfo
 from scripts import batch_mpt_worker
 from scripts import nightly_runner
+from scripts import nightly_preflight
 from scripts import produce_batch
 
 TASK_DEPS_AVAILABLE = importlib.util.find_spec("openai") is not None
@@ -1217,6 +1218,72 @@ class TestHumanReviewPlan(unittest.TestCase):
         queued = self.root / "storage/nightly_jobs/pending/review-batch-story.json"
         self.assertTrue(queued.is_file())
         self.assertEqual(json.loads(queued.read_text())["render_mode"], human_review.RENDER_MODE)
+
+    def test_approve_rejects_missing_primary_duration_and_keeps_pending(self):
+        plan_file = self.root / "production-plan.json"
+        plan = {
+            "duration": 5,
+            "review_status": human_review.STATUS_PENDING,
+            "segments": [{
+                "segment_id": "segment-001",
+                "duration": 5,
+                "selected_asset": {"asset_uid": "drive-1", "metadata": {"duration": None}},
+                "backup_assets": [],
+            }],
+        }
+        human_review.write_json_atomic(plan_file, plan)
+
+        with self.assertRaisesRegex(ValueError, "primary drive-1 has no usable duration"):
+            human_review.approve_plan(plan_file, project_root=self.root)
+        self.assertEqual(
+            human_review.read_json(plan_file)["review_status"],
+            human_review.STATUS_PENDING,
+        )
+
+    def test_approve_rejects_backup_without_duration_when_backup_is_needed(self):
+        plan_file = self.root / "production-plan.json"
+        plan = {
+            "duration": 5,
+            "review_status": human_review.STATUS_PENDING,
+            "segments": [{
+                "segment_id": "segment-001",
+                "duration": 5,
+                "selected_asset": {"asset_uid": "drive-primary", "metadata": {"duration": 4.0}},
+                "backup_assets": [{"asset_uid": "drive-backup", "metadata": {"duration": None}}],
+            }],
+        }
+        human_review.write_json_atomic(plan_file, plan)
+
+        with self.assertRaisesRegex(ValueError, "backup drive-backup has no usable duration"):
+            human_review.approve_plan(plan_file, project_root=self.root)
+        self.assertEqual(human_review.read_json(plan_file)["review_status"], human_review.STATUS_PENDING)
+
+    def test_nightly_runner_blocks_invalid_plan_and_continues_with_next_job(self):
+        queue_root = self.root / "nightly_jobs"
+        paths = nightly_runner.ensure_queue_dirs(queue_root)
+        bad = paths["pending"] / "bad.json"
+        good = paths["pending"] / "good.json"
+        bad.write_text("{}", encoding="utf-8")
+        good.write_text("{}", encoding="utf-8")
+        args = SimpleNamespace(project_root=self.root)
+        logger = nightly_runner.Logger(self.root / "runner.log")
+
+        with patch.object(
+            nightly_preflight,
+            "preflight_job_file",
+            side_effect=nightly_preflight.PreflightError("approved production plan integrity failed"),
+        ), patch.object(nightly_runner, "process_one_job_with_retry") as worker:
+            blocked = nightly_runner.safe_process_one_job(bad, paths, args, logger)
+            worker.assert_not_called()
+        self.assertEqual(blocked.parent.name, "blocked")
+
+        completed = paths["completed"] / "good"
+        with patch.object(nightly_preflight, "preflight_job_file", return_value={}), patch.object(
+            nightly_runner, "process_one_job_with_retry", return_value=completed
+        ) as worker:
+            result = nightly_runner.safe_process_one_job(good, paths, args, logger)
+        self.assertEqual(result, completed)
+        worker.assert_called_once()
 
     def test_approved_plan_is_frozen_for_replace(self):
         plan_file = self.root / "plan.json"

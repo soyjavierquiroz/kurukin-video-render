@@ -132,6 +132,10 @@ class TestMaterialAcquisition(unittest.TestCase):
             [asset_uid for scene in wire.call_args.args[0]["scenes"] for asset_uid in scene["selected_asset_uids"]],
             ["A", "B", "C"],
         )
+        self.assertEqual(
+            [scene["scene_id"] for scene in wire.call_args.args[0]["scenes"]],
+            ["segment-001", "segment-002", "segment-003"],
+        )
 
     def test_approved_plan_bundle_drift_blocks_before_materialization(self):
         selected = MaterialCandidate("asset_hub", "B", "hub:B", "plan")

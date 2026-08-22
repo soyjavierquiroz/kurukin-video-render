@@ -188,6 +188,29 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
 
         self.assertEqual(result["asset_hub_selection"]["selected_asset_uids"], {})
 
+    def test_search_candidate_preserves_production_plan_metadata_contract(self):
+        metadata = {
+            "duration": 7.1,
+            "width": 1080,
+            "height": 1350,
+            "orientation": "vertical-4x5",
+            "people_count": 1,
+            "visual_presentation": "feminine",
+            "visual_presentation_confidence": 0.98,
+            "person_visibility": "clear",
+            "primary_topic": "aceptar ayuda",
+            "primary_theme": "vulnerabilidad",
+        }
+        provider = FakeProvider(search_results=[[{"asset_uid": "drive-a", **metadata}], []])
+
+        result = search_asset_hub_candidates(
+            provider,
+            build_asset_hub_search_requests(make_intent(), generic_policy()),
+        )
+
+        candidate = result["asset_hub_selection"]["scenes"][0]["candidates"][0]
+        self.assertEqual({key: candidate[key] for key in metadata}, metadata)
+
     def test_search_result_is_needs_input_not_ok_after_search(self):
         provider = FakeProvider(search_results=[[], []])
 
@@ -647,6 +670,38 @@ class TestKurukinAssetHubWiring(unittest.TestCase):
         )
 
         self.assertEqual(provider.materialize_calls[0], {"bundle_uid": "jab_test", "force": False})
+
+    def test_stale_manifest_retries_exact_frozen_selection_once(self):
+        valid = self._manifest_for_root("/data/job-assets")
+        stale = json.loads(json.dumps(valid))
+        stale["scenes"][0]["assets"][0]["asset_uid"] = "wrong-approved-never"
+        provider = FakeProvider(manifest=valid)
+        manifests = iter((stale, valid))
+        provider.get_renderer_manifest = lambda _bundle_uid: next(manifests)
+
+        wire_explicit_asset_hub_bundle(
+            make_intent(), provider,
+            {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
+        )
+
+        self.assertEqual(len(provider.create_calls), 2)
+        self.assertEqual([call["force"] for call in provider.materialize_calls], [False, True])
+        self.assertEqual(
+            provider.create_calls[1]["scenes"][0]["selected_asset_uids"], ["drive-a"],
+        )
+        self.assertEqual(provider.create_calls[1]["scenes"][0]["scene_id"], "scene-001")
+
+    def test_stale_manifest_retry_still_mismatching_blocks(self):
+        stale = self._manifest_for_root("/data/job-assets")
+        stale["scenes"][0]["assets"][0]["asset_uid"] = "wrong-approved-never"
+        provider = FakeProvider(manifest=stale)
+
+        with self.assertRaisesRegex(KurukinAssetHubWiringError, "does not match explicit"):
+            wire_explicit_asset_hub_bundle(
+                make_intent(), provider,
+                {"scene-001": ["drive-a"], "scene-002": ["drive-b"]},
+            )
+        self.assertEqual(len(provider.create_calls), 2)
 
     def test_wire_inherits_manifest_ready_for_assets_without_status(self):
         manifest = self._manifest_for_root("/data/job-assets")

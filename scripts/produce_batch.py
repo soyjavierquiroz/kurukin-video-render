@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ if str(HOST_ROOT) not in sys.path:
     sys.path.insert(0, str(HOST_ROOT))
 
 from app.custom import human_review
+from scripts.production_registry import ProductionRegistry, identity as production_identity, sha256_file
 
 CONTAINER_ROOT = Path("/MoneyPrinterTurbo")
 HYPERFRAMES_ROOT = Path("/opt/apps/hyperframes")
@@ -41,6 +43,15 @@ WARM_SEPIA_FILTERGRAPH = (
 VIDEO_DURATION_TOLERANCE_SECONDS = 0.35
 CANONICAL_ALIGNMENT_SOURCE = "MP3"
 SUBTITLE_WAV_REQUIRED = False
+REGISTRY_NAME = "production_registry.sqlite3"
+SUBTITLE_RECIPE_VERSION = "semantic-cues-v4"
+HYPERFRAMES_RECIPE_VERSION = "hyperframes-editorial-gold-v2"
+PRODUCTION_RECIPE_VERSION = f"production-v4:{SUBTITLE_RECIPE_VERSION}:{HYPERFRAMES_RECIPE_VERSION}"
+SUBTITLE_STAGE_NAME = "subtitle-stage.json"
+HYPERFRAMES_STAGE_NAME = "hyperframes-stage.json"
+MASTER_STAGE_NAME = "master-stage.json"
+MASTER_RECIPE_VERSION = "approved-timeline-v1"
+STYLED_MASTER_STAGE_NAME = "styled-master-stage.json"
 
 
 class BatchValidationError(Exception):
@@ -57,7 +68,16 @@ class Job:
         self.mp3 = mp3
         self.txt = txt
         self.srt = srt
+        self.batch_id = batch_id
         self.task_id = f"batch-{batch_id}-{sanitize_id(stem)}"
+
+
+def production_recipe_for(visual_style: str, preset: str, position: str) -> str:
+    """Global identity recipe: include every final-rendering policy input."""
+    return (
+        f"{PRODUCTION_RECIPE_VERSION}:style={visual_style}@{visual_style_version(visual_style)}"
+        f":preset={preset}:position={position}"
+    )
 
 
 _current_process: subprocess.Popen | None = None
@@ -154,6 +174,87 @@ def valid_mp4(path: Path) -> bool:
     return bool(info["has_video"] and info["duration"] and info["duration"] > 0)
 
 
+def production_registry() -> ProductionRegistry:
+    return ProductionRegistry(HOST_ROOT / "storage" / REGISTRY_NAME)
+
+
+def final_duration(path: Path) -> float:
+    """Read duration for registry metadata after the normal MP4 validation."""
+    try:
+        return float(ffprobe_media(path).get("duration") or 0)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError, ValueError):
+        # This only accommodates validator-mocked unit tests.  Production's
+        # valid_mp4 already requires ffprobe and a positive duration.
+        return 0.0
+
+
+def same_file_content(left: Path, right: Path) -> bool:
+    try:
+        if os.path.samefile(left, right):
+            return True
+        return left.stat().st_size == right.stat().st_size and sha256_file(left) == sha256_file(right)
+    except OSError:
+        return False
+
+
+def _host_path(value: str) -> Path:
+    path = Path(value)
+    try:
+        return HOST_ROOT / path.relative_to(CONTAINER_ROOT)
+    except ValueError:
+        return path
+
+
+def backfill_completed(*, wanted_fingerprint: str | None = None, emit: bool = False) -> None:
+    """Safely index outputs only when a completed report and frozen inputs prove identity."""
+    registry = production_registry()
+    outputs_root = HOST_ROOT / "storage" / "batch_outputs"
+    if not outputs_root.exists():
+        return
+    for final_mp4 in sorted(outputs_root.glob("*/*.mp4")):
+        if not valid_mp4(final_mp4):
+            if emit:
+                print(f"INVALID {final_mp4.relative_to(HOST_ROOT).as_posix()}")
+            continue
+        report = read_json(final_mp4.parent / REPORT_NAME)
+        entries = report.get("jobs") if isinstance(report.get("jobs"), dict) else {}
+        entry = next((item for title, item in entries.items()
+                      if isinstance(item, dict) and item.get("status") == "completed"
+                      and _host_path(str(item.get("batch_final") or final_mp4.parent / f"{title}.mp4")) == final_mp4), None)
+        if not entry:
+            if emit:
+                print(f"SKIPPED UNVERIFIABLE {final_mp4.relative_to(HOST_ROOT).as_posix()}")
+            continue
+        plan_path = _host_path(str(entry.get("production_plan_path") or ""))
+        plan = read_json(plan_path)
+        audio = _host_path(str(plan.get("audio_path") or ""))
+        script = _host_path(str(plan.get("script_path") or ""))
+        title = str(plan.get("stem") or final_mp4.stem)
+        material_title = str(plan.get("material_title") or "")
+        if not valid_file(audio) or not script.is_file():
+            if emit:
+                print(f"SKIPPED UNVERIFIABLE {final_mp4.relative_to(HOST_ROOT).as_posix()}")
+            continue
+        # Legacy reports have no recipe provenance.  They are intentionally not
+        # backfilled: a retry must rebuild subtitle/final stages under today's
+        # recipe rather than globally freezing an old-quality artifact.
+        recipe_version = str(entry.get("production_recipe_version") or "")
+        if not recipe_version:
+            if emit:
+                print(f"SKIPPED STALE RECIPE {final_mp4.relative_to(HOST_ROOT).as_posix()}")
+            continue
+        record = production_identity(title, audio, script, material_title, recipe_version)
+        if wanted_fingerprint and record["production_fingerprint"] != wanted_fingerprint:
+            continue
+        already = registry.find_valid(record["production_fingerprint"], valid_mp4)
+        inserted = False
+        if already is None:
+            inserted = registry.upsert(record, final_mp4, str(report.get("batch_id") or final_mp4.parent.name), final_duration(final_mp4))
+        if emit:
+            action = "REGISTERED" if inserted else "ALREADY REGISTERED"
+            print(f"{action} {title}" + (f" {final_mp4.relative_to(HOST_ROOT).as_posix()}" if inserted else ""))
+
+
 def valid_srt(path: Path) -> bool:
     """Return whether *path* contains at least one parseable SRT cue."""
     if not valid_file(path):
@@ -164,6 +265,154 @@ def valid_srt(path: Path) -> bool:
         return bool(parse_srt(path.read_text(encoding="utf-8-sig")))
     except (OSError, UnicodeError):
         return False
+
+
+def stable_fingerprint(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+_DERIVED_COVERAGE_KEYS = {"coverage", "coverage_summary", "segment_coverage"}
+
+
+def _canonical_approved_plan(value: Any) -> Any:
+    """Remove only non-authoritative coverage cache values before hashing."""
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_approved_plan(item)
+            for key, item in value.items()
+            if str(key) not in _DERIVED_COVERAGE_KEYS
+        }
+    if isinstance(value, list):
+        return [_canonical_approved_plan(item) for item in value]
+    return value
+
+
+def _frozen_asset_master_data(asset: Any) -> dict[str, Any]:
+    asset = asset if isinstance(asset, dict) else {}
+    metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
+    return {
+        "asset_uid": str(asset.get("asset_uid") or asset.get("canonical_id") or ""),
+        "flip_horizontal": human_review.asset_flip_horizontal(asset),
+        "source_duration": human_review._asset_source_duration(asset),
+        "orientation": str(metadata.get("orientation") or asset.get("orientation") or ""),
+    }
+
+
+def master_stage_fingerprint(plan: dict[str, Any]) -> str:
+    """Fingerprint the frozen approved inputs to the MPT video-only render."""
+    segments = [segment for segment in plan.get("segments", []) if isinstance(segment, dict)]
+    approved_plan = _canonical_approved_plan(plan)
+    return stable_fingerprint({
+        "approved_plan_sha256": stable_fingerprint(approved_plan),
+        "ordered_segment_ids": [str(segment.get("segment_id") or "") for segment in segments],
+        "ordered_segment_target_durations": [
+            float(segment.get("duration") or 0) for segment in segments
+        ],
+        "ordered_primary_assets": [_frozen_asset_master_data(segment.get("selected_asset")) for segment in segments],
+        "ordered_authorized_backup_assets": [
+            [_frozen_asset_master_data(asset) for asset in (segment.get("backup_assets") or [])]
+            for segment in segments
+        ],
+        "visual_orientation": str(plan.get("aspect_ratio") or plan.get("video_aspect") or ""),
+        "timeline_policy": {
+            "preferred_playback_speed": human_review.PREFERRED_PLAYBACK_SPEED,
+            "hard_min_playback_speed": human_review.HARD_MIN_PLAYBACK_SPEED,
+            "min_backup_output_seconds": human_review.MIN_BACKUP_OUTPUT_SECONDS,
+            "max_segment_freeze_seconds": human_review.MAX_SEGMENT_FREEZE_SECONDS,
+            "max_timeline_autofill_seconds": human_review.MAX_TIMELINE_AUTOFILL_SECONDS,
+        },
+        "master_recipe_version": MASTER_RECIPE_VERSION,
+    })
+
+
+def styled_master_fingerprint(master: Path, visual_style: str) -> str:
+    return stable_fingerprint({
+        "master_sha256": sha256_file(master),
+        "visual_style": visual_style,
+        "visual_style_version": visual_style_version(visual_style),
+    })
+
+
+def subtitle_stage_fingerprint(job: Job) -> str:
+    return stable_fingerprint({
+        "audio_sha256": sha256_file(job.mp3),
+        "script_sha256": sha256_file(job.txt),
+        "subtitle_recipe_version": SUBTITLE_RECIPE_VERSION,
+        "segmentation": {
+            "language": "es", "policy": "punctuation-clause-natural-phrase",
+            "semantic_rebalance": "connector-v1", "max_display_lines": 2,
+        },
+    })
+
+
+def final_stage_fingerprint(master: Path, subtitle: Path, *, preset: str, position: str, visual_style: str) -> str:
+    return stable_fingerprint({
+        "master_sha256": sha256_file(master),
+        "srt_sha256": sha256_file(subtitle),
+        "subtitle_recipe_version": SUBTITLE_RECIPE_VERSION,
+        "hyperframes_recipe_version": HYPERFRAMES_RECIPE_VERSION,
+        "preset": preset, "position": position,
+        "visual_style": visual_style, "visual_style_version": visual_style_version(visual_style),
+    })
+
+
+def stage_metadata_is_current(path: Path, fingerprint: str) -> bool:
+    return read_json(path).get("fingerprint") == fingerprint
+
+
+def write_stage_metadata(path: Path, fingerprint: str, **details: Any) -> None:
+    write_json_atomic(path, {"fingerprint": fingerprint, **details})
+
+
+def subtitle_quality_issues(subtitle: Path, audio_duration: float | None = None) -> list[str]:
+    """Validate semantic and structural SRT properties before HyperFrames."""
+    if not valid_srt(subtitle):
+        return ["invalid_srt"]
+    from app.custom.subtitle_optimizer import parse_srt
+    from app.services.subtitle import _is_semantic_orphan, _normalize_token_for_subtitle_alignment
+
+    cues = parse_srt(subtitle.read_text(encoding="utf-8-sig"))
+    issues: list[str] = []
+    previous_end = -1.0
+    previous_text = ""
+    for index, cue in enumerate(cues, start=1):
+        try:
+            start, end = float(cue["start"]), float(cue["end"])
+        except (KeyError, TypeError, ValueError):
+            issues.append(f"cue_{index}_timing")
+            continue
+        text = " ".join(str(cue.get("text") or "").split())
+        words = text.split()
+        if not text:
+            issues.append(f"cue_{index}_empty")
+        if end <= start or start < previous_end:
+            issues.append(f"cue_{index}_ordering")
+        if audio_duration is not None and (start < 0 or end > audio_duration + 0.05):
+            issues.append(f"cue_{index}_outside_audio")
+        if previous_text and text.casefold() == previous_text.casefold():
+            issues.append(f"cue_{index}_duplicate")
+        if words and index < len(cues):
+            last = _normalize_token_for_subtitle_alignment(words[-1])
+            if _is_semantic_orphan(words[-1]) or last == "no":
+                issues.append(f"cue_{index}_dangling_{last}")
+        if len(words) == 1 and not re.search(r"[.!?！？。:]$", text):
+            issues.append(f"cue_{index}_orphan")
+        if text.endswith(("-", "…")):
+            issues.append(f"cue_{index}_truncated")
+        previous_end, previous_text = end, text
+    return issues
+
+
+def repair_subtitle_semantics(subtitle: Path, script: str) -> dict[str, Any]:
+    """Re-run deterministic canonical segmentation from the existing timing SRT."""
+    from app.services import subtitle as subtitle_service
+    report = subtitle_service._build_alignment_result(str(subtitle), script)
+    if report["status"] == "ok":
+        subtitle_service._write_aligned_subtitle(str(subtitle), report["_output_items"])
+    subtitle_service._write_alignment_report(str(subtitle), report)
+    return {key: value for key, value in report.items() if not key.startswith("_")}
 
 
 def ensure_similar_duration(master: Path, output: Path) -> None:
@@ -225,7 +474,7 @@ def validate_styled_master(master: Path, styled_master: Path) -> None:
     try:
         master_info = ffprobe_media(master)
         styled_info = ffprobe_media(styled_master)
-    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError, ValueError) as exc:
         raise StageError(f"ffprobe validation failed for visual style output: {exc}") from exc
 
     if not styled_info["has_video"]:
@@ -271,13 +520,20 @@ def job_report_entry(report: dict[str, Any], job: Job) -> dict[str, Any]:
     return {}
 
 
-def styled_master_is_current(report_entry: dict[str, Any], styled_master: Path, visual_style: str) -> bool:
-    return (
+def styled_master_is_current(master: Path, styled_master: Path, visual_style: str) -> bool:
+    if not (
         valid_file(styled_master)
-        and report_entry.get("visual_style") == visual_style
-        and report_entry.get("visual_style_version") == visual_style_version(visual_style)
-        and report_entry.get("styled_master") == styled_master.as_posix()
-    )
+        and stage_metadata_is_current(
+            styled_master.with_name(STYLED_MASTER_STAGE_NAME),
+            styled_master_fingerprint(master, visual_style),
+        )
+    ):
+        return False
+    try:
+        validate_styled_master(master, styled_master)
+    except StageError:
+        return False
+    return True
 
 
 def delivery_output_is_current(report_entry: dict[str, Any], video_for_delivery: Path, visual_style: str) -> bool:
@@ -306,12 +562,50 @@ def link_or_copy(src: Path, dst: Path, *, replace: bool = False) -> None:
         shutil.copy2(src, dst)
 
 
+def link_or_copy_completed(src: Path, dst: Path) -> None:
+    """Materialize a global completion without altering its source artifact."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
 def compose_base_command() -> list[str]:
     cmd = ["docker", "compose", "-f", "docker-compose.yml"]
     smoke = Path("/root/mpt-asset-hub-smoke.compose.yml")
     if smoke.exists():
         cmd.extend(["-f", smoke.as_posix()])
     return cmd
+
+
+def _stage_name_from_command(cmd: list[str]) -> str:
+    try:
+        return str(cmd[cmd.index("--stage") + 1])
+    except (ValueError, IndexError):
+        return Path(cmd[0]).name if cmd else "command"
+
+
+def _safe_log_tail(log_path: Path, *, max_lines: int = 40, max_bytes: int = 8192) -> str:
+    """Return useful worker diagnostics without exposing configuration/secrets."""
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            raw = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+    secret = re.compile(r"(?i)\b(api[_-]?key|token|password|secret)\b\s*([=:])\s*\S+")
+    lines = []
+    for line in raw.splitlines()[-max_lines:]:
+        if "config.toml" in line.lower():
+            continue
+        lines.append(secret.sub(r"\1\2[REDACTED]", line))
+    return "\n".join(lines).strip()
 
 
 def run_logged(cmd: list[str], log_path: Path, *, cwd: Path = HOST_ROOT, timeout: int | None = None) -> None:
@@ -337,7 +631,12 @@ def run_logged(cmd: list[str], log_path: Path, *, cwd: Path = HOST_ROOT, timeout
         finally:
             _current_process = None
         if code != 0:
-            raise StageError(f"command failed with exit code {code}: {' '.join(cmd)}")
+            stage = _stage_name_from_command(cmd)
+            detail = _safe_log_tail(log_path)
+            message = f"{stage} failed exit={code}"
+            if detail:
+                message += f"\n{detail}"
+            raise StageError(message)
 
 
 def terminate_current_process() -> None:
@@ -476,14 +775,12 @@ def apply_visual_style(
     styled_master: Path,
     visual_style: str,
     log_path: Path,
-    report_entry: dict[str, Any] | None = None,
 ) -> tuple[Path, str]:
     if visual_style == VISUAL_STYLE_NONE:
         return master, "skip"
     if visual_style != VISUAL_STYLE_WARM_SEPIA:
         raise StageError(f"unsupported visual style: {visual_style}")
-    report_entry = report_entry or {}
-    if styled_master_is_current(report_entry, styled_master, visual_style):
+    if styled_master_is_current(master, styled_master, visual_style):
         validate_styled_master(master, styled_master)
         return styled_master, "skip"
 
@@ -497,6 +794,12 @@ def apply_visual_style(
             pass
         run_logged(build_warm_sepia_command(master, styled_master, copy_audio=False), log_path, timeout=PROCESS_TIMEOUT)
     validate_styled_master(master, styled_master)
+    write_stage_metadata(
+        styled_master.with_name(STYLED_MASTER_STAGE_NAME),
+        styled_master_fingerprint(master, visual_style),
+        master=master.as_posix(), visual_style=visual_style,
+        visual_style_version=visual_style_version(visual_style),
+    )
     return styled_master, "ok"
 
 
@@ -612,31 +915,28 @@ def process_job(
     task_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = batch_output_dir / "logs"
     master = task_dir / "final-1.mp4"
+    master_stage = task_dir / MASTER_STAGE_NAME
     styled_master = task_dir / "final-styled-warm-sepia.mp4"
     subtitle = task_dir / "subtitle.srt"
     alignment = task_dir / "subtitle-alignment.json"
+    subtitle_stage = task_dir / SUBTITLE_STAGE_NAME
+    hyperframes_stage = task_dir / HYPERFRAMES_STAGE_NAME
     final_subtitled = task_dir / "final-subtitled.mp4"
     batch_final = batch_output_dir / f"{job.stem}.mp4"
     script = job.txt.read_text(encoding="utf-8")
-    batch_id = sanitize_batch_id(job.mp3.parent)
+    batch_id = job.batch_id
     review_plan_path = human_review.plan_path(batch_id, job.stem, HOST_ROOT)
     existing_review_plan = read_json(review_plan_path)
     approved_review_plan = existing_review_plan.get("review_status") == human_review.STATUS_APPROVED
-    manifest = write_manifest(
-        job,
-        task_dir,
-        script,
-        production_plan_path=review_plan_path if (human_review_mode or approved_review_plan) else None,
-        visual_style=visual_style,
-        subject_gender=subject_gender,
-        material_title=material_title,
-        source_policy=source_policy,
-    )
-    existing_report_entry = dict(job_report_entry(report, job))
     current_visual_style_version = visual_style_version(visual_style)
 
     print(f"[{index}/{total}] {job.stem}")
     if human_review_mode:
+        manifest = write_manifest(
+            job, task_dir, script, production_plan_path=review_plan_path,
+            visual_style=visual_style, subject_gender=subject_gender,
+            material_title=material_title, source_policy=source_policy,
+        )
         existing_plan = existing_review_plan
         if existing_plan.get("review_status") == human_review.STATUS_APPROVED:
             print("  REVIEW PLAN SKIP approved")
@@ -666,13 +966,68 @@ def process_job(
         )
         return human_review.STATUS_PENDING
 
+    # This comes after the review gate (which must still prepare/validate its
+    # approved plan) but before manifest creation, MPT, subtitles, or HF work.
+    current_production_recipe = production_recipe_for(visual_style, preset, position)
+    identity_record = production_identity(job.stem, job.mp3, job.txt, material_title, current_production_recipe)
+    registry = production_registry()
+    existing_completed = registry.find_valid(identity_record["production_fingerprint"], valid_mp4)
+    if existing_completed is None:
+        # Old dated batches predate the registry.  Their frozen plan must prove
+        # the same audio/script fingerprint; filenames alone are never enough.
+        backfill_completed(wanted_fingerprint=identity_record["production_fingerprint"])
+        existing_completed = registry.find_valid(identity_record["production_fingerprint"], valid_mp4)
+    # Same-batch artifacts retain the established stage-by-stage resume path.
+    # The registry is for cross-batch reuse, not a replacement for it.
+    if existing_completed is not None and str(existing_completed["batch_id"]) != batch_id:
+        source = Path(existing_completed["final_mp4_path"])
+        if not (valid_mp4(batch_final) and same_file_content(source, batch_final)):
+            link_or_copy_completed(source, batch_final)
+        print(f"  GLOBAL COMPLETED SKIP {job.stem}")
+        print(f"  SOURCE      {source.relative_to(HOST_ROOT).as_posix() if source.is_relative_to(HOST_ROOT) else source}")
+        print(f"  FINAL       {batch_final.relative_to(HOST_ROOT).as_posix()}")
+        update_job(
+            report, report_path, job, status="completed", batch_final=batch_final.as_posix(),
+            production_fingerprint=identity_record["production_fingerprint"],
+            global_source=source.as_posix(),
+        )
+        return "completed"
+    print(f"  GLOBAL COMPLETED MISS {job.stem}")
+
+    manifest = write_manifest(
+        job,
+        task_dir,
+        script,
+        production_plan_path=review_plan_path if approved_review_plan else None,
+        visual_style=visual_style,
+        subject_gender=subject_gender,
+        material_title=material_title,
+        source_policy=source_policy,
+    )
+
+    current_master_fingerprint = (
+        master_stage_fingerprint(existing_review_plan)
+        if approved_review_plan else None
+    )
     update_job(report, report_path, job, status="master")
-    if valid_mp4(master):
+    master_current = valid_mp4(master) and (
+        current_master_fingerprint is None
+        or stage_metadata_is_current(master_stage, current_master_fingerprint)
+    )
+    if master_current:
         print("  MASTER      SKIP")
     else:
+        if valid_mp4(master) and current_master_fingerprint is not None:
+            print("  MASTER      STALE")
+        print("  MASTER      REBUILD")
         run_worker(manifest, "master", logs_dir / f"{job.stem}-mpt.log")
         if not valid_mp4(master):
             raise StageError(f"master did not produce a valid video: {master}")
+        if current_master_fingerprint is not None:
+            write_stage_metadata(
+                master_stage, current_master_fingerprint,
+                master=master.as_posix(), master_recipe_version=MASTER_RECIPE_VERSION,
+            )
         print("  MASTER      OK")
 
     update_job(
@@ -685,18 +1040,24 @@ def process_job(
         visual_style_version=current_visual_style_version,
         styled_master=styled_master.as_posix() if visual_style == VISUAL_STYLE_WARM_SEPIA else None,
     )
+    styled_current_before = (
+        visual_style == VISUAL_STYLE_WARM_SEPIA
+        and styled_master_is_current(master, styled_master, visual_style)
+    )
     video_for_delivery, visual_style_status = apply_visual_style(
         master,
         styled_master,
         visual_style,
         logs_dir / f"{job.stem}-visual-style.log",
-        existing_report_entry,
     )
     if visual_style == VISUAL_STYLE_NONE:
         print("  VISUAL STYLE SKIP none")
     elif visual_style_status == "skip":
         print(f"  VISUAL STYLE SKIP {visual_style}")
     else:
+        if not styled_current_before:
+            print("  VISUAL STYLE STALE")
+        print("  VISUAL STYLE REBUILD")
         print(f"  VISUAL STYLE OK {visual_style}")
 
     update_job(
@@ -711,16 +1072,26 @@ def process_job(
         styled_master=styled_master.as_posix() if visual_style == VISUAL_STYLE_WARM_SEPIA else None,
     )
 
-    if valid_srt(subtitle) and approved_report(subtitle_report(task_dir)):
+    current_subtitle_fingerprint = subtitle_stage_fingerprint(job)
+    subtitle_current = (
+        valid_srt(subtitle)
+        and approved_report(subtitle_report(task_dir))
+        and stage_metadata_is_current(subtitle_stage, current_subtitle_fingerprint)
+    )
+    if subtitle_current:
         report_data = subtitle_report(task_dir)
         print(f"  SUBTITLES   SKIP confidence={float(report_data.get('confidence', 0)):.3f}")
-    elif job.srt:
+    else:
+        if valid_srt(subtitle) or valid_file(subtitle_stage):
+            print("  SUBTITLES STALE")
+        print("  SUBTITLES REBUILD")
+    if not subtitle_current and job.srt:
         shutil.copy2(job.srt, subtitle)
         report_data = write_custom_srt_report(task_dir)
         if not valid_srt(subtitle):
             raise StageError(f"custom subtitle is not a valid SRT: {job.srt}")
         print("  SUBTITLES   OK confidence=1.000 custom_srt")
-    else:
+    elif not subtitle_current:
         run_worker(manifest, "subtitles", logs_dir / f"{job.stem}-whisper.log")
         report_data = subtitle_report(task_dir)
         confidence = float(report_data.get("confidence") or 0)
@@ -739,6 +1110,27 @@ def process_job(
             print("  HYPERFRAMES SKIP")
             return "review_required"
 
+    if not subtitle_current:
+        try:
+            audio_duration = ffprobe_media(job.mp3).get("duration")
+        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError, ValueError):
+            audio_duration = None
+        issues = subtitle_quality_issues(subtitle, audio_duration)
+        if issues:
+            print(f"  SUBTITLE SEMANTIC REPAIR {','.join(issues)}")
+            report_data = repair_subtitle_semantics(subtitle, script)
+            issues = subtitle_quality_issues(subtitle, audio_duration)
+        if issues:
+            raise StageError("subtitle semantic repair failed: " + ",".join(issues))
+        from app.custom.subtitle_optimizer import parse_srt
+        print(f"  SUBTITLE SEMANTIC OK cues={len(parse_srt(subtitle.read_text(encoding='utf-8-sig')))}")
+        write_stage_metadata(
+            subtitle_stage, current_subtitle_fingerprint,
+            recipe_version=SUBTITLE_RECIPE_VERSION,
+            audio_sha256=sha256_file(job.mp3), script_sha256=sha256_file(job.txt),
+            alignment_status=report_data.get("status"),
+        )
+
     update_job(
         report,
         report_path,
@@ -752,7 +1144,14 @@ def process_job(
         styled_master=styled_master.as_posix() if visual_style == VISUAL_STYLE_WARM_SEPIA else None,
     )
 
-    final_subtitled_current = valid_mp4(final_subtitled)
+    current_final_fingerprint = final_stage_fingerprint(
+        video_for_delivery, subtitle, preset=preset, position=position, visual_style=visual_style,
+    )
+    final_subtitled_current = valid_mp4(final_subtitled) and stage_metadata_is_current(
+        hyperframes_stage, current_final_fingerprint
+    )
+    if valid_mp4(final_subtitled) and not final_subtitled_current:
+        print("  HYPERFRAMES STALE")
     if final_subtitled_current:
         try:
             ensure_similar_duration(video_for_delivery, final_subtitled)
@@ -761,6 +1160,7 @@ def process_job(
     if final_subtitled_current:
         print("  HYPERFRAMES SKIP")
     else:
+        print("  HYPERFRAMES REBUILD")
         run_hyperframes(
             job,
             video_for_delivery,
@@ -774,6 +1174,13 @@ def process_job(
             raise StageError(f"HyperFrames did not produce a valid video: {final_subtitled}")
         ensure_similar_duration(video_for_delivery, final_subtitled)
         print("  HYPERFRAMES OK")
+        write_stage_metadata(
+            hyperframes_stage, current_final_fingerprint,
+            recipe_version=HYPERFRAMES_RECIPE_VERSION,
+            subtitle_recipe_version=SUBTITLE_RECIPE_VERSION,
+            master_sha256=sha256_file(video_for_delivery), srt_sha256=sha256_file(subtitle),
+            preset=preset, position=position, visual_style=visual_style,
+        )
 
     link_or_copy(final_subtitled, batch_final, replace=not final_subtitled_current)
     print(f"  FINAL       {batch_final.relative_to(HOST_ROOT).as_posix()}")
@@ -788,7 +1195,13 @@ def process_job(
         visual_style=visual_style,
         visual_style_version=current_visual_style_version,
         styled_master=styled_master.as_posix() if visual_style == VISUAL_STYLE_WARM_SEPIA else None,
+        production_recipe_version=current_production_recipe,
     )
+    # Registration is deliberately last: neither failed nor partial stages can
+    # create a reusable completed entry.
+    if not valid_mp4(batch_final):
+        raise StageError(f"final batch output did not validate: {batch_final}")
+    registry.upsert(identity_record, batch_final, batch_id, final_duration(batch_final))
     return "completed"
 
 
@@ -810,6 +1223,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("input_dir", nargs="?")
     parser.add_argument("--approved-plan", help="frozen approved production-plan.json to produce")
     parser.add_argument(
+        "--refresh-stale-subtitles-batch",
+        metavar="BATCH_ID",
+        help="repair stale subtitle/final stages for approved jobs while reusing valid masters",
+    )
+    parser.add_argument(
         "--production",
         action="store_true",
         help="run the approved-plan production pipeline (master, subtitles, HyperFrames)",
@@ -830,11 +1248,51 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("MPT_SOURCE_POLICY", "").strip(),
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--reindex-completed",
+        action="store_true",
+        help="safely register verifiable completed batch outputs; never renders",
+    )
     return parser
+
+
+def refresh_stale_subtitles_batch(batch_id: str, *, preset: str, position: str) -> int:
+    """Retry only approved jobs; normal stage provenance preserves valid masters."""
+    input_dir = HOST_ROOT / "storage" / "batch_inputs" / batch_id
+    jobs = scan_input(input_dir)
+    failures = 0
+    for job in jobs:
+        plan = human_review.plan_path(job.batch_id, job.stem, HOST_ROOT)
+        if read_json(plan).get("review_status") != human_review.STATUS_APPROVED:
+            continue
+        print(f"CURRENT {job.stem}")
+        try:
+            process_approved_review_plan(plan, preset=preset, position=position)
+        except Exception as exc:
+            failures += 1
+            print(f"FAILED {job.stem} {type(exc).__name__}: {exc}")
+    return 3 if failures else 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.refresh_stale_subtitles_batch:
+        if args.input_dir or args.approved_plan or args.production or args.human_review or args.dry_run or args.reindex_completed:
+            print("--refresh-stale-subtitles-batch cannot be combined with other production options", file=sys.stderr)
+            return 1
+        try:
+            return refresh_stale_subtitles_batch(
+                args.refresh_stale_subtitles_batch, preset=args.preset, position=args.position,
+            )
+        except (BatchValidationError, OSError) as exc:
+            print(f"REFRESH FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+    if args.reindex_completed:
+        if args.input_dir or args.approved_plan or args.production or args.human_review or args.dry_run:
+            print("--reindex-completed cannot be combined with production options", file=sys.stderr)
+            return 1
+        backfill_completed(emit=True)
+        return 0
     if args.approved_plan or args.production:
         if not args.production or not args.approved_plan or args.input_dir:
             print("--production requires --approved-plan and does not accept input_dir", file=sys.stderr)
@@ -954,6 +1412,13 @@ def process_approved_review_plan(
     if not script_path.is_file():
         raise StageError(f"approved script missing: {script_path}")
 
+    integrity = human_review.validate_approved_plan_integrity(plan)
+    if not integrity["ok"]:
+        raise StageError(
+            "approved production plan integrity failed:\n- "
+            + "\n- ".join(integrity["errors"])
+        )
+
     batch_id = str(plan.get("batch_id") or sanitize_batch_id(script_path.parent))
     stem = str(plan.get("stem") or script_path.stem)
     # Approved production plans are frozen.  Alignment comes from their
@@ -982,6 +1447,7 @@ def process_approved_review_plan(
         position=position,
         visual_style=plan_visual_style,
         human_review_mode=False,
+        material_title=str(plan.get("material_title") or ""),
     )
 
 

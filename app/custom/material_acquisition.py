@@ -82,12 +82,29 @@ def _approved_plan_asset_hub_uids(plan: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _approved_plan_scene_ids_for_uids(plan: Mapping[str, Any], asset_uids: list[str]) -> list[str]:
+    """Resolve frozen segment IDs for an already-exact approved UID sequence."""
+    scenes_by_uid: dict[str, str] = {}
+    for segment in plan.get("segments") or []:
+        if not isinstance(segment, Mapping):
+            continue
+        scene_id = str(segment.get("segment_id") or "").strip()
+        for asset in [segment.get("selected_asset"), *(segment.get("backup_assets") or [])]:
+            if not isinstance(asset, Mapping):
+                continue
+            uid = str(asset.get("asset_uid") or asset.get("canonical_id") or "")
+            if uid:
+                scenes_by_uid[uid] = scene_id
+    return [scenes_by_uid.get(uid, "") for uid in asset_uids]
+
+
 def _asset_hub_materials(
     decisions: list[Any],
     task_id: str,
     provider: Any,
     *,
     approved_plan: Mapping[str, Any] | None = None,
+    scene_ids: list[str] | None = None,
 ) -> tuple[list[MaterialInfo], str]:
     selected_uids = [str(decision.candidate.canonical_id) for decision in decisions]
     if approved_plan is not None:
@@ -98,13 +115,23 @@ def _asset_hub_materials(
                 "selected_asset_uids; materialization blocked"
             )
 
-    by_term: dict[str, list[Any]] = {}
-    for decision in decisions:
-        candidate = decision.candidate
-        by_term.setdefault(str(getattr(candidate, "search_term", "") or "asset"), []).append(candidate)
+    if scene_ids is None or len(scene_ids) != len(decisions):
+        if approved_plan is not None:
+            raise MaterialAcquisitionError(
+                "approved Asset Hub selection is missing frozen segment scene IDs"
+            )
+        # Non-production callers retain their existing request shape.  The
+        # approved production path above never takes this fallback.
+        scene_ids = [f"scene-{index:03d}" for index in range(1, len(decisions) + 1)]
+    by_scene: dict[str, list[Any]] = {}
+    for scene_id, decision in zip(scene_ids, decisions):
+        approved_scene_id = str(scene_id or "").strip()
+        if not approved_scene_id:
+            raise MaterialAcquisitionError("approved Asset Hub scene_id is required")
+        by_scene.setdefault(approved_scene_id, []).append(decision.candidate)
     scenes = []
-    for index, (term, candidates) in enumerate(by_term.items(), 1):
-        scenes.append({"scene_id": f"scene-{index:03d}", "scene_index": index, "script_scene": term,
+    for index, (scene_id, candidates) in enumerate(by_scene.items(), 1):
+        scenes.append({"scene_id": scene_id, "scene_index": index,
                        "selected_asset_uids": [candidate.canonical_id for candidate in candidates]})
     intent = {"task_id": task_id, "scenes": scenes}
     selection = {scene["scene_id"]: scene["selected_asset_uids"] for scene in scenes}
@@ -156,11 +183,27 @@ def acquire_selected_materials(*, selection_result: Any, task_id: str,
         asset_hub_provider = KurukinAssetProvider()
     hub_infos, bundle_uid = ([], None)
     if hub:
+        decision_segment_ids = list(getattr(selection_result, "decision_segment_ids", ()) or ())
+        decision_scene_ids = (
+            [
+                decision_segment_ids[index]
+                for index, decision in enumerate(decisions)
+                if getattr(decision.candidate, "provider", "") == "asset_hub"
+            ]
+            if len(decision_segment_ids) == len(decisions)
+            else []
+        )
+        if approved_plan is not None and len(decision_scene_ids) != len(hub):
+            decision_scene_ids = _approved_plan_scene_ids_for_uids(
+                approved_plan,
+                [str(decision.candidate.canonical_id) for decision in hub],
+            )
         hub_infos, bundle_uid = _asset_hub_materials(
             hub,
             task_id,
             asset_hub_provider,
             approved_plan=approved_plan,
+            scene_ids=decision_scene_ids,
         )
     hub_by_key = {decision.candidate.dedupe_key: info for decision, info in zip(hub, hub_infos)}
     result, manifest_items = [], []

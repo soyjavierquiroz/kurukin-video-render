@@ -23,9 +23,12 @@ model = None
 GLOBAL_OK_THRESHOLD = 0.90
 LINE_MIN_COVERAGE = 0.40
 SEMANTIC_SUBTITLE_TARGET_MIN_CHARS = 20
-SEMANTIC_SUBTITLE_TARGET_MAX_CHARS = 36
-SEMANTIC_SUBTITLE_SOFT_CUE_CHARS = 42
-SEMANTIC_SUBTITLE_HARD_CUE_CHARS = 48
+SEMANTIC_SUBTITLE_TARGET_MAX_CHARS = 52
+SEMANTIC_SUBTITLE_SOFT_CUE_CHARS = 64
+# A temporal cue may be visually wrapped onto two display lines.  This limit
+# deliberately leaves room for a complete Spanish clause instead of forcing a
+# grammatical fragment into the following cue.
+SEMANTIC_SUBTITLE_HARD_CUE_CHARS = 76
 SEMANTIC_SUBTITLE_TARGET_MIN_WORDS = 4
 SEMANTIC_SUBTITLE_TARGET_MAX_WORDS = 7
 SEMANTIC_BOUNDARY_CONNECTORS = {
@@ -49,6 +52,7 @@ SEMANTIC_BOUNDARY_CONNECTORS = {
     "y",
 }
 SEMANTIC_ORPHAN_WORDS = {
+    "a",
     "aunque",
     "con",
     "de",
@@ -63,6 +67,12 @@ SEMANTIC_ORPHAN_WORDS = {
     "por",
     "que",
     "sin",
+    "su",
+    "te",
+    "se",
+    "me",
+    "un",
+    "una",
     "y",
 }
 
@@ -740,13 +750,84 @@ def _balanced_cue_spans(words):
     return spans
 
 
+def _has_sentence_end(word):
+    return bool(re.search(r"[.!?！？。:]$", str(word or "").strip()))
+
+
+def _boundary_is_dangling(words, left_end, right_end):
+    """Whether the boundary separates a Spanish function construction.
+
+    `left_end` and `right_end` are exclusive offsets.  The rule is intentionally
+    lexical and deterministic: it only repairs a boundary when the surrounding
+    sentence continues, never by changing script text or timestamps.
+    """
+    if left_end <= 0 or left_end >= len(words) or right_end <= left_end:
+        return False
+    left = words[left_end - 1]["text"]
+    right = words[left_end]["text"]
+    if _has_sentence_end(left):
+        return False
+    if _is_semantic_orphan(left):
+        return True
+    # "no" is not universally dangling, but it is when it follows a connector
+    # or noun phrase and the next cue supplies the predicate ("Y un límite no /
+    # siempre es...").
+    if _normalize_token_for_subtitle_alignment(left) == "no":
+        return bool(right) and not _has_sentence_end(left)
+    # A new cue should not begin with a continuation that clearly belongs to
+    # the preceding phrase either.
+    return _is_semantic_orphan(right)
+
+
+def _rebalance_semantic_spans(words, spans):
+    """Merge bad semantic edges without losing the aligned word timing."""
+    if not spans:
+        return spans
+    repaired = list(spans)
+    index = 0
+    while index < len(repaired) - 1:
+        start, end = repaired[index]
+        next_start, next_end = repaired[index + 1]
+        merged_text = _join_semantic_words(words[start:next_end])
+        compact_complete_sentence = (
+            end == next_start
+            and not _has_sentence_end(words[end - 1]["text"])
+            and _has_sentence_end(words[next_end - 1]["text"])
+            and len(merged_text) <= SEMANTIC_SUBTITLE_HARD_CUE_CHARS
+        )
+        if end != next_start or not (compact_complete_sentence or _boundary_is_dangling(words, end, next_end)):
+            index += 1
+            continue
+        # A complete clause is more important than the normal display target.
+        # The hard cap still prevents a pathological, unrenderable cue.
+        if len(merged_text) <= SEMANTIC_SUBTITLE_HARD_CUE_CHARS:
+            repaired[index:index + 2] = [(start, next_end)]
+            if index:
+                index -= 1
+            continue
+        # If merging is too large, move words from the next cue left until the
+        # old cue no longer ends in a connector.  The next pass can then catch
+        # an orphaned beginning if one remains.
+        moved_end = end
+        while moved_end < next_end:
+            moved_end += 1
+            candidate = _join_semantic_words(words[start:moved_end])
+            if len(candidate) > SEMANTIC_SUBTITLE_HARD_CUE_CHARS:
+                break
+            if not _boundary_is_dangling(words, moved_end, next_end):
+                repaired[index:index + 2] = [(start, moved_end), (moved_end, next_end)]
+                break
+        index += 1
+    return repaired
+
+
 def _semantic_subtitle_items(script_lines, token_mapping, whisper_tokens):
     words = _semantic_words_from_alignment(script_lines, token_mapping, whisper_tokens)
     output = []
     index = 1
     previous_end = 0
 
-    for start, end in _balanced_cue_spans(words):
+    for start, end in _rebalance_semantic_spans(words, _balanced_cue_spans(words)):
         selected = words[start:end]
         mapped_words = [
             word

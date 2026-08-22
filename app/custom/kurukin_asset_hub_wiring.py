@@ -24,6 +24,22 @@ STATUS_READY = "READY"
 REASON_EXPLICIT_ASSET_SELECTION_REQUIRED = "explicit_asset_selection_required"
 REASON_ASSET_HUB_MATERIALIZATION_NOT_READY = "asset_hub_materialization_not_ready"
 
+# This is the public candidate contract returned by Asset Hub search.  Keep
+# these fields on the review-selection payload: Human Review serializes them
+# into production-plan.json and uses duration for coverage validation.
+_CANDIDATE_METADATA_FIELDS = (
+    "duration",
+    "width",
+    "height",
+    "orientation",
+    "people_count",
+    "visual_presentation",
+    "visual_presentation_confidence",
+    "person_visibility",
+    "primary_topic",
+    "primary_theme",
+)
+
 
 class KurukinAssetHubWiringError(RuntimeError):
     """Expected wiring error for explicit Asset Hub selection."""
@@ -165,7 +181,7 @@ def _candidate_tags(asset: Mapping[str, Any]) -> list[str]:
 
 def _normalize_candidate(asset: Mapping[str, Any]) -> dict[str, Any]:
     asset_uid = validate_asset_uid(asset.get("asset_uid"))
-    return {
+    candidate = {
         "asset_uid": asset_uid,
         "dedupe_key": dedupe_key(asset_uid),
         "filename": _candidate_value(asset, "filename", "name"),
@@ -176,6 +192,14 @@ def _normalize_candidate(asset: Mapping[str, Any]) -> dict[str, Any]:
         "orientation": _candidate_value(asset, "orientation", "aspect"),
         "tags": _candidate_tags(asset),
     }
+    # Do not coerce these values: zero, null, and numeric confidence are all
+    # meaningful parts of Asset Hub's response contract.
+    candidate.update({
+        field: deepcopy(asset.get(field))
+        for field in _CANDIDATE_METADATA_FIELDS
+        if field in asset
+    })
+    return candidate
 
 
 def search_asset_hub_candidates(
@@ -509,41 +533,45 @@ def wire_explicit_asset_hub_bundle(
     if not job_id:
         raise KurukinAssetHubWiringError("job_id is required")
 
-    create_response = provider.create_bundle(
-        job_id=job_id,
-        scenes=bundle_scenes,
-        created_by=created_by,
-    )
-    bundle_uid = _extract_bundle_uid(create_response)
-    if not bundle_uid:
-        raise KurukinAssetHubWiringError("Asset Hub create_bundle did not return bundle_uid")
+    # A prior bundle/manifest may be stale.  Retry only once, recreating from
+    # the exact frozen UIDs; this never invokes discovery or substitution.
+    for attempt in range(2):
+        try:
+            create_response = provider.create_bundle(
+                job_id=job_id,
+                scenes=bundle_scenes,
+                created_by=created_by,
+            )
+            bundle_uid = _extract_bundle_uid(create_response)
+            if not bundle_uid:
+                raise KurukinAssetHubWiringError("Asset Hub create_bundle did not return bundle_uid")
 
-    materialize_response = provider.materialize_bundle(bundle_uid, force=False)
-    if not isinstance(materialize_response, Mapping) or not _is_ready_response(
-        materialize_response
-    ):
-        raise KurukinAssetHubMaterializationNotReady(
-            REASON_ASSET_HUB_MATERIALIZATION_NOT_READY
-        )
+            materialize_response = provider.materialize_bundle(bundle_uid, force=attempt > 0)
+            if not isinstance(materialize_response, Mapping) or not _is_ready_response(materialize_response):
+                raise KurukinAssetHubMaterializationNotReady(REASON_ASSET_HUB_MATERIALIZATION_NOT_READY)
 
-    manifest = provider.get_renderer_manifest(bundle_uid)
-    if not isinstance(manifest, dict):
-        raise KurukinAssetHubWiringError("Asset Hub renderer manifest must be a JSON object")
-    validate_asset_hub_renderer_manifest(manifest)
-    manifest_bundle_uid = _clean_text(manifest.get("bundle_uid"))
-    if manifest_bundle_uid and manifest_bundle_uid != bundle_uid:
-        raise KurukinAssetHubWiringError(
-            "renderer manifest bundle_uid does not match created bundle_uid"
-        )
-    validate_explicit_manifest_selection(manifest, bundle_scenes)
-    ready_assets = resolve_ready_asset_paths(
-        _manifest_for_ready_path_resolution(manifest),
-        materialized_root=root,
-    )
-    if not ready_assets:
-        raise KurukinAssetHubMaterializationNotReady(
-            REASON_ASSET_HUB_MATERIALIZATION_NOT_READY
-        )
+            manifest = provider.get_renderer_manifest(bundle_uid)
+            if not isinstance(manifest, dict):
+                raise KurukinAssetHubWiringError("Asset Hub renderer manifest must be a JSON object")
+            validate_asset_hub_renderer_manifest(manifest)
+            manifest_bundle_uid = _clean_text(manifest.get("bundle_uid"))
+            if manifest_bundle_uid and manifest_bundle_uid != bundle_uid:
+                raise KurukinAssetHubWiringError("renderer manifest bundle_uid does not match created bundle_uid")
+            validate_explicit_manifest_selection(manifest, bundle_scenes)
+            ready_assets = resolve_ready_asset_paths(
+                _manifest_for_ready_path_resolution(manifest), materialized_root=root,
+            )
+            if not ready_assets:
+                raise KurukinAssetHubMaterializationNotReady(REASON_ASSET_HUB_MATERIALIZATION_NOT_READY)
+            break
+        except KurukinAssetHubMaterializationNotReady:
+            if attempt:
+                raise
+        except KurukinAssetHubWiringError as exc:
+            if attempt or "does not match explicit selected_asset_uids" not in str(exc):
+                raise
+    else:  # pragma: no cover - the retry paths either break or raise.
+        raise KurukinAssetHubMaterializationNotReady(REASON_ASSET_HUB_MATERIALIZATION_NOT_READY)
 
     return {
         "asset_hub": {
