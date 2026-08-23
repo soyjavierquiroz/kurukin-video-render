@@ -44,7 +44,7 @@ VIDEO_DURATION_TOLERANCE_SECONDS = 0.35
 CANONICAL_ALIGNMENT_SOURCE = "MP3"
 SUBTITLE_WAV_REQUIRED = False
 REGISTRY_NAME = "production_registry.sqlite3"
-SUBTITLE_RECIPE_VERSION = "semantic-cues-v4"
+SUBTITLE_RECIPE_VERSION = "semantic-cues-v5"
 HYPERFRAMES_RECIPE_VERSION = "hyperframes-editorial-gold-v2"
 PRODUCTION_RECIPE_VERSION = f"production-v4:{SUBTITLE_RECIPE_VERSION}:{HYPERFRAMES_RECIPE_VERSION}"
 SUBTITLE_STAGE_NAME = "subtitle-stage.json"
@@ -366,43 +366,91 @@ def write_stage_metadata(path: Path, fingerprint: str, **details: Any) -> None:
     write_json_atomic(path, {"fingerprint": fingerprint, **details})
 
 
-def subtitle_quality_issues(subtitle: Path, audio_duration: float | None = None) -> list[str]:
-    """Validate semantic and structural SRT properties before HyperFrames."""
-    if not valid_srt(subtitle):
-        return ["invalid_srt"]
-    from app.custom.subtitle_optimizer import parse_srt
+def subtitle_validation_issues(
+    subtitle: Path, audio_duration: float | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return (fatal structural errors, non-fatal semantic style warnings)."""
+    from app.custom.subtitle_optimizer import TIMING_RE, parse_srt, parse_timestamp
     from app.services.subtitle import _is_semantic_orphan, _normalize_token_for_subtitle_alignment
 
-    cues = parse_srt(subtitle.read_text(encoding="utf-8-sig"))
-    issues: list[str] = []
+    try:
+        content = subtitle.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return ["invalid_srt"], []
+
+    blocks = [block for block in re.split(r"\n\s*\n", content.replace("\r\n", "\n").replace("\r", "\n").strip()) if block.strip()]
+    if not blocks:
+        return ["empty_srt"], []
+
+    structural: list[str] = []
+    for index, block in enumerate(blocks, start=1):
+        lines = [line.rstrip() for line in block.split("\n")]
+        timing_match = TIMING_RE.match(lines[1].strip()) if len(lines) >= 2 else None
+        if len(lines) < 2 or not lines[0].strip().isdigit() or not timing_match:
+            structural.append(f"cue_{index}_invalid_srt")
+            continue
+        try:
+            start_value, end_value = timing_match.group(1), timing_match.group(2)
+            start, end = parse_timestamp(start_value), parse_timestamp(end_value)
+        except (AttributeError, ValueError):
+            structural.append(f"cue_{index}_timing")
+            continue
+        if any(
+            int(value.split(":")[1]) >= 60
+            or int(value.split(":")[2].split(",")[0]) >= 60
+            for value in (start_value, end_value)
+        ):
+            structural.append(f"cue_{index}_timing")
+        if end <= start:
+            structural.append(f"cue_{index}_timing")
+        if len(lines) == 2:
+            structural.append(f"cue_{index}_empty")
+        if not " ".join(line.strip() for line in lines[2:]).strip():
+            structural.append(f"cue_{index}_empty")
+
+    if structural:
+        return list(dict.fromkeys(structural)), []
+
+    cues = parse_srt(content)
+    if not cues or len(cues) != len(blocks):
+        structural.append("invalid_srt")
+    semantic: list[str] = []
     previous_end = -1.0
     previous_text = ""
     for index, cue in enumerate(cues, start=1):
         try:
             start, end = float(cue["start"]), float(cue["end"])
         except (KeyError, TypeError, ValueError):
-            issues.append(f"cue_{index}_timing")
+            structural.append(f"cue_{index}_timing")
             continue
         text = " ".join(str(cue.get("text") or "").split())
         words = text.split()
         if not text:
-            issues.append(f"cue_{index}_empty")
+            structural.append(f"cue_{index}_empty")
         if end <= start or start < previous_end:
-            issues.append(f"cue_{index}_ordering")
+            structural.append(f"cue_{index}_ordering")
         if audio_duration is not None and (start < 0 or end > audio_duration + 0.05):
-            issues.append(f"cue_{index}_outside_audio")
+            structural.append(f"cue_{index}_outside_audio")
         if previous_text and text.casefold() == previous_text.casefold():
-            issues.append(f"cue_{index}_duplicate")
+            semantic.append(f"cue_{index}_duplicate")
         if words and index < len(cues):
             last = _normalize_token_for_subtitle_alignment(words[-1])
-            if _is_semantic_orphan(words[-1]) or last == "no":
-                issues.append(f"cue_{index}_dangling_{last}")
+            # Punctuation closes the phrase even when normalization makes an
+            # interrogative "qué?" look like the connector "que".
+            if not re.search(r"[.!?！？。:]$", words[-1]) and (_is_semantic_orphan(words[-1]) or last == "no"):
+                semantic.append(f"cue_{index}_dangling_{last}")
         if len(words) == 1 and not re.search(r"[.!?！？。:]$", text):
-            issues.append(f"cue_{index}_orphan")
+            semantic.append(f"cue_{index}_orphan")
         if text.endswith(("-", "…")):
-            issues.append(f"cue_{index}_truncated")
+            semantic.append(f"cue_{index}_truncated")
         previous_end, previous_text = end, text
-    return issues
+    return list(dict.fromkeys(structural)), list(dict.fromkeys(semantic))
+
+
+def subtitle_quality_issues(subtitle: Path, audio_duration: float | None = None) -> list[str]:
+    """Compatibility wrapper for callers that need every subtitle issue."""
+    structural, semantic = subtitle_validation_issues(subtitle, audio_duration)
+    return [*structural, *semantic]
 
 
 def repair_subtitle_semantics(subtitle: Path, script: str) -> dict[str, Any]:
@@ -413,6 +461,24 @@ def repair_subtitle_semantics(subtitle: Path, script: str) -> dict[str, Any]:
         subtitle_service._write_aligned_subtitle(str(subtitle), report["_output_items"])
     subtitle_service._write_alignment_report(str(subtitle), report)
     return {key: value for key, value in report.items() if not key.startswith("_")}
+
+
+def subtitle_semantic_gate(subtitle: Path, script: str, audio_duration: float | None) -> dict[str, Any]:
+    """Attempt one deterministic style repair without weakening structural safety."""
+    structural, warnings = subtitle_validation_issues(subtitle, audio_duration)
+    result: dict[str, Any] = {
+        "structural_issues": structural,
+        "initial_warnings": warnings,
+        "warnings": warnings,
+        "repaired": False,
+    }
+    if structural or not warnings:
+        return result
+
+    result["report"] = repair_subtitle_semantics(subtitle, script)
+    structural, warnings = subtitle_validation_issues(subtitle, audio_duration)
+    result.update(structural_issues=structural, warnings=warnings, repaired=True)
+    return result
 
 
 def ensure_similar_duration(master: Path, output: Path) -> None:
@@ -1085,18 +1151,21 @@ def process_job(
         if valid_srt(subtitle) or valid_file(subtitle_stage):
             print("  SUBTITLES STALE")
         print("  SUBTITLES REBUILD")
+    alignment_confidence: float | None = None
+    alignment_suffix = ""
     if not subtitle_current and job.srt:
         shutil.copy2(job.srt, subtitle)
         report_data = write_custom_srt_report(task_dir)
         if not valid_srt(subtitle):
             raise StageError(f"custom subtitle is not a valid SRT: {job.srt}")
-        print("  SUBTITLES   OK confidence=1.000 custom_srt")
+        alignment_confidence = 1.0
+        alignment_suffix = " custom_srt"
     elif not subtitle_current:
         run_worker(manifest, "subtitles", logs_dir / f"{job.stem}-whisper.log")
         report_data = subtitle_report(task_dir)
         confidence = float(report_data.get("confidence") or 0)
         if valid_srt(subtitle) and approved_report(report_data):
-            print(f"  SUBTITLES   OK confidence={confidence:.3f}")
+            alignment_confidence = confidence
         else:
             print(f"  SUBTITLES   REVIEW confidence={confidence:.3f}")
             update_job(
@@ -1115,15 +1184,25 @@ def process_job(
             audio_duration = ffprobe_media(job.mp3).get("duration")
         except (subprocess.CalledProcessError, json.JSONDecodeError, OSError, ValueError):
             audio_duration = None
-        issues = subtitle_quality_issues(subtitle, audio_duration)
-        if issues:
-            print(f"  SUBTITLE SEMANTIC REPAIR {','.join(issues)}")
-            report_data = repair_subtitle_semantics(subtitle, script)
-            issues = subtitle_quality_issues(subtitle, audio_duration)
-        if issues:
-            raise StageError("subtitle semantic repair failed: " + ",".join(issues))
+        gate = subtitle_semantic_gate(subtitle, script, audio_duration)
+        structural_issues = gate["structural_issues"]
+        semantic_warnings = gate["warnings"]
+        if structural_issues:
+            raise StageError("subtitle structural validation failed: " + ",".join(structural_issues))
+        print(f"  SUBTITLE ALIGNMENT OK confidence={alignment_confidence:.3f}{alignment_suffix}")
+        if gate["initial_warnings"]:
+            print(f"  SUBTITLE SEMANTIC REPAIR {','.join(gate['initial_warnings'])}")
+        if gate.get("report"):
+            report_data = gate["report"]
         from app.custom.subtitle_optimizer import parse_srt
-        print(f"  SUBTITLE SEMANTIC OK cues={len(parse_srt(subtitle.read_text(encoding='utf-8-sig')))}")
+        cue_count = len(parse_srt(subtitle.read_text(encoding="utf-8-sig")))
+        if semantic_warnings:
+            for warning in semantic_warnings:
+                print(f"  SUBTITLE SEMANTIC WARNING {warning}")
+            print(f"  SUBTITLE SEMANTIC ACCEPTED WITH WARNINGS cues={cue_count}")
+        else:
+            print(f"  SUBTITLE SEMANTIC OK cues={cue_count}")
+        print(f"  SUBTITLES   OK confidence={alignment_confidence:.3f}{alignment_suffix}")
         write_stage_metadata(
             subtitle_stage, current_subtitle_fingerprint,
             recipe_version=SUBTITLE_RECIPE_VERSION,
