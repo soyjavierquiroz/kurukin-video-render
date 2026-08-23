@@ -1345,6 +1345,49 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertIn("hflip", stage_with_flip(True).split(","))
         self.assertNotIn("hflip", stage_with_flip(False).split(","))
 
+    def test_freeze_uses_a_real_final_frame_before_cloning_and_keeps_flip(self):
+        source = self.root / "asset.mp4"
+        source.write_bytes(b"video")
+        piece = {
+            "segment_id": "segment-001", "role": "FREEZE", "asset_uid": "asset-1",
+            "asset": {"flip_horizontal": True}, "flip_horizontal": True,
+            "source_duration": 0.04, "source_start": 3.585,
+            "output_duration": 0.972, "playback_speed": 1.0, "freeze_seconds": 0.972,
+        }
+        timeline = SimpleNamespace(pieces=(piece,), shortfall=0, segment_shortfalls=(), total_output_duration=.972)
+        selected = SimpleNamespace(decisions=(decision(candidate("asset-1")),))
+        acquired = SimpleNamespace(materials=(MaterialInfo(provider="local", url=source.as_posix(), duration=4),))
+
+        def fake_run(command, **_kwargs):
+            Path(command[-1]).parent.mkdir(parents=True, exist_ok=True)
+            Path(command[-1]).write_bytes(b"staged")
+            return SimpleNamespace(returncode=0, stderr="")
+
+        with patch.object(human_review, "render_timeline_from_plan", return_value=timeline), \
+             patch("scripts.batch_mpt_worker.subprocess.run", side_effect=fake_run) as run:
+            batch_mpt_worker._stage_human_review_timeline(plan={}, selection=selected, acquisition=acquired, task_id="test-freeze-filter")
+        vf = run.call_args.args[0][run.call_args.args[0].index("-vf") + 1]
+        self.assertIn("reverse,select=eq(n\\,0),setpts=PTS-STARTPTS,fps=24", vf)
+        self.assertIn("tpad=stop_mode=clone:stop_duration=0.972000", vf)
+        self.assertIn("hflip", vf.split(","))
+        self.assertTrue(vf.endswith("trim=duration=0.972000,setpts=PTS-STARTPTS"))
+
+    def test_stage_failure_includes_redacted_ffmpeg_stderr_tail(self):
+        source = self.root / "asset.mp4"
+        source.write_bytes(b"video")
+        plan = {"review_status": human_review.STATUS_APPROVED, "duration": 5, "segments": [{
+            "segment_id": "segment-001", "duration": 5,
+            "selected_asset": {"asset_uid": "asset-1", "canonical_id": "asset-1", "metadata": {"duration": 5}},
+            "backup_assets": [],
+        }]}
+        selected = SimpleNamespace(decisions=(decision(candidate("asset-1")),))
+        acquired = SimpleNamespace(materials=(MaterialInfo(provider="local", url=source.as_posix(), duration=5),))
+        with patch("scripts.batch_mpt_worker.subprocess.run", return_value=SimpleNamespace(returncode=1, stderr="encoder failed token=private-value\nuseful tail")):
+            with self.assertRaisesRegex(RuntimeError, "useful tail") as caught:
+                batch_mpt_worker._stage_human_review_timeline(plan=plan, selection=selected, acquisition=acquired, task_id="test-stderr-tail")
+        self.assertIn("token=<redacted>", str(caught.exception))
+        self.assertNotIn("private-value", str(caught.exception))
+
 
 class TestHumanReviewPipeline(unittest.TestCase):
     @unittest.skipUnless(TASK_DEPS_AVAILABLE, "task service optional dependencies are not installed")

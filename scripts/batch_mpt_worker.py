@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -24,6 +25,17 @@ def _write_json(path: Path, payload: dict) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+_FFMPEG_SECRET = re.compile(
+    r"(?i)((?:authorization|api[_-]?key|token|secret|password))"
+    r"\s*(?:=|:)\s*[^\s,;]+"
+)
+
+
+def _safe_ffmpeg_stderr_tail(stderr: str, *, limit: int = 2000) -> str:
+    """Return useful ffmpeg diagnostics without propagating credentials."""
+    return _FFMPEG_SECRET.sub(r"\1=<redacted>", str(stderr or ""))[-limit:]
 
 
 
@@ -223,37 +235,42 @@ def _stage_human_review_timeline(
             f"{uid}.mp4"
         )
 
-        # Slow playback by stretching video PTS.
-        #
-        # Example:
-        #   speed 0.90
-        #   setpts=(PTS-STARTPTS)/0.90
-        filters = [
-            (
-                f"trim=start=0:"
-                f"duration={source_duration:.6f}"
-            ),
-            (
-                "setpts="
-                f"(PTS-STARTPTS)/{playback_speed:.6f}"
-            ),
-        ]
-        if source_start > 0:
-            filters[0] = (
-                f"trim=start={source_start:.6f}:"
-                f"duration={source_duration:.6f}"
-            )
         if freeze_seconds > 0:
-            filters.append(f"tpad=stop_mode=clone:stop_duration={freeze_seconds:.6f}")
+            # The freeze timeline piece nominally starts at the final 0.04s
+            # of the source.  At 24 fps that interval can contain no frame:
+            # trim then emits an empty stream and tpad cannot clone it.  Take
+            # the final real decoded frame before source_start instead, reset
+            # its PTS, then clone it for the approved freeze duration.
+            filters = [
+                f"trim=start=0:end={source_start:.6f}",
+                "reverse",
+                "select=eq(n\\,0)",
+                "setpts=PTS-STARTPTS",
+                # select produces a variable-frame-rate one-frame stream;
+                # give tpad a concrete cadence so clone frames are emitted.
+                "fps=24",
+                f"tpad=stop_mode=clone:stop_duration={freeze_seconds:.6f}",
+            ]
             print(
                 f"timeline {segment_id} FREEZE asset={uid} duration={freeze_seconds:.3f}s"
             )
-        elif role == "extend":
+        else:
+            # Slow playback by stretching video PTS.
+            # Example: speed 0.90 -> setpts=(PTS-STARTPTS)/0.90
+            filters = [
+                f"trim=start={source_start:.6f}:duration={source_duration:.6f}",
+                f"setpts=(PTS-STARTPTS)/{playback_speed:.6f}",
+            ]
+        if role == "extend":
             print(f"timeline timeline-tail EXTEND asset={uid} duration={output_duration:.3f}s")
         elif role == "loop":
             print(f"timeline timeline-tail LOOP asset={uid} duration={output_duration:.3f}s")
         if flip_horizontal:
             filters.append("hflip")
+        # Make the output duration a property of the encoded MP4 rather than
+        # relying on validator arithmetic or encoder frame rounding.
+        filters.append(f"trim=duration={output_duration:.6f}")
+        filters.append("setpts=PTS-STARTPTS")
         vf = ",".join(filters)
 
         command = [
@@ -297,7 +314,7 @@ def _stage_human_review_timeline(
             raise RuntimeError(
                 "failed to stage Human Review timeline "
                 f"clip {segment_id}/{uid}: "
-                f"{completed.stderr[-2000:]}"
+                f"{_safe_ffmpeg_stderr_tail(completed.stderr)}"
             )
 
         if (

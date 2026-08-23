@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any, Mapping
 from app.custom.asset_hub_manifest import extract_asset_hub_local_assets
 from app.custom.kurukin_asset_hub import KurukinAssetProvider
 from app.custom.kurukin_asset_hub_wiring import wire_explicit_asset_hub_bundle
+from app.custom.kurukin_asset_hub_wiring import KurukinAssetHubMaterializationNotReady
 from app.models.schema import MaterialInfo
 from app.services import material
 from app.utils import utils
@@ -21,6 +23,7 @@ from app.utils import utils
 
 _TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _FORBIDDEN = ("drive_file_id", "remote_path", "rclone_remote", "target_path", "credential", "api_key", "token", "secret", "password", "authorization")
+_APPROVED_MATERIALIZATION_BACKOFF_SECONDS = (5, 15)
 
 
 class MaterialAcquisitionError(RuntimeError): pass
@@ -275,14 +278,30 @@ def acquire_selected_materials(*, selection_result: Any, task_id: str,
             decision_scene_ids = _approved_plan_scene_ids_for_uids(
                 approved_plan,
                 [str(decision.candidate.canonical_id) for decision in hub],
-            )
-        hub_infos, bundle_uid = _asset_hub_materials(
-            hub,
-            task_id,
-            asset_hub_provider,
-            approved_plan=approved_plan,
-            scene_ids=decision_scene_ids,
         )
+        for attempt in range(1, 4):
+            if approved_plan is not None and attempt > 1:
+                print(f"ASSET HUB MATERIALIZATION RETRY attempt={attempt}/3")
+            try:
+                hub_infos, bundle_uid = _asset_hub_materials(
+                    hub,
+                    task_id,
+                    asset_hub_provider,
+                    approved_plan=approved_plan,
+                    scene_ids=decision_scene_ids,
+                )
+                if approved_plan is not None:
+                    print(f"ASSET HUB MATERIALIZATION READY attempt={attempt}/3")
+                break
+            except KurukinAssetHubMaterializationNotReady:
+                # Only frozen, approved production plans may wait and retry.
+                # The same decisions and scene IDs are passed on every call;
+                # this branch neither discovers nor substitutes assets.
+                if approved_plan is None or attempt == 3:
+                    raise
+                if attempt == 1:
+                    print("ASSET HUB MATERIALIZATION WAIT attempt=1/3")
+                time.sleep(_APPROVED_MATERIALIZATION_BACKOFF_SECONDS[attempt - 1])
     hub_by_key = {decision.candidate.dedupe_key: info for decision, info in zip(hub, hub_infos)}
     result, manifest_items = [], []
     materials_dir.mkdir(parents=True, exist_ok=True)

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from app.custom.material_discovery import MaterialCandidate
 from app.custom.material_acquisition import MaterialAcquisitionError, MaterialAcquisitionUnavailable, acquire_selected_materials
+from app.custom.kurukin_asset_hub_wiring import KurukinAssetHubMaterializationNotReady
 from app.models.schema import MaterialInfo
 from app.services import material as material_service
 
@@ -209,6 +210,30 @@ class TestMaterialAcquisition(unittest.TestCase):
         with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle", side_effect=error):
             with self.assertRaises(MaterialAcquisitionUnavailable): acquire_selected_materials(selection_result=SimpleNamespace(decisions=(decision(hub),)), task_id="t1", asset_hub_provider=object())
         with self.assertRaises(ValueError): acquire_selected_materials(selection_result=SimpleNamespace(decisions=()), task_id="../bad")
+
+    def test_approved_materialization_retries_exact_frozen_uids_and_third_success_continues(self):
+        hub = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")
+        info = MaterialInfo(provider="asset_hub", url="/tmp/approved.mp4", duration=5)
+        attempts = [KurukinAssetHubMaterializationNotReady("not ready"), KurukinAssetHubMaterializationNotReady("not ready"), ([info], "bundle")]
+        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), \
+             patch("app.custom.material_acquisition._asset_hub_materials", side_effect=attempts) as materialize, \
+             patch("app.custom.material_acquisition.time.sleep") as sleep:
+            result = acquire_selected_materials(selection_result=SimpleNamespace(decisions=(decision(hub),)), task_id="t1", asset_hub_provider=object(), approved_plan=self.approved_plan(["uid-a"]))
+        self.assertEqual(result.materials, (info,))
+        self.assertEqual(sleep.call_args_list, [((5,),), ((15,),)])
+        self.assertEqual(materialize.call_count, 3)
+        self.assertEqual([[d.candidate.canonical_id for d in call.args[0]] for call in materialize.call_args_list], [["uid-a"]] * 3)
+        self.assertEqual([call.kwargs["scene_ids"] for call in materialize.call_args_list], [["segment-001"]] * 3)
+
+    def test_approved_materialization_exhaustion_blocks_and_open_sources_do_not_retry(self):
+        hub = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")
+        not_ready = KurukinAssetHubMaterializationNotReady("not ready")
+        with patch("app.custom.material_acquisition._asset_hub_materials", side_effect=[not_ready, not_ready, not_ready]) as materialize, \
+             patch("app.custom.material_acquisition.time.sleep") as sleep:
+            with self.assertRaises(KurukinAssetHubMaterializationNotReady):
+                acquire_selected_materials(selection_result=SimpleNamespace(decisions=(decision(hub),)), task_id="t1", asset_hub_provider=object(), approved_plan=self.approved_plan(["uid-a"]))
+        self.assertEqual(materialize.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [((5,),), ((15,),)])
 
     def test_stock_download_records_existing_external_history(self):
         if download_material_candidate is None:
