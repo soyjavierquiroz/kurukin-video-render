@@ -12,16 +12,6 @@ services:
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
     volumes: *common-volumes
     restart: always
-  human-review:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: "moneyprinterturbo-human-review"
-    ports:
-      - "127.0.0.1:18502:8501"
-    command: [ "streamlit", "run", "./scripts/review_app.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.gatherUsageStats=false", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=true", "--server.showEmailPrompt=false" ]
-    volumes: *common-volumes
-    restart: unless-stopped
   api:
     build:
       context: .

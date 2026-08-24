@@ -1,0 +1,52 @@
+version: "3.8"
+
+services:
+  human-review:
+    image: moneyprinterturbo-webui
+    working_dir: /MoneyPrinterTurbo
+    command:
+      - streamlit
+      - run
+      - ./scripts/review_app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --browser.gatherUsageStats=false
+      - --client.toolbarMode=minimal
+      - --logger.hideWelcomeMessage=true
+      - --server.showEmailPrompt=false
+    volumes:
+      - type: bind
+        source: /opt/moneyprinterturbo
+        target: /MoneyPrinterTurbo
+        read_only: false
+      - type: bind
+        source: /var/lib/kurukin-asset-hub-pilot/job-assets
+        target: /data/job-assets
+        read_only: true
+    networks:
+      traefik_public: {}
+      general_network:
+        aliases:
+          - human-review
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == HughesDocker2026
+      restart_policy:
+        condition: any
+        delay: 5s
+      labels:
+        traefik.enable: "true"
+        traefik.docker.network: traefik_public
+        traefik.http.routers.human-review.rule: "Host(`human.kuruk.in`)"
+        traefik.http.routers.human-review.entrypoints: websecure
+        traefik.http.routers.human-review.tls: "true"
+        traefik.http.routers.human-review.tls.certresolver: le
+        traefik.http.routers.human-review.service: human-review
+        traefik.http.services.human-review.loadbalancer.server.port: "8501"
+
+networks:
+  traefik_public:
+    external: true
+  general_network:
+    external: true
