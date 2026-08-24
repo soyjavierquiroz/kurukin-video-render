@@ -2690,6 +2690,7 @@ def approve_plan(
     project_root: str | Path | None = None,
     *,
     allow_insufficient_coverage: bool = False,
+    enqueue_nightly: bool = True,
 ) -> dict[str, Any]:
     plan = normalize_plan_editorial_fields(read_json(plan_file))
 
@@ -2700,11 +2701,12 @@ def approve_plan(
                 "cannot approve production plan:\n- "
                 + "\n- ".join(integrity["errors"])
             )
-        enqueue_approved_plan(
-            plan_file,
-            plan,
-            project_root=project_root,
-        )
+        if enqueue_nightly:
+            enqueue_approved_plan(
+                plan_file,
+                plan,
+                project_root=project_root,
+            )
         return plan
 
     errors, coverage = validate_plan_for_approval(
@@ -2735,11 +2737,12 @@ def approve_plan(
 
     write_json_atomic(plan_file, plan)
 
-    enqueue_approved_plan(
-        plan_file,
-        plan,
-        project_root=project_root,
-    )
+    if enqueue_nightly:
+        enqueue_approved_plan(
+            plan_file,
+            plan,
+            project_root=project_root,
+        )
 
     return plan
 

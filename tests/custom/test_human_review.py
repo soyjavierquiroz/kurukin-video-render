@@ -1,6 +1,7 @@
 import json
 import importlib.util
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,6 +84,18 @@ def selection(selected):
         ("term",),
         5,
     )
+
+
+def load_review_app_module():
+    module_name = "review_app_for_human_review_tests"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        Path("scripts/review_app.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(sys.modules, {"streamlit": SimpleNamespace(), module_name: module}):
+        spec.loader.exec_module(module)
+    return module
 
 
 class TestHumanReviewPlan(unittest.TestCase):
@@ -1218,6 +1231,47 @@ class TestHumanReviewPlan(unittest.TestCase):
         queued = self.root / "storage/nightly_jobs/pending/review-batch-story.json"
         self.assertTrue(queued.is_file())
         self.assertEqual(json.loads(queued.read_text())["render_mode"], human_review.RENDER_MODE)
+
+    def test_approve_explicit_enqueue_nightly_true_enqueues(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        human_review.write_json_atomic(plan_file, {
+            "schema_version": 1, "batch_id": "batch", "stem": "story", "task_id": "task-1",
+            "duration": 5, "review_status": human_review.STATUS_PENDING, "visual_style": "none",
+            "segments": [{"segment_id": "segment-001", "duration": 5,
+                          "selected_asset": {"asset_uid": "asset-1", "canonical_id": "asset-1", "dedupe_key": "asset-1", "metadata": {"duration": 5}},
+                          "backup_assets": []}],
+        })
+
+        human_review.approve_plan(plan_file, project_root=self.root, enqueue_nightly=True)
+
+        self.assertTrue((self.root / "storage/nightly_jobs/pending/review-batch-story.json").is_file())
+
+    def test_approve_without_enqueue_freezes_content_job_and_preserves_provenance(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        content_job = {"content_id": "test-content-001", "niche_id": "test-niche"}
+        human_review.write_json_atomic(plan_file, {
+            "schema_version": 1, "batch_id": "batch", "stem": "story", "task_id": "task-1",
+            "duration": 5, "review_status": human_review.STATUS_PENDING, "visual_style": "none",
+            "content_job": content_job,
+            "segments": [{"segment_id": "segment-001", "duration": 5,
+                          "selected_asset": {"asset_uid": "asset-1", "canonical_id": "asset-1", "dedupe_key": "asset-1", "metadata": {"duration": 5}},
+                          "backup_assets": []}],
+        })
+
+        plan = human_review.approve_plan(plan_file, project_root=self.root, enqueue_nightly=False)
+
+        self.assertEqual(plan["review_status"], human_review.STATUS_APPROVED)
+        self.assertEqual(plan["content_job"], content_job)
+        self.assertFalse((self.root / "storage/nightly_jobs/pending").exists())
+        self.assertTrue(human_review.validate_approved_plan_integrity(plan)["ok"])
+
+    def test_review_app_does_not_enqueue_content_job_plans(self):
+        review_app = load_review_app_module()
+        self.assertFalse(review_app.should_enqueue_nightly({"content_job": {"content_id": "test-content-001"}}))
+
+    def test_review_app_keeps_legacy_enqueue_for_non_content_job_plans(self):
+        review_app = load_review_app_module()
+        self.assertTrue(review_app.should_enqueue_nightly({"batch_id": "legacy-batch"}))
 
     def test_approve_rejects_missing_primary_duration_and_keeps_pending(self):
         plan_file = self.root / "production-plan.json"

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 import sys
 
@@ -13,6 +14,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.custom import human_review
+
+
+def should_enqueue_nightly(plan: Mapping[str, object]) -> bool:
+    """Content-job plans await external production scheduling after review."""
+    return not isinstance(plan.get("content_job"), Mapping)
 
 
 def discover_plans(status: str = human_review.STATUS_PENDING) -> list[Path]:
@@ -619,18 +625,21 @@ def main() -> None:
             "APPROVE JOB",
             type="primary",
         ):
+            enqueue_nightly = should_enqueue_nightly(plan)
             try:
                 human_review.approve_plan(
                     plan_file,
                     project_root=PROJECT_ROOT,
                     allow_insufficient_coverage=allow_short,
+                    enqueue_nightly=enqueue_nightly,
                 )
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                st.success(
-                    "Approved and queued for Night Runner."
-                )
+                if enqueue_nightly:
+                    st.success("Approved and queued for Night Runner.")
+                else:
+                    st.success("Approved. Awaiting production scheduling.")
                 st.rerun()
 
     with reject:
