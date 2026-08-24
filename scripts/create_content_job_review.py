@@ -129,14 +129,78 @@ def content_job_provenance(metadata: dict[str, Any], policy: Any) -> dict[str, A
     }
 
 
-def _validate_existing_plan(plan_path: Path, batch_id: str, stem: str, provenance: dict[str, Any]) -> None:
-    plan = human_review.read_json(plan_path)
+def _existing_plan_matches_content_job(
+    plan: dict[str, Any],
+    *,
+    plan_path: Path,
+    batch_id: str,
+    stem: str,
+    audio: Path,
+    script: Path,
+    policy: Any,
+) -> None:
+    """Prove that a legacy pending plan is the one for this content job.
+
+    Older manifests derived their internal ``batch_id`` from the content-job
+    directory.  The review queue path and task ID, however, have always used
+    the adapter's deterministic batch ID.  Do not rewrite that legacy field:
+    the deterministic plan location and task identity are the stable proof.
+    """
     if plan.get("review_status") != human_review.STATUS_PENDING:
         raise ContentJobReviewError(f"existing review plan is not pending: {plan_path}")
-    if plan.get("batch_id") != batch_id or plan.get("stem") != stem:
+    expected_task_id = f"batch-{batch_id}-{stem}"
+    if (
+        plan_path != human_review.plan_path(batch_id, stem, produce_batch.HOST_ROOT).resolve()
+        or plan.get("stem") != stem
+        or plan.get("job_name") != stem
+        or plan.get("task_id") != expected_task_id
+    ):
         raise ContentJobReviewError(f"existing review plan identity differs: {plan_path}")
-    if plan.get("content_job") != provenance:
-        raise ContentJobReviewError(f"existing review plan content_job provenance differs: {plan_path}")
+    try:
+        plan_audio = Path(str(plan["audio_path"])).resolve()
+        plan_script = Path(str(plan["script_path"])).resolve()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ContentJobReviewError(f"existing review plan source identity is incomplete: {plan_path}") from exc
+    if plan_audio != audio.resolve() or plan_script != script.resolve():
+        raise ContentJobReviewError(f"existing review plan source identity differs: {plan_path}")
+
+    # Policy models use tuples internally while review plans are JSON, so
+    # compare the JSON representation rather than their Python containers.
+    expected_material_policy = json.loads(json.dumps(policy.to_dict()))
+    expected_asset_hub_policy = build_asset_hub_source_policy(policy)
+    if (
+        plan.get("material_source_policy") != expected_material_policy
+        or plan.get("asset_hub_source_policy") != expected_asset_hub_policy
+    ):
+        raise ContentJobReviewError(f"existing review plan source policy differs: {plan_path}")
+
+
+def _validate_existing_plan(
+    plan_path: Path,
+    *,
+    batch_id: str,
+    stem: str,
+    audio: Path,
+    script: Path,
+    policy: Any,
+    provenance: dict[str, Any],
+) -> str:
+    plan = human_review.read_json(plan_path)
+    _existing_plan_matches_content_job(
+        plan, plan_path=plan_path, batch_id=batch_id, stem=stem,
+        audio=audio, script=script, policy=policy,
+    )
+    existing_provenance = plan.get("content_job")
+    if existing_provenance is not None:
+        if existing_provenance != provenance:
+            raise ContentJobReviewError(f"existing review plan content_job provenance differs: {plan_path}")
+        return "already_exists"
+
+    # This is deliberately the only mutation of a legacy pending plan.
+    updated_plan = dict(plan)
+    updated_plan["content_job"] = provenance
+    human_review.write_json_atomic(plan_path, updated_plan)
+    return "provenance_backfilled"
 
 
 def create_content_job_review(
@@ -167,8 +231,11 @@ def create_content_job_review(
 
     provenance = content_job_provenance(metadata, policy)
     if plan_path.exists():
-        _validate_existing_plan(plan_path, batch_id, stem, provenance)
-        return "already_exists", plan_path
+        result = _validate_existing_plan(
+            plan_path, batch_id=batch_id, stem=stem, audio=audio, script=script,
+            policy=policy, provenance=provenance,
+        )
+        return result, plan_path
 
     material_title, source_policy = legacy_review_arguments(policy)
     job = produce_batch.Job(stem, audio, script, None, batch_id)
@@ -207,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if result == "already_exists":
         print("REVIEW ALREADY EXISTS")
+    elif result == "provenance_backfilled":
+        print("PROVENANCE BACKFILLED")
     else:
         print("REVIEW CREATED")
     print(plan_path)

@@ -46,8 +46,18 @@ class ContentJobHumanReviewTests(unittest.TestCase):
 
     def _fake_process(self, job, **_kwargs):
         plan = human_review.plan_path(job.batch_id, job.stem, self.root)
-        human_review.write_json_atomic(plan, {"batch_id": job.batch_id, "stem": job.stem,
-                                              "review_status": human_review.STATUS_PENDING})
+        policy = adapter.resolve_asset_profile("test-niche", "MI_OTRA_YO", self.registry)
+        human_review.write_json_atomic(plan, {
+            "batch_id": job.batch_id,
+            "task_id": job.task_id,
+            "stem": job.stem,
+            "job_name": job.stem,
+            "audio_path": job.mp3.as_posix(),
+            "script_path": job.txt.as_posix(),
+            "material_source_policy": policy.to_dict(),
+            "asset_hub_source_policy": adapter.build_asset_hub_source_policy(policy),
+            "review_status": human_review.STATUS_PENDING,
+        })
         return human_review.STATUS_PENDING
 
     def _create(self, job):
@@ -113,6 +123,24 @@ class ContentJobHumanReviewTests(unittest.TestCase):
         self.assertEqual((result, repeated), ("already_exists", plan))
         process.assert_not_called()
 
+    def test_pending_plan_missing_provenance_is_safely_backfilled_only(self):
+        job, data = self._job()
+        (_, plan), _ = self._create(job)
+        original = human_review.read_json(plan)
+        del original["content_job"]
+        human_review.write_json_atomic(plan, original)
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), patch.object(produce_batch, "process_job") as process:
+            result, repeated = adapter.create_content_job_review(job, registry_path=self.registry)
+
+        updated = human_review.read_json(plan)
+        self.assertEqual((result, repeated), ("provenance_backfilled", plan))
+        self.assertEqual(updated["content_job"]["content_id"], data["content_id"])
+        without_provenance = dict(updated)
+        del without_provenance["content_job"]
+        self.assertEqual(without_provenance, original)
+        process.assert_not_called()
+
     def test_conflicting_existing_provenance_fails(self):
         job, _ = self._job()
         (_, plan), _ = self._create(job)
@@ -122,6 +150,51 @@ class ContentJobHumanReviewTests(unittest.TestCase):
         with patch.object(produce_batch, "HOST_ROOT", self.root):
             with self.assertRaisesRegex(adapter.ContentJobReviewError, "provenance differs"):
                 adapter.create_content_job_review(job, registry_path=self.registry)
+
+    def test_non_pending_plan_missing_provenance_is_not_mutated(self):
+        job, _ = self._job()
+        (_, plan), _ = self._create(job)
+        original = human_review.read_json(plan)
+        del original["content_job"]
+        original["review_status"] = human_review.STATUS_APPROVED
+        human_review.write_json_atomic(plan, original)
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), self.assertRaisesRegex(
+            adapter.ContentJobReviewError, "not pending"
+        ):
+            adapter.create_content_job_review(job, registry_path=self.registry)
+
+        self.assertEqual(human_review.read_json(plan), original)
+
+    def test_policy_mismatch_prevents_backfill(self):
+        job, _ = self._job()
+        (_, plan), _ = self._create(job)
+        original = human_review.read_json(plan)
+        del original["content_job"]
+        original["asset_hub_source_policy"] = {"sources": []}
+        human_review.write_json_atomic(plan, original)
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), self.assertRaisesRegex(
+            adapter.ContentJobReviewError, "source policy differs"
+        ):
+            adapter.create_content_job_review(job, registry_path=self.registry)
+
+        self.assertEqual(human_review.read_json(plan), original)
+
+    def test_source_identity_mismatch_prevents_backfill(self):
+        job, _ = self._job()
+        (_, plan), _ = self._create(job)
+        original = human_review.read_json(plan)
+        del original["content_job"]
+        original["audio_path"] = (self.root / "other.mp3").as_posix()
+        human_review.write_json_atomic(plan, original)
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), self.assertRaisesRegex(
+            adapter.ContentJobReviewError, "source identity differs"
+        ):
+            adapter.create_content_job_review(job, registry_path=self.registry)
+
+        self.assertEqual(human_review.read_json(plan), original)
 
     def test_title_cannot_escape_review_directory(self):
         job, _ = self._job(title="../../outside")
