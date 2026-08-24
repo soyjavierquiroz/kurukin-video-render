@@ -1273,6 +1273,44 @@ class TestHumanReviewPlan(unittest.TestCase):
         review_app = load_review_app_module()
         self.assertTrue(review_app.should_enqueue_nightly({"batch_id": "legacy-batch"}))
 
+    def test_content_id_selects_matching_content_job_plan(self):
+        review_app = load_review_app_module()
+        first = self.root / "first.json"
+        target = self.root / "target.json"
+        human_review.write_json_atomic(first, {"content_job": {"content_id": "cf_000000"}})
+        human_review.write_json_atomic(target, {"content_job": {"content_id": "cf_000001"}})
+
+        self.assertEqual(review_app.find_plan_by_content_id([first, target], "cf_000001"), target)
+
+    def test_unknown_content_id_has_no_selected_plan(self):
+        review_app = load_review_app_module()
+        plan = self.root / "plan.json"
+        human_review.write_json_atomic(plan, {"content_job": {"content_id": "cf_000001"}})
+
+        self.assertIsNone(review_app.find_plan_by_content_id([plan], "cf_missing"))
+
+    def test_absent_content_id_preserves_pending_plan_list(self):
+        review_app = load_review_app_module()
+        plans = [self.root / "first.json", self.root / "second.json"]
+
+        self.assertIsNone(review_app.query_content_id())
+        self.assertEqual(review_app.filter_plans_for_content_id(plans, None), plans)
+
+    def test_legacy_plan_without_content_job_is_safe(self):
+        review_app = load_review_app_module()
+        legacy = self.root / "legacy.json"
+        human_review.write_json_atomic(legacy, {"batch_id": "legacy-batch"})
+
+        self.assertIsNone(review_app.plan_content_id(human_review.read_json(legacy)))
+        self.assertIsNone(review_app.find_plan_by_content_id([legacy], "cf_000001"))
+
+    def test_review_relative_url_encodes_content_id_safely(self):
+        review_app = load_review_app_module()
+        self.assertEqual(
+            review_app.review_relative_url("cf 000/001?&"),
+            "?content_id=cf+000%2F001%3F%26",
+        )
+
     def test_approve_rejects_missing_primary_duration_and_keeps_pending(self):
         plan_file = self.root / "production-plan.json"
         plan = {

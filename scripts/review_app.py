@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 import sys
+from urllib.parse import urlencode
 
 import streamlit as st
 
@@ -33,6 +34,59 @@ def discover_plans(status: str = human_review.STATUS_PENDING) -> list[Path]:
         if plan.get("review_status") == status:
             result.append(plan_file)
     return result
+
+
+def review_relative_url(content_id: str) -> str:
+    """Return the relative, safely encoded deep link for a content review."""
+    return f"?{urlencode({'content_id': content_id})}"
+
+
+def plan_content_id(plan: Mapping[str, object]) -> str | None:
+    """Return a content-job identity when the plan has one."""
+    content_job = plan.get("content_job")
+    if not isinstance(content_job, Mapping):
+        return None
+    content_id = content_job.get("content_id")
+    if content_id is None:
+        return None
+    value = str(content_id).strip()
+    return value or None
+
+
+def find_plan_by_content_id(plans: list[Path], content_id: str) -> Path | None:
+    """Find a pending plan by its immutable content-job identity."""
+    for plan_file in plans:
+        try:
+            plan = human_review.read_json(plan_file)
+        except Exception:
+            continue
+        if plan_content_id(plan) == content_id:
+            return plan_file
+    return None
+
+
+def filter_plans_for_content_id(plans: list[Path], content_id: str | None) -> list[Path]:
+    """Preserve normal selection unless a content-job deep link was supplied."""
+    if content_id is None:
+        return plans
+    selected_plan = find_plan_by_content_id(plans, content_id)
+    return [selected_plan] if selected_plan is not None else []
+
+
+def query_content_id() -> str | None:
+    """Read the optional Streamlit deep-link parameter across supported APIs."""
+    params = getattr(st, "query_params", None)
+    if params is not None:
+        value = params.get("content_id")
+    else:
+        legacy_params = getattr(st, "experimental_get_query_params", lambda: {})()
+        value = legacy_params.get("content_id")
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    result = str(value).strip()
+    return result or None
 
 
 def show_asset(asset: dict, key: str) -> None:
@@ -151,6 +205,13 @@ def main() -> None:
     if not plans:
         st.info("No pending review jobs.")
         return
+
+    content_id = query_content_id()
+    if content_id is not None:
+        plans = filter_plans_for_content_id(plans, content_id)
+        if not plans:
+            st.error(f"No pending review was found for content_id={content_id!r}.")
+            return
 
     labels = []
     for path in plans:
