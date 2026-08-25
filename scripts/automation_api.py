@@ -6,12 +6,14 @@ It contains no approval, render, upload, scheduling, or cleanup behavior.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from typing import Any
 from urllib.parse import quote
 
@@ -21,11 +23,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.custom import human_review
-from scripts import content_ingest, create_content_job_review
+from scripts import content_ingest, create_content_job_review, nightly_runner
 
 
 LOG = logging.getLogger(__name__)
 app = FastAPI(title="MPT internal automation API", docs_url=None, redoc_url=None, openapi_url=None)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_nightly_launch_lock = threading.Lock()
+_nightly_process: subprocess.Popen[bytes] | None = None
 
 
 class ReviewRequest(BaseModel):
@@ -198,10 +203,86 @@ def _launch_immediate_production(schedule_record: Path) -> None:
     """Detach the canonical approved-plan producer from the API request."""
     subprocess.Popen(
         [sys.executable, "-m", "scripts.automation_api", "--run-now", schedule_record.as_posix()],
-        cwd=Path(__file__).resolve().parents[1].as_posix(),
+        cwd=PROJECT_ROOT.as_posix(),
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+def _nightly_queue_dir() -> Path:
+    """Use the runner's own container-or-host queue resolution."""
+    return nightly_runner.default_queue_dir(project_root=PROJECT_ROOT)
+
+
+def _queue_job_count(root: Path, directory: str) -> int:
+    path = root / directory
+    if not path.is_dir():
+        return 0
+    if directory == "pending":
+        return sum(1 for entry in path.glob("*.json") if entry.is_file())
+    return sum(1 for entry in path.glob("*/job.json") if entry.is_file())
+
+
+def _processing_job_identity(queue_root: Path) -> str | None:
+    processing = queue_root / "processing"
+    if not processing.is_dir():
+        return None
+    jobs = sorted(path for path in processing.glob("*/job.json") if path.is_file())
+    # The runner-generated processing directory name is a safe queue identity;
+    # do not return job payloads or arbitrary filesystem paths.
+    return jobs[0].parent.name if jobs else None
+
+
+def _tracked_nightly_process_is_active() -> bool:
+    global _nightly_process
+    if _nightly_process is None:
+        return False
+    if _nightly_process.poll() is None:
+        return True
+    _nightly_process = None
+    return False
+
+
+def _nightly_status_payload() -> dict[str, Any]:
+    queue_root = _nightly_queue_dir()
+    lock_present = (queue_root / "nightly_runner.lock").is_file()
+    # A lock is the canonical runner's cross-process authority.  The tracked
+    # child covers the brief interval after Popen and before it creates lock.
+    running = lock_present or _tracked_nightly_process_is_active()
+    return {
+        "ok": True,
+        "running": running,
+        "lock_present": lock_present,
+        "pending_count": _queue_job_count(queue_root, "pending"),
+        "processing_count": _queue_job_count(queue_root, "processing"),
+        "completed_count": _queue_job_count(queue_root, "completed"),
+        "failed_count": _queue_job_count(queue_root, "failed"),
+        "current_job": _processing_job_identity(queue_root),
+    }
+
+
+def _nightly_window_is_open() -> bool:
+    """Apply exactly the canonical runner's default window interpretation."""
+    args = nightly_runner.build_parser().parse_args([])
+    return nightly_runner.is_in_window(
+        dt.datetime.now().astimezone(), args.window_start, args.window_end,
+    )
+
+
+def _launch_nightly_runner() -> subprocess.Popen[bytes]:
+    queue_root = _nightly_queue_dir()
+    logs = queue_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log_path = logs / f"nightly-runner-launch-{nightly_runner.timestamp()}.log"
+    with log_path.open("ab") as output:
+        return subprocess.Popen(
+            [sys.executable, "scripts/nightly_runner.py"],
+            cwd=PROJECT_ROOT.as_posix(),
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
 
 
 def _run_immediate_production(schedule_record: Path) -> int:
@@ -310,6 +391,39 @@ def _existing_idempotent_review(payload: ReviewRequest) -> bool:
 @app.get("/healthz")
 def healthz() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/v1/nightly/status")
+def nightly_status() -> dict[str, Any]:
+    try:
+        return _nightly_status_payload()
+    except OSError:
+        LOG.exception("nightly status lookup failed")
+        raise HTTPException(status_code=500, detail="unable to read nightly state")
+
+
+@app.post("/v1/nightly/run")
+def run_nightly() -> dict[str, Any]:
+    global _nightly_process
+    # This lock only serializes API requests in this worker.  The canonical
+    # file lock in nightly_runner remains the cross-process final authority.
+    with _nightly_launch_lock:
+        try:
+            status = _nightly_status_payload()
+            if status["running"]:
+                return {"ok": True, "nightly_state": "already_running"}
+            if status["pending_count"] == 0:
+                return {"ok": True, "nightly_state": "no_pending"}
+            if not _nightly_window_is_open():
+                return {"ok": True, "nightly_state": "outside_window"}
+            _nightly_process = _launch_nightly_runner()
+            return {"ok": True, "nightly_state": "started"}
+        except OSError:
+            LOG.exception("nightly runner launch failed")
+            raise HTTPException(status_code=500, detail="unable to launch nightly runner")
+        except Exception:
+            LOG.exception("nightly runner request failed")
+            raise HTTPException(status_code=500, detail="unable to launch nightly runner")
 
 
 @app.get("/v1/content/{content_id}")

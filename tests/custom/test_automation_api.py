@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -20,6 +20,7 @@ class AutomationApiTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.jobs = self.root / "content_jobs"
         self.client = TestClient(automation_api.app)
+        automation_api._nightly_process = None
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -89,6 +90,25 @@ class AutomationApiTests(unittest.TestCase):
             automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root,
         )
 
+    def _nightly_queue(self, *, pending=0, processing=0, completed=0, failed=0):
+        queue = self.root / "storage" / "nightly_jobs"
+        for directory, count in {
+            "pending": pending,
+            "processing": processing,
+            "completed": completed,
+            "failed": failed,
+        }.items():
+            root = queue / directory
+            root.mkdir(parents=True, exist_ok=True)
+            for number in range(count):
+                if directory == "pending":
+                    (root / f"job-{number}.json").write_text("{}", encoding="utf-8")
+                else:
+                    run = root / f"run-{number}"
+                    run.mkdir()
+                    (run / "job.json").write_text("{}", encoding="utf-8")
+        return queue
+
     @staticmethod
     def _identity_payload(**overrides):
         payload = {
@@ -103,6 +123,100 @@ class AutomationApiTests(unittest.TestCase):
         response = self.client.get("/healthz")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"ok": True})
+
+    def test_nightly_status_reports_one_pending_job(self):
+        queue = self._nightly_queue(pending=1)
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue):
+            response = self.client.get("/v1/nightly/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "ok": True, "running": False, "lock_present": False,
+            "pending_count": 1, "processing_count": 0,
+            "completed_count": 0, "failed_count": 0, "current_job": None,
+        })
+
+    def test_nightly_status_reports_processing_job_and_lock(self):
+        queue = self._nightly_queue(processing=1)
+        (queue / "nightly_runner.lock").write_text("pid=123\n", encoding="utf-8")
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue):
+            response = self.client.get("/v1/nightly/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["running"])
+        self.assertTrue(response.json()["lock_present"])
+        self.assertEqual(response.json()["processing_count"], 1)
+        self.assertEqual(response.json()["current_job"], "run-0")
+
+    def test_nightly_run_with_no_pending_does_not_launch(self):
+        queue = self._nightly_queue()
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
+            automation_api, "_launch_nightly_runner"
+        ) as launch:
+            response = self.client.post("/v1/nightly/run")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "nightly_state": "no_pending"})
+        launch.assert_not_called()
+
+    def test_nightly_run_with_active_runner_does_not_launch(self):
+        queue = self._nightly_queue(pending=1)
+        (queue / "nightly_runner.lock").write_text("pid=123\n", encoding="utf-8")
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
+            automation_api, "_launch_nightly_runner"
+        ) as launch:
+            response = self.client.post("/v1/nightly/run")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "nightly_state": "already_running"})
+        launch.assert_not_called()
+
+    def test_nightly_run_launches_canonical_runner_once_without_window_override(self):
+        queue = self._nightly_queue(pending=1)
+        process = MagicMock()
+        process.poll.return_value = None
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
+            automation_api, "_nightly_window_is_open", return_value=True
+        ), patch.object(automation_api, "_launch_nightly_runner", return_value=process) as launch:
+            response = self.client.post("/v1/nightly/run")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "nightly_state": "started"})
+        launch.assert_called_once_with()
+
+    def test_nightly_duplicate_api_call_does_not_intentionally_launch_second_runner(self):
+        queue = self._nightly_queue(pending=1)
+        process = MagicMock()
+        process.poll.return_value = None
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
+            automation_api, "_nightly_window_is_open", return_value=True
+        ), patch.object(automation_api, "_launch_nightly_runner", return_value=process) as launch:
+            first = self.client.post("/v1/nightly/run")
+            second = self.client.post("/v1/nightly/run")
+        self.assertEqual(first.json()["nightly_state"], "started")
+        self.assertEqual(second.json()["nightly_state"], "already_running")
+        launch.assert_called_once_with()
+
+    def test_nightly_launch_command_is_detached_and_preserves_default_window(self):
+        queue = self._nightly_queue(pending=1)
+        args = automation_api.nightly_runner.build_parser().parse_args([])
+        self.assertEqual(args.window_start.strftime("%H:%M"), "00:00")
+        self.assertEqual(args.window_end.strftime("%H:%M"), "07:00")
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
+            automation_api.subprocess, "Popen"
+        ) as popen:
+            automation_api._launch_nightly_runner()
+        command = popen.call_args.args[0]
+        self.assertEqual(command, [automation_api.sys.executable, "scripts/nightly_runner.py"])
+        self.assertNotIn("--ignore-window", command)
+        self.assertEqual(popen.call_args.kwargs["cwd"], automation_api.PROJECT_ROOT.as_posix())
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.kwargs["stderr"], automation_api.subprocess.STDOUT)
+
+    def test_nightly_launch_failure_is_sanitized(self):
+        queue = self._nightly_queue(pending=1)
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
+            automation_api, "_nightly_window_is_open", return_value=True
+        ), patch.object(automation_api, "_launch_nightly_runner", side_effect=RuntimeError("secret=never-returned")):
+            response = self.client.post("/v1/nightly/run")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "unable to launch nightly runner")
+        self.assertNotIn("secret", response.text)
 
     def test_review_url_encodes_content_id(self):
         self.assertEqual(automation_api.review_relative_url("a b/?"), "/?content_id=a%20b%2F%3F")
