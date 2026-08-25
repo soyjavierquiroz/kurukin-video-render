@@ -109,6 +109,14 @@ class AutomationApiTests(unittest.TestCase):
                     (run / "job.json").write_text("{}", encoding="utf-8")
         return queue
 
+    def _review_queue_job(self, plan, content_id):
+        return {
+            "render_mode": human_review.RENDER_MODE,
+            "job_id": f"review-{content_id}",
+            "batch_id": f"content-test-niche-{content_id}",
+            "production_plan_path": plan.as_posix(),
+        }
+
     @staticmethod
     def _identity_payload(**overrides):
         payload = {
@@ -393,6 +401,52 @@ class AutomationApiTests(unittest.TestCase):
         self.assertEqual(first.json()["production_state"], "producing")
         launch.assert_called_once_with(job / "production-schedule.json")
         self.assertFalse((self.root / "storage/nightly_jobs/pending").exists())
+
+    def test_now_promotes_only_matching_pending_nightly_job_to_held_once(self):
+        job, _, plan = self._approved_schedule_fixture()
+        _, _, other_plan = self._approved_schedule_fixture("cid_002")
+        pending = self.root / "storage/nightly_jobs/pending"
+        pending.mkdir(parents=True)
+        exact = pending / "exact.json"
+        exact_payload = self._review_queue_job(plan, "cid_001")
+        exact.write_text(json.dumps(exact_payload), encoding="utf-8")
+        unrelated = pending / "unrelated.json"
+        unrelated_payload = self._review_queue_job(other_plan, "cid_002")
+        unrelated.write_text(json.dumps(unrelated_payload), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root, patch.object(
+            automation_api, "_nightly_queue_dir", return_value=pending.parent,
+        ), patch.object(automation_api, "_launch_immediate_production") as launch:
+            first = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
+            second = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["schedule_state"], "started_now")
+        self.assertEqual(first.json()["promoted_from"], "queued_night")
+        self.assertFalse(exact.exists())
+        self.assertEqual(json.loads(unrelated.read_text(encoding="utf-8")), unrelated_payload)
+        held = list((self.root / "storage/nightly_jobs/held").glob("*.json"))
+        self.assertEqual(len(held), 1)
+        self.assertEqual(json.loads(held[0].read_text(encoding="utf-8")), exact_payload)
+        launch.assert_called_once_with(job / "production-schedule.json")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["production_state"], "producing")
+
+    def test_now_does_not_promote_or_launch_a_nightly_job_already_processing(self):
+        _, _, plan = self._approved_schedule_fixture()
+        processing = self.root / "storage/nightly_jobs/processing/run-1"
+        processing.mkdir(parents=True)
+        (processing / "job.json").write_text(
+            json.dumps(self._review_queue_job(plan, "cid_001")), encoding="utf-8",
+        )
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root, patch.object(
+            automation_api, "_nightly_queue_dir", return_value=processing.parent.parent,
+        ), patch.object(automation_api, "_launch_immediate_production") as launch:
+            response = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["schedule_state"], "already_processing")
+        self.assertEqual(response.json()["production_state"], "producing")
+        launch.assert_not_called()
 
     def test_now_worker_uses_canonical_approved_plan_producer(self):
         job, _, plan = self._approved_schedule_fixture()

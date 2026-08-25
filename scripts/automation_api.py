@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -148,6 +149,53 @@ def _nightly_runtime_state(plan_path: Path, project_root: Path) -> str | None:
             if job.get("render_mode") == human_review.RENDER_MODE and _same_plan_path(job.get("production_plan_path"), plan_path):
                 return state
     return None
+
+
+def _nightly_job_matches_plan(job: dict[str, Any], plan_path: Path) -> bool:
+    """Match a human-review queue job by its stable production-plan identity."""
+    return (
+        job.get("render_mode") == human_review.RENDER_MODE
+        and _same_plan_path(job.get("production_plan_path"), plan_path)
+    )
+
+
+def _find_nightly_job(queue_root: Path, directory: str, plan_path: Path) -> Path | None:
+    """Find the exact queue item for a plan in an existing runner directory."""
+    root = queue_root / directory
+    if not root.is_dir():
+        return None
+    candidates = root.glob("*.json") if directory == "pending" else root.glob("*/job.json")
+    for candidate in candidates:
+        try:
+            if _nightly_job_matches_plan(_read_object(candidate), plan_path):
+                return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def _hold_pending_nightly_job(queue_root: Path, plan_path: Path) -> str:
+    """Atomically claim a pending job for NOW, preserving its queue history.
+
+    The nightly runner owns jobs once they are in processing.  A rename is the
+    only claim made here: if the runner wins it first, the source disappears
+    and the caller re-observes processing instead of starting a duplicate.
+    """
+    if _find_nightly_job(queue_root, "processing", plan_path) is not None:
+        return "already_processing"
+    if (queue_root / "nightly_runner.lock").is_file():
+        return "nightly_runner_active"
+    pending = _find_nightly_job(queue_root, "pending", plan_path)
+    if pending is None:
+        return "not_pending"
+    held = queue_root / "held"
+    held.mkdir(parents=True, exist_ok=True)
+    destination = held / f"{pending.stem}-promoted-{time.time_ns()}-{os.getpid()}.json"
+    try:
+        os.replace(pending, destination)
+    except FileNotFoundError:
+        return "already_processing" if _find_nightly_job(queue_root, "processing", plan_path) else "not_pending"
+    return "held"
 
 
 def _schedule_runtime_state(job_dir: Path) -> str | None:
@@ -457,8 +505,44 @@ def schedule_content(content_id: str, payload: ScheduleRequest) -> dict[str, Any
 
         project_root = create_content_job_review.produce_batch.HOST_ROOT
         state = _production_state(job_dir, plan_path, project_root, plan)
-        if state in {"completed", "producing", "queued_night"}:
+        if (
+            payload.run_mode == "NOW"
+            and state == "producing"
+            and _schedule_runtime_state(job_dir) is None
+            and _find_nightly_job(_nightly_queue_dir(), "processing", plan_path) is not None
+        ):
+            return {
+                "ok": True, "content_id": content_id, "run_mode": "NOW",
+                "production_state": "producing", "schedule_state": "already_processing",
+            }
+        if state in {"completed", "producing"}:
             return {"ok": True, "content_id": content_id, "run_mode": payload.run_mode, "production_state": state}
+
+        promoted_from: str | None = None
+        if state == "queued_night":
+            if payload.run_mode == "NIGHT":
+                return {"ok": True, "content_id": content_id, "run_mode": "NIGHT", "production_state": "queued_night"}
+            promotion = _hold_pending_nightly_job(_nightly_queue_dir(), plan_path)
+            if promotion == "already_processing":
+                return {
+                    "ok": True, "content_id": content_id, "run_mode": "NOW",
+                    "production_state": "producing", "schedule_state": "already_processing",
+                }
+            if promotion == "nightly_runner_active":
+                return {
+                    "ok": True, "content_id": content_id, "run_mode": "NOW",
+                    "production_state": "queued_night", "schedule_state": "nightly_runner_active",
+                }
+            if promotion == "not_pending":
+                state = _production_state(job_dir, plan_path, project_root, plan)
+                if state in {"completed", "producing", "queued_night"}:
+                    return {"ok": True, "content_id": content_id, "run_mode": "NOW", "production_state": state}
+                # A vanished item is not authority to start a second producer.
+                return {
+                    "ok": True, "content_id": content_id, "run_mode": "NOW",
+                    "production_state": "not_scheduled", "schedule_state": "not_pending",
+                }
+            promoted_from = "queued_night"
 
         if payload.run_mode == "NIGHT":
             human_review.enqueue_approved_plan(plan_path, plan, project_root=project_root)
@@ -488,7 +572,10 @@ def schedule_content(content_id: str, payload: ScheduleRequest) -> dict[str, Any
                 "production_state": "error",
             })
             raise
-        return {"ok": True, "content_id": content_id, "run_mode": "NOW", "production_state": "producing"}
+        response = {"ok": True, "content_id": content_id, "run_mode": "NOW", "production_state": "producing"}
+        if promoted_from:
+            response.update({"schedule_state": "started_now", "promoted_from": promoted_from})
+        return response
     except HTTPException:
         raise
     except Exception:
