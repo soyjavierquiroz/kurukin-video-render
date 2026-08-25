@@ -117,6 +117,49 @@ def _validate_pending_plan(plan_path: Path, content_id: str) -> None:
         raise ValueError("review plan does not match content job")
 
 
+def _existing_idempotent_review(payload: ReviewRequest) -> bool:
+    """Return whether a pending review is safely reusable without invoking adapters.
+
+    Content jobs and review plans can have been created before this API, and
+    their absolute source paths may reflect a different bind-mount location.
+    The immutable Drive identity and content-job provenance are the proof of
+    identity; adapter-local paths, titles, and batch representations are not.
+    """
+    found = _content_job_for(payload.content_id)
+    if found is None:
+        return False
+    job_dir, metadata = found
+    expected_identity = {
+        "content_id": payload.content_id,
+        "niche_id": payload.niche_id,
+        "audio_file_id": payload.audio_file_id,
+        "script_file_id": payload.script_file_id,
+        "asset_profile": payload.asset_profile,
+    }
+    for field, expected in expected_identity.items():
+        if metadata.get(field) != expected:
+            raise content_ingest.ContentIngestError(
+                f"content_id already exists with different {field}; refusing to overwrite content identity"
+            )
+
+    plan_path = _plan_for(job_dir, metadata)
+    if plan_path is None:
+        return False
+    plan = _read_object(plan_path)
+    provenance = plan.get("content_job")
+    immutable_provenance = (
+        "content_id", "niche_id", "asset_profile", "audio_sha256", "script_sha256",
+        "resolved_asset_policy",
+    )
+    if (
+        plan.get("review_status") == human_review.STATUS_PENDING
+        and isinstance(provenance, dict)
+        and all(provenance.get(field) == metadata.get(field) for field in immutable_provenance)
+    ):
+        return True
+    return False
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, bool]:
     return {"ok": True}
@@ -145,6 +188,14 @@ def create_review(payload: ReviewRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc))
 
     try:
+        if _existing_idempotent_review(payload):
+            return {
+                "ok": True,
+                "content_id": payload.content_id,
+                "niche_id": payload.niche_id,
+                "review_status": human_review.STATUS_PENDING,
+                "review_relative_url": review_relative_url(payload.content_id),
+            }
         metadata = content_ingest.ingest_content(
             niche_id=payload.niche_id,
             content_id=payload.content_id,
