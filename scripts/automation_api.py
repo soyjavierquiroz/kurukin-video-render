@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 from urllib.parse import quote
 
@@ -33,6 +36,13 @@ class ReviewRequest(BaseModel):
     audio_file_id: str = Field(min_length=1)
     script_file_id: str = Field(min_length=1)
     asset_profile: str = Field(min_length=1)
+
+    class Config:
+        extra = "forbid"
+
+
+class ScheduleRequest(BaseModel):
+    run_mode: str
 
     class Config:
         extra = "forbid"
@@ -83,6 +93,140 @@ def _plan_for(job_dir: Path, metadata: dict[str, Any]) -> Path | None:
     return path if path.is_file() else None
 
 
+def _schedule_record_path(job_dir: Path) -> Path:
+    """Keep immediate-launch state with the immutable content job."""
+    return job_dir / "production-schedule.json"
+
+
+def _read_optional_object(path: Path) -> dict[str, Any] | None:
+    return _read_object(path) if path.is_file() else None
+
+
+def _plan_provenance_matches(plan: dict[str, Any], metadata: dict[str, Any], content_id: str) -> bool:
+    provenance = plan.get("content_job")
+    if not isinstance(provenance, dict) or provenance.get("content_id") != content_id:
+        return False
+    fields = (
+        "niche_id", "asset_profile", "audio_sha256", "script_sha256",
+        "resolved_asset_policy",
+    )
+    return all(provenance.get(field) == metadata.get(field) for field in fields)
+
+
+def _same_plan_path(value: Any, plan_path: Path) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return Path(value).resolve() == plan_path.resolve()
+    except OSError:
+        return False
+
+
+def _nightly_runtime_state(plan_path: Path, project_root: Path) -> str | None:
+    """Observe the existing nightly runner layout; never create or move jobs."""
+    queue_root = project_root / "storage" / "nightly_jobs"
+    for directory, state in (
+        ("pending", "queued_night"),
+        ("processing", "producing"),
+        ("completed", "completed"),
+        ("failed", "error"),
+    ):
+        root = queue_root / directory
+        if not root.is_dir():
+            continue
+        candidates = root.glob("*.json") if directory == "pending" else root.glob("*/job.json")
+        for candidate in candidates:
+            try:
+                job = _read_object(candidate)
+            except ValueError:
+                continue
+            if job.get("render_mode") == human_review.RENDER_MODE and _same_plan_path(job.get("production_plan_path"), plan_path):
+                return state
+    return None
+
+
+def _schedule_runtime_state(job_dir: Path) -> str | None:
+    record = _read_optional_object(_schedule_record_path(job_dir))
+    if record is None:
+        return None
+    state = record.get("production_state")
+    return state if state in {"producing", "completed", "error"} else "producing"
+
+
+def _registry_completed(plan: dict[str, Any], project_root: Path) -> bool:
+    """Use the existing completed-production registry without creating one."""
+    registry_path = project_root / "storage" / create_content_job_review.produce_batch.REGISTRY_NAME
+    if not registry_path.is_file():
+        return False
+    try:
+        producer = create_content_job_review.produce_batch
+        audio = Path(str(plan.get("audio_path") or ""))
+        script = Path(str(plan.get("script_path") or ""))
+        if not audio.is_file() or not script.is_file():
+            return False
+        recipe = producer.production_recipe_for(
+            str(plan.get("visual_style") or producer.VISUAL_STYLE_NONE), "karaoke", "bottom",
+        )
+        record = producer.production_identity(
+            str(plan.get("stem") or script.stem), audio, script,
+            str(plan.get("material_title") or ""), recipe,
+        )
+        return producer.production_registry().find_valid(
+            record["production_fingerprint"], producer.valid_mp4,
+        ) is not None
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def _production_state(job_dir: Path, plan_path: Path, project_root: Path, plan: dict[str, Any] | None = None) -> str:
+    immediate = _schedule_runtime_state(job_dir)
+    if immediate in {"completed", "error", "producing"}:
+        return immediate
+    nightly = _nightly_runtime_state(plan_path, project_root)
+    if nightly:
+        return nightly
+    if plan is not None and _registry_completed(plan, project_root):
+        return "completed"
+    return "not_scheduled"
+
+
+def _write_schedule_record(path: Path, payload: dict[str, Any]) -> None:
+    human_review.write_json_atomic(path, payload)
+
+
+def _launch_immediate_production(schedule_record: Path) -> None:
+    """Detach the canonical approved-plan producer from the API request."""
+    subprocess.Popen(
+        [sys.executable, "-m", "scripts.automation_api", "--run-now", schedule_record.as_posix()],
+        cwd=Path(__file__).resolve().parents[1].as_posix(),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _run_immediate_production(schedule_record: Path) -> int:
+    """Worker entry point which invokes the existing approved-plan producer only."""
+    try:
+        record = _read_object(schedule_record)
+        plan_path = Path(str(record["production_plan_path"]))
+        record["production_state"] = "producing"
+        record["pid"] = os.getpid()
+        _write_schedule_record(schedule_record, record)
+        status = create_content_job_review.produce_batch.process_approved_review_plan(plan_path)
+        record["production_state"] = "completed" if status == "completed" else "error"
+        _write_schedule_record(schedule_record, record)
+        return 0 if status == "completed" else 1
+    except Exception:
+        try:
+            record = _read_object(schedule_record)
+            record["production_state"] = "error"
+            _write_schedule_record(schedule_record, record)
+        except Exception:
+            LOG.error("immediate production state update failed")
+        LOG.exception("immediate production failed")
+        return 1
+
+
 def _status_payload(content_id: str) -> dict[str, Any]:
     found = _content_job_for(content_id)
     if found is None:
@@ -101,6 +245,9 @@ def _status_payload(content_id: str) -> dict[str, Any]:
         "review_exists": plan is not None,
         "review_status": plan.get("review_status") if plan else None,
         "review_relative_url": review_relative_url(content_id) if plan else None,
+        "production_state": _production_state(
+            job_dir, plan_path, create_content_job_review.produce_batch.HOST_ROOT, plan,
+        ) if plan_path else "not_scheduled",
     }
 
 
@@ -176,6 +323,65 @@ def get_content(content_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="unable to read content state")
 
 
+@app.post("/v1/content/{content_id}/schedule")
+def schedule_content(content_id: str, payload: ScheduleRequest) -> dict[str, Any]:
+    if payload.run_mode not in {"NIGHT", "NOW"}:
+        raise HTTPException(status_code=400, detail="invalid run_mode")
+    try:
+        found = _content_job_for(content_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="content job not found")
+        job_dir, metadata = found
+        plan_path = _plan_for(job_dir, metadata)
+        if plan_path is None:
+            raise HTTPException(status_code=409, detail="human review not found")
+        plan = _read_object(plan_path)
+        if not _plan_provenance_matches(plan, metadata, content_id):
+            raise HTTPException(status_code=409, detail="review provenance conflict")
+        if plan.get("review_status") != human_review.STATUS_APPROVED:
+            raise HTTPException(status_code=409, detail="review is not approved")
+
+        project_root = create_content_job_review.produce_batch.HOST_ROOT
+        state = _production_state(job_dir, plan_path, project_root, plan)
+        if state in {"completed", "producing", "queued_night"}:
+            return {"ok": True, "content_id": content_id, "run_mode": payload.run_mode, "production_state": state}
+
+        if payload.run_mode == "NIGHT":
+            human_review.enqueue_approved_plan(plan_path, plan, project_root=project_root)
+            return {"ok": True, "content_id": content_id, "run_mode": "NIGHT", "production_state": "queued_night"}
+
+        schedule_record = _schedule_record_path(job_dir)
+        try:
+            fd = os.open(schedule_record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            state = _schedule_runtime_state(job_dir) or "producing"
+            return {"ok": True, "content_id": content_id, "run_mode": "NOW", "production_state": state}
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({
+                "content_id": content_id,
+                "production_plan_path": plan_path.as_posix(),
+                "production_state": "launching",
+            }, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            _launch_immediate_production(schedule_record)
+        except Exception:
+            _write_schedule_record(schedule_record, {
+                "content_id": content_id,
+                "production_plan_path": plan_path.as_posix(),
+                "production_state": "error",
+            })
+            raise
+        return {"ok": True, "content_id": content_id, "run_mode": "NOW", "production_state": "producing"}
+    except HTTPException:
+        raise
+    except Exception:
+        LOG.exception("content scheduling failed for content_id=%r", content_id)
+        raise HTTPException(status_code=500, detail="unable to schedule production")
+
+
 @app.post("/v1/content/review")
 def create_review(payload: ReviewRequest) -> dict[str, Any]:
     try:
@@ -228,3 +434,9 @@ def create_review(payload: ReviewRequest) -> dict[str, Any]:
         "review_status": human_review.STATUS_PENDING,
         "review_relative_url": review_relative_url(payload.content_id),
     }
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--run-now":
+        sys.exit(_run_immediate_production(Path(sys.argv[2])))
+    raise SystemExit("automation_api is served by uvicorn")

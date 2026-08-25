@@ -60,13 +60,13 @@ class AutomationApiTests(unittest.TestCase):
         (job / "content.json").write_text(json.dumps(metadata), encoding="utf-8")
         return job, metadata
 
-    def _identity_plan(self, metadata, *, legacy_batch_id=False):
+    def _identity_plan(self, metadata, *, legacy_batch_id=False, review_status="pending_review"):
         path = human_review.plan_path(
             "content-test-niche-" + metadata["content_id"], "Stored-title", self.root,
         )
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps({
-            "review_status": "pending_review",
+            "review_status": review_status,
             # Legacy adapters used the content ID here, while the directory
             # and task identity above remained deterministic.
             "batch_id": metadata["content_id"] if legacy_batch_id else "content-test-niche-" + metadata["content_id"],
@@ -78,6 +78,16 @@ class AutomationApiTests(unittest.TestCase):
             },
         }), encoding="utf-8")
         return path
+
+    def _approved_schedule_fixture(self, content_id="cid_001"):
+        job, metadata = self._identity_job(content_id)
+        plan = self._identity_plan(metadata, review_status=human_review.STATUS_APPROVED)
+        return job, metadata, plan
+
+    def _schedule_context(self):
+        return patch.object(automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs), patch.object(
+            automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root,
+        )
 
     @staticmethod
     def _identity_payload(**overrides):
@@ -240,6 +250,85 @@ class AutomationApiTests(unittest.TestCase):
             response = self.client.post("/v1/content/review", json=payload)
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["detail"], "review creation failed")
+
+    def test_night_approved_content_enqueues_once_and_never_starts_immediate_production(self):
+        _, _, plan = self._approved_schedule_fixture()
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root, patch.object(automation_api, "_launch_immediate_production") as launch, patch.object(
+            human_review, "approve_plan"
+        ) as approve:
+            first = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NIGHT"})
+            second = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NIGHT"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["production_state"], "queued_night")
+        queue = self.root / "storage/nightly_jobs/pending"
+        self.assertEqual(list(queue.glob("*.json")).__len__(), 1)
+        self.assertEqual(json.loads(next(queue.glob("*.json")).read_text())["production_plan_path"], plan.as_posix())
+        launch.assert_not_called()
+        approve.assert_not_called()
+
+    def test_now_approved_content_launches_canonical_producer_once_without_nightly_enqueue(self):
+        job, _, _ = self._approved_schedule_fixture()
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root, patch.object(automation_api, "_launch_immediate_production") as launch:
+            first = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
+            second = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["production_state"], "producing")
+        launch.assert_called_once_with(job / "production-schedule.json")
+        self.assertFalse((self.root / "storage/nightly_jobs/pending").exists())
+
+    def test_now_worker_uses_canonical_approved_plan_producer(self):
+        job, _, plan = self._approved_schedule_fixture()
+        record = job / "production-schedule.json"
+        record.write_text(json.dumps({"content_id": "cid_001", "production_plan_path": plan.as_posix()}), encoding="utf-8")
+        with patch.object(
+            automation_api.create_content_job_review.produce_batch,
+            "process_approved_review_plan", return_value="completed",
+        ) as produce:
+            self.assertEqual(automation_api._run_immediate_production(record), 0)
+        produce.assert_called_once_with(plan)
+        self.assertEqual(json.loads(record.read_text())["production_state"], "completed")
+
+    def test_schedule_rejects_unapproved_invalid_unknown_and_provenance_conflict(self):
+        _, metadata = self._identity_job()
+        self._identity_plan(metadata)
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root:
+            unapproved = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NIGHT"})
+            invalid = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "MORNING"})
+            unknown = self.client.post("/v1/content/missing/schedule", json={"run_mode": "NIGHT"})
+        self.assertEqual(unapproved.status_code, 409)
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(unknown.status_code, 404)
+
+        _, metadata, plan = self._approved_schedule_fixture("cid_002")
+        payload = json.loads(plan.read_text())
+        payload["content_job"]["audio_sha256"] = "wrong"
+        plan.write_text(json.dumps(payload), encoding="utf-8")
+        with self._schedule_context()[0], self._schedule_context()[1]:
+            conflict = self.client.post("/v1/content/cid_002/schedule", json={"run_mode": "NIGHT"})
+        self.assertEqual(conflict.status_code, 409)
+
+    def test_status_reports_nightly_running_and_completed_states(self):
+        job, _, plan = self._approved_schedule_fixture()
+        queue_job = {
+            "render_mode": human_review.RENDER_MODE,
+            "production_plan_path": plan.as_posix(),
+        }
+        processing = self.root / "storage/nightly_jobs/processing/run-1"
+        processing.mkdir(parents=True)
+        (processing / "job.json").write_text(json.dumps(queue_job), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root:
+            running = self.client.get("/v1/content/cid_001")
+        self.assertEqual(running.json()["production_state"], "producing")
+        (job / "production-schedule.json").write_text(json.dumps({"production_state": "completed"}), encoding="utf-8")
+        with self._schedule_context()[0], self._schedule_context()[1]:
+            completed = self.client.get("/v1/content/cid_001")
+        self.assertEqual(completed.json()["production_state"], "completed")
 
 
 if __name__ == "__main__":
