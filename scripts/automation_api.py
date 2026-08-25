@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.custom import human_review
-from scripts import content_ingest, create_content_job_review, nightly_runner
+from scripts import content_delivery, content_ingest, create_content_job_review, nightly_runner
 from scripts.niche_registry import NicheRegistryError, enabled_niches, load_niche
 
 
@@ -362,7 +362,11 @@ def _run_immediate_production(schedule_record: Path) -> int:
         record["pid"] = os.getpid()
         _write_schedule_record(schedule_record, record)
         status = create_content_job_review.produce_batch.process_approved_review_plan(plan_path)
-        record["production_state"] = "completed" if status == "completed" else "error"
+        if status == "completed":
+            content_delivery.finalize_production_plan(plan_path)
+            record["production_state"] = "completed"
+        else:
+            record["production_state"] = "error"
         _write_schedule_record(schedule_record, record)
         return 0 if status == "completed" else 1
     except Exception:
@@ -729,7 +733,22 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
         if state == "error":
             return _sheet_projection(content_id, payload.niche_id, "ERROR", run_mode, review_exists=True, error="production error")
         if state == "completed":
-            return _sheet_projection(content_id, payload.niche_id, "COMPLETED", run_mode, review_exists=True)
+            try:
+                delivery = content_delivery.read_delivery(
+                    job_dir / "delivery.json", content_id=content_id, niche_id=payload.niche_id,
+                )
+            except content_delivery.DeliveryError:
+                return _sheet_projection(
+                    content_id, payload.niche_id, "ERROR", run_mode, review_exists=True,
+                    error="delivery incomplete",
+                )
+            projection = _sheet_projection(content_id, payload.niche_id, "COMPLETED", run_mode, review_exists=True)
+            projection.update({
+                "final_drive_file_id": delivery["final_drive_file_id"],
+                "final_drive_url": delivery["final_drive_url"],
+                "checksum": delivery["checksum"],
+            })
+            return projection
         if state == "producing":
             return _sheet_projection(content_id, payload.niche_id, "PRODUCING", run_mode, review_exists=True)
         if plan.get("review_status") != human_review.STATUS_APPROVED:

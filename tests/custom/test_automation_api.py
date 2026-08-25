@@ -239,12 +239,19 @@ class AutomationApiTests(unittest.TestCase):
         producing_launch.assert_not_called()
 
         (job / "production-schedule.json").write_text(json.dumps({"production_state": "completed"}), encoding="utf-8")
+        (job / "delivery.json").write_text(json.dumps({
+            "content_id": "cid_001", "niche_id": "test-niche", "final_drive_file_id": "file-1",
+            "final_drive_url": "https://drive.google.com/file/d/file-1/view", "checksum": "a" * 64,
+        }), encoding="utf-8")
         jobs_root, host_root = self._schedule_context()
         with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
             automation_api, "_launch_immediate_production"
         ) as completed_launch:
             completed = self._reconcile(status="COMPLETED", run_mode="NOW")
         self.assertEqual(completed.json()["status"], "COMPLETED")
+        self.assertEqual(completed.json()["final_drive_file_id"], "file-1")
+        self.assertEqual(completed.json()["final_drive_url"], "https://drive.google.com/file/d/file-1/view")
+        self.assertEqual(completed.json()["checksum"], "a" * 64)
         completed_launch.assert_not_called()
 
         (job / "production-schedule.json").write_text(json.dumps({"production_state": "error"}), encoding="utf-8")
@@ -596,10 +603,31 @@ class AutomationApiTests(unittest.TestCase):
         with patch.object(
             automation_api.create_content_job_review.produce_batch,
             "process_approved_review_plan", return_value="completed",
-        ) as produce:
+        ) as produce, patch.object(automation_api.content_delivery, "finalize_production_plan") as deliver:
             self.assertEqual(automation_api._run_immediate_production(record), 0)
         produce.assert_called_once_with(plan)
+        deliver.assert_called_once_with(plan)
         self.assertEqual(json.loads(record.read_text())["production_state"], "completed")
+
+    def test_now_delivery_failure_marks_schedule_error(self):
+        job, _, plan = self._approved_schedule_fixture()
+        record = job / "production-schedule.json"
+        record.write_text(json.dumps({"content_id": "cid_001", "production_plan_path": plan.as_posix()}), encoding="utf-8")
+        with patch.object(
+            automation_api.create_content_job_review.produce_batch,
+            "process_approved_review_plan", return_value="completed",
+        ), patch.object(automation_api.content_delivery, "finalize_production_plan", side_effect=RuntimeError("offline")):
+            self.assertEqual(automation_api._run_immediate_production(record), 1)
+        self.assertEqual(json.loads(record.read_text())["production_state"], "error")
+
+    def test_reconcile_completed_without_delivery_is_error(self):
+        job, _, _ = self._approved_schedule_fixture()
+        (job / "production-schedule.json").write_text(json.dumps({"production_state": "completed"}), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
+            response = self._reconcile(status="COMPLETED", run_mode="NOW")
+        self.assertEqual(response.json()["status"], "ERROR")
+        self.assertEqual(response.json()["error"], "delivery incomplete")
 
     def test_schedule_rejects_unapproved_invalid_unknown_and_provenance_conflict(self):
         _, metadata = self._identity_job()

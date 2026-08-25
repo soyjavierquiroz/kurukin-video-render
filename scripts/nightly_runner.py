@@ -486,6 +486,7 @@ def handle_aroll_broll_job(
 
 
 def handle_human_review_batch_job(job: dict[str, Any], reserved_dir: Path) -> dict[str, Any]:
+    from scripts.content_delivery import finalize_production_plan
     from scripts.produce_batch import process_approved_review_plan
 
     if not is_human_review_batch_job(job):
@@ -512,6 +513,9 @@ def handle_human_review_batch_job(job: dict[str, Any], reserved_dir: Path) -> di
         raise RunnerError(
             f"approved review render did not complete: {status}"
         )
+
+    result["delivery"] = finalize_production_plan(job["production_plan_path"])
+    write_json(reserved_dir / "render-result.json", result)
 
     write_json(
         reserved_dir / "submit-response.json",
