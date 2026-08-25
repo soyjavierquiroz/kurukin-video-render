@@ -33,6 +33,10 @@ app = FastAPI(title="MPT internal automation API", docs_url=None, redoc_url=None
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _nightly_launch_lock = threading.Lock()
 _nightly_process: subprocess.Popen[bytes] | None = None
+CANONICAL_SHEET_STATUSES = frozenset({
+    "DRAFT", "READY", "PREPARING_REVIEW", "HUMAN_REVIEW_READY",
+    "PRODUCTION_READY", "QUEUED_NIGHT", "PRODUCING", "COMPLETED", "ERROR",
+})
 
 
 class ReviewRequest(BaseModel):
@@ -668,6 +672,8 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
     run_mode = payload.run_mode.strip().upper() if isinstance(payload.run_mode, str) else None
     if run_mode not in {None, "NIGHT", "NOW"}:
         raise HTTPException(status_code=400, detail="invalid run_mode")
+    if requested_status not in CANONICAL_SHEET_STATUSES:
+        raise HTTPException(status_code=400, detail="invalid status")
     if requested_status == "DRAFT":
         try:
             found = _content_job_for(content_id)
@@ -679,9 +685,6 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
             LOG.exception("draft content identity lookup failed for content_id=%r", content_id)
             raise HTTPException(status_code=500, detail="unable to read content state")
         return _sheet_projection(content_id, payload.niche_id, "DRAFT", run_mode)
-    if requested_status != "READY":
-        raise HTTPException(status_code=400, detail="invalid status")
-
     try:
         found = _content_job_for(content_id)
         if found is None:

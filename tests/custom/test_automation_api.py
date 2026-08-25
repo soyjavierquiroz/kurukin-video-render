@@ -210,7 +210,7 @@ class AutomationApiTests(unittest.TestCase):
             draft_conflict = self._reconcile(status="DRAFT", niche_id="other-niche")
         self.assertEqual(draft_conflict.status_code, 409)
 
-    def test_reconcile_approved_modes_and_idempotent_states_do_not_duplicate_launches(self):
+    def test_reconcile_queued_night_preserves_night_and_promotes_now(self):
         job, _, plan = self._approved_schedule_fixture()
         jobs_root, host_root = self._schedule_context()
         with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
@@ -218,23 +218,32 @@ class AutomationApiTests(unittest.TestCase):
         ), patch.object(
             automation_api, "_launch_immediate_production"
         ) as launch:
-            night = self._reconcile(run_mode="NIGHT")
-            night_again = self._reconcile(run_mode="NIGHT")
-            now = self._reconcile(run_mode="NOW")
-            producing = self._reconcile(run_mode="NOW")
+            night = self._reconcile(status="QUEUED_NIGHT", run_mode="NIGHT")
+            night_again = self._reconcile(status="QUEUED_NIGHT", run_mode="NIGHT")
+            now = self._reconcile(status="QUEUED_NIGHT", run_mode="NOW")
         self.assertEqual(night.json()["status"], "QUEUED_NIGHT")
         self.assertEqual(night_again.json()["status"], "QUEUED_NIGHT")
         self.assertEqual(now.json()["status"], "PRODUCING")
-        self.assertEqual(producing.json()["status"], "PRODUCING")
         self.assertEqual(len(list((self.root / "storage/nightly_jobs/pending").glob("*.json"))), 0)
         launch.assert_called_once_with(job / "production-schedule.json")
+
+    def test_reconcile_producing_completed_and_error_are_idempotent(self):
+        job, _, _ = self._approved_schedule_fixture()
+        jobs_root, host_root = self._schedule_context()
+        (job / "production-schedule.json").write_text(json.dumps({"production_state": "producing"}), encoding="utf-8")
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
+            automation_api, "_launch_immediate_production"
+        ) as producing_launch:
+            producing = self._reconcile(status="PRODUCING", run_mode="NOW")
+        self.assertEqual(producing.json()["status"], "PRODUCING")
+        producing_launch.assert_not_called()
 
         (job / "production-schedule.json").write_text(json.dumps({"production_state": "completed"}), encoding="utf-8")
         jobs_root, host_root = self._schedule_context()
         with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
             automation_api, "_launch_immediate_production"
         ) as completed_launch:
-            completed = self._reconcile(run_mode="NOW")
+            completed = self._reconcile(status="COMPLETED", run_mode="NOW")
         self.assertEqual(completed.json()["status"], "COMPLETED")
         completed_launch.assert_not_called()
 
@@ -243,9 +252,26 @@ class AutomationApiTests(unittest.TestCase):
         with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
             automation_api, "_launch_immediate_production"
         ) as failed_launch:
-            errored = self._reconcile(run_mode="NOW")
+            errored = self._reconcile(status="ERROR", run_mode="NOW")
         self.assertEqual(errored.json()["status"], "ERROR")
         failed_launch.assert_not_called()
+
+    def test_reconcile_review_projection_statuses_follow_actual_review_facts(self):
+        _, metadata = self._identity_job()
+        self._identity_plan(metadata)
+        for status in ("PREPARING_REVIEW", "HUMAN_REVIEW_READY", "PRODUCTION_READY"):
+            with self.subTest(status=status):
+                jobs_root, host_root = self._schedule_context()
+                with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
+                    response = self._reconcile(status=status, run_mode="NIGHT")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "HUMAN_REVIEW_READY")
+
+    def test_reconcile_unknown_projection_status_is_rejected(self):
+        with patch.object(automation_api, "_validate_enabled_niche"):
+            response = self._reconcile(status="GARBAGE")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"detail": "invalid status"})
 
     def test_nightly_status_reports_one_pending_job(self):
         queue = self._nightly_queue(pending=1)
