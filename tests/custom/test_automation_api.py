@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.custom import human_review
@@ -131,6 +132,120 @@ class AutomationApiTests(unittest.TestCase):
         response = self.client.get("/healthz")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"ok": True})
+
+    def test_niches_returns_only_safe_enabled_registry_entries_without_hardcoding(self):
+        entries = [
+            ("generic-niche", {"sheet_id": "sheet-1", "sheet_tab": "Ideas"}),
+        ]
+        with patch.object(automation_api, "enabled_niches", return_value=entries):
+            response = self.client.get("/v1/niches")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "niches": [{
+            "niche_id": "generic-niche", "enabled": True, "sheet_id": "sheet-1", "sheet_tab": "Ideas",
+        }]})
+        self.assertNotIn("rclone_remote", response.text)
+        self.assertNotIn("final_drive_folder_id", response.text)
+        self.assertNotIn("/storage/", response.text)
+
+    def test_niches_excludes_disabled_entries_and_registry_failure_is_safe(self):
+        with patch.object(automation_api, "enabled_niches", return_value=[]):
+            response = self.client.get("/v1/niches")
+        self.assertEqual(response.json(), {"ok": True, "niches": []})
+        with patch.object(automation_api, "enabled_niches", side_effect=automation_api.NicheRegistryError("secret=x")):
+            response = self.client.get("/v1/niches")
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("secret", response.text)
+
+    def _reconcile(self, content_id="cid_001", **overrides):
+        payload = {"niche_id": "test-niche", "status": "READY", "run_mode": "NIGHT"}
+        payload.update(overrides)
+        return self.client.post(f"/v1/content/{content_id}/reconcile", json=payload)
+
+    def test_reconcile_draft_is_noop_and_unknown_or_disabled_niche_is_rejected(self):
+        with patch.object(automation_api, "_validate_enabled_niche") as validate:
+            response = self._reconcile(status="DRAFT")
+        self.assertEqual(response.json()["status"], "DRAFT")
+        validate.assert_called_once_with("test-niche")
+        with patch.object(automation_api, "load_niche", side_effect=automation_api.NicheRegistryError("unknown")):
+            unknown = self._reconcile(status="DRAFT", niche_id="unknown")
+        self.assertEqual(unknown.status_code, 404)
+        with patch.object(automation_api, "load_niche", return_value={"enabled": False}):
+            disabled = self._reconcile(status="DRAFT")
+        self.assertEqual(disabled.status_code, 403)
+
+    def test_reconcile_ready_creates_canonical_review_and_sanitizes_failure(self):
+        job, metadata = self._identity_job()
+        plan = self._identity_plan(metadata)
+        review = automation_api.ReviewRequest(**self._identity_payload())
+        with patch.object(automation_api, "_validate_enabled_niche"), patch.object(
+            automation_api, "_content_job_for", side_effect=[None, (job, metadata)]
+        ), patch.object(automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root), patch.object(
+            automation_api, "create_review", return_value={"ok": True}
+        ) as create:
+            response = self._reconcile(**self._identity_payload())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "HUMAN_REVIEW_READY")
+        create.assert_called_once()
+        self.assertEqual(create.call_args.args[0], review)
+
+        with patch.object(automation_api, "_validate_enabled_niche"), patch.object(
+            automation_api, "create_review", side_effect=HTTPException(status_code=500, detail="secret=x")
+        ):
+            failed = self._reconcile(**self._identity_payload())
+        self.assertEqual(failed.json()["status"], "ERROR")
+        self.assertNotIn("secret", failed.text)
+
+    def test_reconcile_unapproved_and_identity_conflict_are_safe(self):
+        _, metadata = self._identity_job()
+        self._identity_plan(metadata)
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
+            response = self._reconcile()
+        self.assertEqual(response.json()["status"], "HUMAN_REVIEW_READY")
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
+            conflict = self._reconcile(niche_id="other-niche")
+        self.assertEqual(conflict.status_code, 409)
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
+            draft_conflict = self._reconcile(status="DRAFT", niche_id="other-niche")
+        self.assertEqual(draft_conflict.status_code, 409)
+
+    def test_reconcile_approved_modes_and_idempotent_states_do_not_duplicate_launches(self):
+        job, _, plan = self._approved_schedule_fixture()
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
+            automation_api, "_nightly_queue_dir", return_value=self.root / "storage/nightly_jobs",
+        ), patch.object(
+            automation_api, "_launch_immediate_production"
+        ) as launch:
+            night = self._reconcile(run_mode="NIGHT")
+            night_again = self._reconcile(run_mode="NIGHT")
+            now = self._reconcile(run_mode="NOW")
+            producing = self._reconcile(run_mode="NOW")
+        self.assertEqual(night.json()["status"], "QUEUED_NIGHT")
+        self.assertEqual(night_again.json()["status"], "QUEUED_NIGHT")
+        self.assertEqual(now.json()["status"], "PRODUCING")
+        self.assertEqual(producing.json()["status"], "PRODUCING")
+        self.assertEqual(len(list((self.root / "storage/nightly_jobs/pending").glob("*.json"))), 0)
+        launch.assert_called_once_with(job / "production-schedule.json")
+
+        (job / "production-schedule.json").write_text(json.dumps({"production_state": "completed"}), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
+            automation_api, "_launch_immediate_production"
+        ) as completed_launch:
+            completed = self._reconcile(run_mode="NOW")
+        self.assertEqual(completed.json()["status"], "COMPLETED")
+        completed_launch.assert_not_called()
+
+        (job / "production-schedule.json").write_text(json.dumps({"production_state": "error"}), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
+            automation_api, "_launch_immediate_production"
+        ) as failed_launch:
+            errored = self._reconcile(run_mode="NOW")
+        self.assertEqual(errored.json()["status"], "ERROR")
+        failed_launch.assert_not_called()
 
     def test_nightly_status_reports_one_pending_job(self):
         queue = self._nightly_queue(pending=1)

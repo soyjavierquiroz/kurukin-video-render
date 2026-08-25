@@ -2,7 +2,9 @@
   "version": 1,
   "niches": {
     "constelaciones-familiares": {
+      "enabled": true,
       "sheet_id": "1svnEu-1pXuJYLg7NiuZ5t4teoN9M2rebwuw0k42-GvA",
+      "sheet_tab": "Constelar",
       "rclone_remote": "gdrive_constesanarte",
       "final_drive_folder_id": "1bFEyNRipZnKwGJjLGvMh5yMkHd6U8JQU",
       "default_asset_profile": "MI_OTRA_YO",

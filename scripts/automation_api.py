@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from app.custom import human_review
 from scripts import content_ingest, create_content_job_review, nightly_runner
+from scripts.niche_registry import NicheRegistryError, enabled_niches, load_niche
 
 
 LOG = logging.getLogger(__name__)
@@ -49,6 +50,21 @@ class ReviewRequest(BaseModel):
 
 class ScheduleRequest(BaseModel):
     run_mode: str
+
+    class Config:
+        extra = "forbid"
+
+
+class ReconcileRequest(BaseModel):
+    niche_id: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    run_mode: str | None = None
+    title: str | None = None
+    hook_title: str | None = None
+    audio_file_id: str | None = None
+    script_file_id: str | None = None
+    asset_profile: str | None = None
+    cleanup_approved: bool | None = None
 
     class Config:
         extra = "forbid"
@@ -380,6 +396,36 @@ def _status_payload(content_id: str) -> dict[str, Any]:
     }
 
 
+def _sheet_projection(
+    content_id: str, niche_id: str, status: str, run_mode: str | None,
+    *, review_exists: bool = False, error: str | None = None,
+) -> dict[str, Any]:
+    """Return the small, path-free Sheet representation used by n8n."""
+    return {
+        "ok": error is None,
+        "content_id": content_id,
+        "niche_id": niche_id,
+        "status": status,
+        "run_mode": run_mode,
+        "review_url": review_relative_url(content_id) if review_exists else None,
+        "final_drive_file_id": None,
+        "final_drive_url": None,
+        "checksum": None,
+        "error": error,
+    }
+
+
+def _require_review_fields(content_id: str, payload: ReconcileRequest) -> ReviewRequest:
+    fields = ("title", "audio_file_id", "script_file_id", "asset_profile")
+    if any(not isinstance(getattr(payload, field), str) or not getattr(payload, field).strip() for field in fields):
+        raise HTTPException(status_code=400, detail="review inputs are required for READY content")
+    return ReviewRequest(
+        niche_id=payload.niche_id, content_id=content_id, title=payload.title,
+        hook_title=payload.hook_title, audio_file_id=payload.audio_file_id,
+        script_file_id=payload.script_file_id, asset_profile=payload.asset_profile,
+    )
+
+
 def _is_identity_conflict(message: str) -> bool:
     return "already exists with different" in message or "already exists with a different" in message
 
@@ -436,9 +482,40 @@ def _existing_idempotent_review(payload: ReviewRequest) -> bool:
     return False
 
 
+def _validate_enabled_niche(niche_id: str) -> None:
+    try:
+        niche = load_niche(niche_id)
+    except NicheRegistryError as exc:
+        raise HTTPException(status_code=404, detail="unknown niche_id") from exc
+    enabled = niche.get("enabled", True)
+    if not isinstance(enabled, bool):
+        LOG.error("niche registry has invalid enabled value for niche_id=%r", niche_id)
+        raise HTTPException(status_code=500, detail="unable to read niche registry")
+    if not enabled:
+        raise HTTPException(status_code=403, detail="niche is disabled")
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/v1/niches")
+def list_niches() -> dict[str, Any]:
+    try:
+        niches = [
+            {
+                "niche_id": niche_id,
+                "enabled": True,
+                "sheet_id": niche["sheet_id"],
+                "sheet_tab": niche.get("sheet_tab"),
+            }
+            for niche_id, niche in enabled_niches()
+        ]
+    except (NicheRegistryError, KeyError, TypeError):
+        LOG.exception("niche registry lookup failed")
+        raise HTTPException(status_code=500, detail="unable to read niche registry")
+    return {"ok": True, "niches": niches}
 
 
 @app.get("/v1/nightly/status")
@@ -581,6 +658,99 @@ def schedule_content(content_id: str, payload: ScheduleRequest) -> dict[str, Any
     except Exception:
         LOG.exception("content scheduling failed for content_id=%r", content_id)
         raise HTTPException(status_code=500, detail="unable to schedule production")
+
+
+@app.post("/v1/content/{content_id}/reconcile")
+def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, Any]:
+    """Reconcile a Sheet projection using the existing review and schedule logic."""
+    _validate_enabled_niche(payload.niche_id)
+    requested_status = payload.status.strip().upper()
+    run_mode = payload.run_mode.strip().upper() if isinstance(payload.run_mode, str) else None
+    if run_mode not in {None, "NIGHT", "NOW"}:
+        raise HTTPException(status_code=400, detail="invalid run_mode")
+    if requested_status == "DRAFT":
+        try:
+            found = _content_job_for(content_id)
+            if found is not None and found[1].get("niche_id") != payload.niche_id:
+                raise HTTPException(status_code=409, detail="content identity conflict")
+        except HTTPException:
+            raise
+        except Exception:
+            LOG.exception("draft content identity lookup failed for content_id=%r", content_id)
+            raise HTTPException(status_code=500, detail="unable to read content state")
+        return _sheet_projection(content_id, payload.niche_id, "DRAFT", run_mode)
+    if requested_status != "READY":
+        raise HTTPException(status_code=400, detail="invalid status")
+
+    try:
+        found = _content_job_for(content_id)
+        if found is None:
+            review = _require_review_fields(content_id, payload)
+            try:
+                create_review(review)
+            except HTTPException as exc:
+                if exc.status_code < 500:
+                    raise
+                return _sheet_projection(
+                    content_id, payload.niche_id, "ERROR", run_mode,
+                    error="unable to prepare human review",
+                )
+            found = _content_job_for(content_id)
+            if found is None:  # Defensive: the canonical adapter must persist the job.
+                return _sheet_projection(
+                    content_id, payload.niche_id, "ERROR", run_mode,
+                    error="unable to prepare human review",
+                )
+
+        job_dir, metadata = found
+        if metadata.get("niche_id") != payload.niche_id:
+            raise HTTPException(status_code=409, detail="content identity conflict")
+        plan_path = _plan_for(job_dir, metadata)
+        plan = _read_object(plan_path) if plan_path else None
+        if plan is None:
+            # Existing jobs without a plan can still use the canonical review
+            # creation path, but only when the inputs needed by that path exist.
+            review = _require_review_fields(content_id, payload)
+            try:
+                create_review(review)
+            except HTTPException as exc:
+                if exc.status_code < 500:
+                    raise
+                return _sheet_projection(content_id, payload.niche_id, "ERROR", run_mode, error="unable to prepare human review")
+            plan_path = _plan_for(job_dir, metadata)
+            plan = _read_object(plan_path) if plan_path else None
+            if plan is None:
+                return _sheet_projection(content_id, payload.niche_id, "ERROR", run_mode, error="unable to prepare human review")
+
+        state = _production_state(job_dir, plan_path, create_content_job_review.produce_batch.HOST_ROOT, plan)
+        if state == "error":
+            return _sheet_projection(content_id, payload.niche_id, "ERROR", run_mode, review_exists=True, error="production error")
+        if state == "completed":
+            return _sheet_projection(content_id, payload.niche_id, "COMPLETED", run_mode, review_exists=True)
+        if state == "producing":
+            return _sheet_projection(content_id, payload.niche_id, "PRODUCING", run_mode, review_exists=True)
+        if plan.get("review_status") != human_review.STATUS_APPROVED:
+            return _sheet_projection(content_id, payload.niche_id, "HUMAN_REVIEW_READY", run_mode, review_exists=True)
+        if run_mode is None:
+            raise HTTPException(status_code=400, detail="run_mode is required for approved content")
+
+        scheduled = schedule_content(content_id, ScheduleRequest(run_mode=run_mode))
+        production_state = scheduled.get("production_state")
+        status = {
+            "queued_night": "QUEUED_NIGHT",
+            "producing": "PRODUCING",
+            "completed": "COMPLETED",
+            "error": "ERROR",
+        }.get(production_state, "ERROR")
+        return _sheet_projection(
+            content_id, payload.niche_id, status, run_mode, review_exists=True,
+            error="production error" if status == "ERROR" else None,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        LOG.exception("content reconcile failed for content_id=%r", content_id)
+        return _sheet_projection(content_id, payload.niche_id, "ERROR", run_mode, error="unable to reconcile content")
 
 
 @app.post("/v1/content/review")

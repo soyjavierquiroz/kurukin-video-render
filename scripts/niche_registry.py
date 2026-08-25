@@ -88,6 +88,24 @@ def load_niche(niche_id: str, registry_path: Path = DEFAULT_REGISTRY_PATH) -> di
     return _validate_niche(niche_id, niches[niche_id])
 
 
+def enabled_niches(registry_path: Path = DEFAULT_REGISTRY_PATH) -> list[tuple[str, dict[str, Any]]]:
+    """Return enabled registry entries, validating each before use.
+
+    ``enabled`` is intentionally backwards-compatible: existing entries are
+    enabled unless they explicitly opt out.
+    """
+    registry = _read_registry(Path(registry_path))
+    result: list[tuple[str, dict[str, Any]]] = []
+    for niche_id, raw_niche in registry["niches"].items():
+        niche = _validate_niche(niche_id, raw_niche)
+        enabled = niche.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise NicheRegistryError(f"niche '{niche_id}' field 'enabled' must be a boolean")
+        if enabled:
+            result.append((niche_id, niche))
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Validate a non-secret niche configuration.")
     parser.add_argument("--niche", required=True, help="Niche ID to validate")
