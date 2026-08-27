@@ -4,43 +4,56 @@ services:
   api:
     image: moneyprinterturbo-webui
     working_dir: /MoneyPrinterTurbo
+
     command:
       - /bin/sh
       - -ec
       - set -a; . /run/secrets/mpt_automation_asset_hub_env; set +a; exec python3 -m uvicorn scripts.automation_api:app --host 0.0.0.0 --port 8080
+
     volumes:
       - type: bind
         source: /opt/moneyprinterturbo
         target: /MoneyPrinterTurbo
         read_only: false
+
       - type: bind
         source: /var/lib/kurukin-asset-hub-pilot/job-assets
         target: /data/job-assets
         read_only: true
+
       - type: bind
         source: /usr/bin/rclone
         target: /usr/local/bin/rclone
         read_only: true
+
       - type: bind
         source: /root/.config/rclone/rclone.conf
         target: /root/.config/rclone/rclone.conf
         read_only: false
+
     secrets:
       - mpt_automation_asset_hub_env
+
     networks:
       general_network:
         aliases:
           - mpt-automation
+      traefik_public:
+
     deploy:
       placement:
         constraints:
           - node.hostname == HughesDocker2026
+
       restart_policy:
         condition: any
         delay: 5s
 
 networks:
   general_network:
+    external: true
+
+  traefik_public:
     external: true
 
 secrets:
