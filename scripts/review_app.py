@@ -17,9 +17,34 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.custom import human_review
 
 
+def _clean_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _is_content_job_plan(plan: Mapping[str, object]) -> bool:
+    """Recognize both legacy and current automation content-job plans."""
+    if isinstance(plan.get("content_job"), Mapping):
+        return True
+
+    # Current automation plans do not yet persist content_job metadata.
+    # Their task identity is generated from deterministic batch ids:
+    # batch-content-<niche>-<content_id>-<stem>.
+    task_id = _clean_text(plan.get("task_id"))
+    if task_id.startswith("batch-content-"):
+        return True
+
+    # Keep a second deterministic signal in case task-id formatting changes.
+    for key in ("audio_path", "script_path"):
+        value = _clean_text(plan.get(key)).replace("\\", "/")
+        if "/storage/content_jobs/" in value:
+            return True
+
+    return False
+
+
 def should_enqueue_nightly(plan: Mapping[str, object]) -> bool:
     """Content-job plans await external production scheduling after review."""
-    return not isinstance(plan.get("content_job"), Mapping)
+    return not _is_content_job_plan(plan)
 
 
 def discover_plans(status: str = human_review.STATUS_PENDING) -> list[Path]:
@@ -42,15 +67,22 @@ def review_relative_url(content_id: str) -> str:
 
 
 def plan_content_id(plan: Mapping[str, object]) -> str | None:
-    """Return a content-job identity when the plan has one."""
+    """Return the immutable content identity for a content-job review plan."""
     content_job = plan.get("content_job")
-    if not isinstance(content_job, Mapping):
-        return None
-    content_id = content_job.get("content_id")
-    if content_id is None:
-        return None
-    value = str(content_id).strip()
-    return value or None
+
+    if isinstance(content_job, Mapping):
+        content_id = _clean_text(content_job.get("content_id"))
+        if content_id:
+            return content_id
+
+    # Current automation-generated plans identify the content itself with
+    # batch_id while their task_id carries the full deterministic batch name.
+    if _is_content_job_plan(plan):
+        content_id = _clean_text(plan.get("batch_id"))
+        if content_id:
+            return content_id
+
+    return None
 
 
 def find_plan_by_content_id(plans: list[Path], content_id: str) -> Path | None:
