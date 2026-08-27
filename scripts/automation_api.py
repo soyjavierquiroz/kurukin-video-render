@@ -129,14 +129,52 @@ def _read_optional_object(path: Path) -> dict[str, Any] | None:
 
 
 def _plan_provenance_matches(plan: dict[str, Any], metadata: dict[str, Any], content_id: str) -> bool:
+    """Verify that a review plan belongs to one immutable content job.
+
+    Legacy plans persist a content-job provenance snapshot.  Current automation
+    plans intentionally do not, so their canonical batch identity and source
+    artifact paths provide the equivalent proof.  A batch_id alone is never
+    sufficient evidence.
+    """
     provenance = plan.get("content_job")
-    if not isinstance(provenance, dict) or provenance.get("content_id") != content_id:
+    if isinstance(provenance, dict):
+        if provenance.get("content_id") != content_id:
+            return False
+        fields = (
+            "niche_id", "asset_profile", "audio_sha256", "script_sha256",
+            "resolved_asset_policy",
+        )
+        return all(provenance.get(field) == metadata.get(field) for field in fields)
+
+    # Only an omitted/null content_job denotes the current format.  Other
+    # malformed legacy provenance must not silently fall through to it.
+    if provenance is not None:
         return False
-    fields = (
-        "niche_id", "asset_profile", "audio_sha256", "script_sha256",
-        "resolved_asset_policy",
+
+    niche_id = metadata.get("niche_id")
+    if not isinstance(niche_id, str) or not niche_id:
+        return False
+    if plan.get("batch_id") != content_id:
+        return False
+    try:
+        batch_id = create_content_job_review.deterministic_batch_id(niche_id, content_id)
+    except (TypeError, ValueError, create_content_job_review.ContentJobReviewError):
+        return False
+    task_id = plan.get("task_id")
+    if not isinstance(task_id, str) or not task_id.startswith(f"batch-{batch_id}-"):
+        return False
+
+    def has_canonical_suffix(value: Any, filename: str) -> bool:
+        if not isinstance(value, str):
+            return False
+        normalized = value.replace("\\", "/").rstrip("/")
+        suffix = f"/storage/content_jobs/{niche_id}/{content_id}/{filename}"
+        return normalized.endswith(suffix)
+
+    return (
+        has_canonical_suffix(plan.get("audio_path"), "source.mp3")
+        and has_canonical_suffix(plan.get("script_path"), "script.txt")
     )
-    return all(provenance.get(field) == metadata.get(field) for field in fields)
 
 
 def _same_plan_path(value: Any, plan_path: Path) -> bool:
@@ -438,12 +476,16 @@ def _is_identity_conflict(message: str) -> bool:
     return "already exists with different" in message or "already exists with a different" in message
 
 
-def _validate_pending_plan(plan_path: Path, content_id: str) -> None:
+def _validate_pending_plan(
+    plan_path: Path, content_id: str, metadata: dict[str, Any] | None = None,
+) -> None:
     plan = _read_object(plan_path)
     if plan.get("review_status") != human_review.STATUS_PENDING:
         raise ValueError("review plan is not pending")
-    provenance = plan.get("content_job")
-    if not isinstance(provenance, dict) or provenance.get("content_id") != content_id:
+    if metadata is None:
+        found = _content_job_for(content_id)
+        metadata = found[1] if found is not None else None
+    if metadata is None or not _plan_provenance_matches(plan, metadata, content_id):
         raise ValueError("review plan does not match content job")
 
 
@@ -476,15 +518,8 @@ def _existing_idempotent_review(payload: ReviewRequest) -> bool:
     if plan_path is None:
         return False
     plan = _read_object(plan_path)
-    provenance = plan.get("content_job")
-    immutable_provenance = (
-        "content_id", "niche_id", "asset_profile", "audio_sha256", "script_sha256",
-        "resolved_asset_policy",
-    )
-    if (
-        plan.get("review_status") == human_review.STATUS_PENDING
-        and isinstance(provenance, dict)
-        and all(provenance.get(field) == metadata.get(field) for field in immutable_provenance)
+    if plan.get("review_status") == human_review.STATUS_PENDING and _plan_provenance_matches(
+        plan, metadata, payload.content_id
     ):
         return True
     return False
@@ -806,7 +841,7 @@ def create_review(payload: ReviewRequest) -> dict[str, Any]:
         _, plan_path = create_content_job_review.create_content_job_review(
             content_ingest.DEFAULT_JOB_ROOT / metadata["niche_id"] / metadata["content_id"]
         )
-        _validate_pending_plan(plan_path, payload.content_id)
+        _validate_pending_plan(plan_path, payload.content_id, metadata)
     except content_ingest.ContentIngestError as exc:
         status = 409 if _is_identity_conflict(str(exc)) else 500
         LOG.warning("content ingest failed for content_id=%r: %s", payload.content_id, exc)

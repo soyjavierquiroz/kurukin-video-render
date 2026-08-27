@@ -81,6 +81,25 @@ class AutomationApiTests(unittest.TestCase):
         }), encoding="utf-8")
         return path
 
+    def _current_plan(self, metadata, *, review_status="pending_review", **overrides):
+        """Create the provenance shape emitted by the current automation path."""
+        content_id = metadata["content_id"]
+        niche_id = metadata["niche_id"]
+        path = human_review.plan_path(
+            f"content-{niche_id}-{content_id}", "Stored-title", self.root,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        plan = {
+            "review_status": review_status,
+            "batch_id": content_id,
+            "task_id": f"batch-content-{niche_id}-{content_id}-editorial-title",
+            "audio_path": f"/MoneyPrinterTurbo/storage/content_jobs/{niche_id}/{content_id}/source.mp3",
+            "script_path": f"/MoneyPrinterTurbo/storage/content_jobs/{niche_id}/{content_id}/script.txt",
+        }
+        plan.update(overrides)
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        return path
+
     def _approved_schedule_fixture(self, content_id="cid_001"):
         job, metadata = self._identity_job(content_id)
         plan = self._identity_plan(metadata, review_status=human_review.STATUS_APPROVED)
@@ -400,12 +419,12 @@ class AutomationApiTests(unittest.TestCase):
         self.assertEqual(response.json(), {"error": "invalid request"})
 
     def test_existing_identity_is_reused_without_approval_or_production(self):
-        plan = self._plan()
+        _, metadata = self._identity_job()
+        plan = self._identity_plan(metadata)
         payload = {
             "niche_id": "test-niche", "content_id": "cid_001", "title": "A title",
             "audio_file_id": "audio-id", "script_file_id": "script-id", "asset_profile": "GENERALES",
         }
-        metadata = {"niche_id": "test-niche", "content_id": "cid_001"}
         with patch.object(automation_api.content_ingest, "validate_request"), patch.object(
             automation_api.content_ingest, "ingest_content", return_value=metadata
         ) as ingest, patch.object(
@@ -444,6 +463,55 @@ class AutomationApiTests(unittest.TestCase):
         review.assert_not_called()
         process.assert_not_called()
         approve.assert_not_called()
+
+    def test_provenance_accepts_legacy_and_current_formats_but_rejects_partial_identity(self):
+        _, metadata = self._identity_job()
+        legacy_path = self._identity_plan(metadata)
+        legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+        self.assertTrue(automation_api._plan_provenance_matches(legacy, metadata, "cid_001"))
+        legacy["content_job"]["audio_sha256"] = "wrong"
+        self.assertFalse(automation_api._plan_provenance_matches(legacy, metadata, "cid_001"))
+
+        current_path = self._current_plan(metadata)
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        self.assertTrue(automation_api._plan_provenance_matches(current, metadata, "cid_001"))
+
+        invalid_cases = {
+            "batch_id": "another-content",
+            "task_id": "batch-content-other-niche-cid_002-editorial-title",
+            "audio_path": "/MoneyPrinterTurbo/storage/content_jobs/test-niche/cid_002/source.mp3",
+            "script_path": "/MoneyPrinterTurbo/storage/content_jobs/test-niche/cid_002/script.txt",
+        }
+        for field, value in invalid_cases.items():
+            with self.subTest(field=field):
+                altered = dict(current)
+                altered[field] = value
+                self.assertFalse(automation_api._plan_provenance_matches(altered, metadata, "cid_001"))
+
+        self.assertFalse(automation_api._plan_provenance_matches(
+            {"batch_id": "cid_001"}, metadata, "cid_001"
+        ))
+
+    def test_validate_pending_plan_accepts_valid_current_plan(self):
+        _, metadata = self._identity_job()
+        plan = self._current_plan(metadata)
+        with patch.object(automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs):
+            automation_api._validate_pending_plan(plan, "cid_001")
+
+    def test_existing_valid_current_review_is_reused_without_regeneration(self):
+        _, metadata = self._identity_job()
+        self._current_plan(metadata)
+        with patch.object(automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs), patch.object(
+            automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root
+        ), patch.object(automation_api.content_ingest, "validate_request"), patch.object(
+            automation_api.content_ingest, "ingest_content"
+        ) as ingest, patch.object(
+            automation_api.create_content_job_review, "create_content_job_review"
+        ) as review:
+            response = self.client.post("/v1/content/review", json=self._identity_payload())
+        self.assertEqual(response.status_code, 200)
+        ingest.assert_not_called()
+        review.assert_not_called()
 
     def test_existing_review_ignores_hook_title_and_legacy_batch_representation(self):
         _, metadata = self._identity_job()
@@ -537,6 +605,19 @@ class AutomationApiTests(unittest.TestCase):
         self.assertEqual(json.loads(next(queue.glob("*.json")).read_text())["production_plan_path"], plan.as_posix())
         launch.assert_not_called()
         approve.assert_not_called()
+
+    def test_night_schedule_accepts_approved_current_plan_and_queues_it(self):
+        _, metadata = self._identity_job()
+        plan = self._current_plan(metadata, review_status=human_review.STATUS_APPROVED)
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root, patch.object(automation_api, "_launch_immediate_production") as launch:
+            response = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NIGHT"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["production_state"], "queued_night")
+        queued = list((self.root / "storage/nightly_jobs/pending").glob("*.json"))
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(json.loads(queued[0].read_text())["production_plan_path"], plan.as_posix())
+        launch.assert_not_called()
 
     def test_now_approved_content_launches_canonical_producer_once_without_nightly_enqueue(self):
         job, _, _ = self._approved_schedule_fixture()
