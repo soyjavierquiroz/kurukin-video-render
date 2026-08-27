@@ -48,11 +48,12 @@ MIN_BACKUP_OUTPUT_SECONDS = 0.75
 # Coverage is persisted for display, but it is never authoritative.  Keep a
 # small tolerance for the rounded values stored in production plans.
 COVERAGE_TOLERANCE_SECONDS = 0.01
-# The renderer can safely hold the final rendered piece for a short audio
-# overrun.  This is deliberately limited: a longer unsegmented tail still
-# needs an explicitly approved visual segment.
+# The renderer can safely hold a scene's final rendered piece for a short
+# in-scene overrun.  This is never used to fill an unsegmented timeline tail.
 MAX_SEGMENT_FREEZE_SECONDS = 1.25
-MAX_TIMELINE_AUTOFILL_SECONDS = 5.0
+# Kept as a recipe-fingerprint input for already-produced plans.  Timeline
+# tails are no longer auto-filled, so the effective policy is zero seconds.
+MAX_TIMELINE_AUTOFILL_SECONDS = 0.0
 _LOG = logging.getLogger(__name__)
 PREVIEW_KEYS = (
     "thumbnail_url", "thumbnail", "preview_url", "preview", "poster_url", "poster",
@@ -1575,50 +1576,13 @@ def render_timeline_from_plan(
                 }
             )
 
-    # A tail is not a new semantic scene.  Once every approved scene is
-    # renderable, continue only the final frozen asset for a bounded audio
-    # overrun.  Never add or rediscover an asset here.
+    # A tail is not a new semantic scene.  It must be represented by a scene
+    # in the review plan, never silently covered by looping or freezing the
+    # final approved asset.
     unsegmented_shortfall = max(0.0, required_duration - total_scene_target)
-    if (
-        unsegmented_shortfall > 0.01
-        and unsegmented_shortfall <= MAX_TIMELINE_AUTOFILL_SECONDS
-        and not segment_shortfalls
-        and pieces
-    ):
-        final_piece = pieces[-1]
-        final_asset = final_piece["asset"]
-        source_total = _asset_source_duration(final_asset)
-        source_used = float(final_piece["source_duration"])
-        remaining = unsegmented_shortfall
-        unused = max(0.0, source_total - source_used)
-        if unused > 0.0001:
-            extend = min(unused, remaining)
-            append_piece(
-                segment_id="timeline-tail", role="EXTEND", asset=final_asset,
-                source_duration=extend, output_duration=extend, playback_speed=1.0,
-                source_start=source_used,
-            )
-            remaining -= extend
-        while remaining > 0.0001 and source_total > 0.0001:
-            replay = min(source_total, remaining)
-            append_piece(
-                segment_id="timeline-tail", role="LOOP", asset=final_asset,
-                source_duration=replay, output_duration=replay, playback_speed=1.0,
-                source_start=0.0,
-            )
-            remaining -= replay
-        if remaining > 0.0001:
-            append_piece(
-                segment_id="timeline-tail", role="FREEZE", asset=final_asset,
-                source_duration=0.04, output_duration=remaining, playback_speed=1.0,
-                source_start=max(0.0, source_total - 0.04), freeze_seconds=remaining,
-            )
-            remaining = 0.0
-        unsegmented_shortfall = remaining
-
-    # If there are too few scenes to span the whole audio, report
-    # that as an explicit timeline-tail shortfall instead of letting
-    # combine_videos() silently loop.
+    # If there are too few scenes to span the whole audio, report that as an
+    # explicit timeline-tail shortfall instead of letting production silently
+    # loop, extend, or freeze the final scene.
     if unsegmented_shortfall > 0.01:
         segment_shortfalls.append(
             {
@@ -2091,6 +2055,42 @@ def split_script_for_segments(script_text: str, segment_count: int) -> list[str]
     return chunks
 
 
+def allocate_script_segment_durations(
+    script_fragments: list[str],
+    total_duration: float,
+) -> list[float]:
+    """Allocate an audio timeline across contiguous script fragments.
+
+    ``clip_duration`` still determines the editorial scene cadence and thus
+    how many fragments are made.  It is deliberately not used for timeline
+    timing: before subtitle timestamps exist, spoken-word count is the best
+    deterministic proxy for how much audio belongs to each fragment.
+
+    Values are rounded to microseconds for stable JSON.  The final value only
+    receives the accumulated rounding correction, not an unsegmented audio
+    remainder.
+    """
+    count = len(script_fragments)
+    if count == 0:
+        return []
+
+    duration = max(0.0, float(total_duration or 0))
+    word_counts = [len(re.findall(r"\S+", str(fragment or ""))) for fragment in script_fragments]
+    total_words = sum(word_counts)
+    weights = word_counts if total_words else [1] * count
+    weight_total = total_words or count
+
+    allocated = [
+        round(duration * weight / weight_total, 6)
+        for weight in weights
+    ]
+    # Keep the plan's scene durations equal to the audio duration despite
+    # serialization rounding.  This correction is bounded by half a
+    # microsecond per segment.
+    allocated[-1] = round(duration - sum(allocated[:-1]), 6)
+    return allocated
+
+
 def visual_queries_for_review_segments(
     script_text: str,
     segment_count: int,
@@ -2140,7 +2140,8 @@ def build_plan(
         len(selected_decisions),
         int(getattr(selection_result, "target_count", 0) or 0),
     )
-    clip_duration = float(getattr(getattr(selection_result, "options", None), "clip_duration", 5) or 5)
+    # Selection's clip duration has already determined this scene count.  It
+    # remains an editorial cadence, but is not a fixed-duration timeline grid.
     editorial_profile = normalize_editorial_profile(editorial_profile)
     script_fragments = split_script_for_segments(script_text, target_segment_count)
     segment_queries = visual_queries_for_review_segments(
@@ -2162,6 +2163,10 @@ def build_plan(
             or str(script_fragments[index] or "").strip()
         )
     ]
+    segment_durations = allocate_script_segment_durations(
+        [script_fragment for _decision, script_fragment, _queries in review_inputs],
+        duration,
+    )
     segments = []
 
     # ----------------------------------------------------------
@@ -2451,17 +2456,9 @@ def build_plan(
                 alt_preview_warnings
             )
 
-        start = (
-            index - 1
-        ) * clip_duration
-
-        end = min(
-            float(
-                duration
-                or index * clip_duration
-            ),
-            start + clip_duration,
-        )
+        segment_duration = segment_durations[index - 1]
+        start = round(sum(segment_durations[:index - 1]), 6)
+        end = round(start + segment_duration, 6)
 
         segments.append(
             {
@@ -2470,10 +2467,7 @@ def build_plan(
                 ),
                 "start": start,
                 "end": end,
-                "duration": max(
-                    0.0,
-                    end - start,
-                ),
+                "duration": segment_duration,
                 "script_text": (
                     script_fragment
                 ),

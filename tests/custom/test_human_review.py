@@ -432,8 +432,83 @@ class TestHumanReviewPlan(unittest.TestCase):
         )
 
         coverage = plan["segments"][0]["coverage"]
-        self.assertAlmostEqual(coverage["target_duration"], 5.1, places=3)
+        self.assertAlmostEqual(coverage["target_duration"], 9.1, places=3)
         self.assertLess(coverage["covered_duration"], coverage["target_duration"])
+
+    def test_build_plan_assigns_audio_duration_proportionally_to_script_fragments(self):
+        assets = [candidate(f"asset-{index}", duration=12) for index in range(1, 10)]
+        result = MaterialSelectionResult(
+            MaterialSelectionOptions("9:16", 51.49, 5),
+            tuple(decision(asset) for asset in assets),
+            9,
+            9,
+            0,
+            False,
+            ("term",),
+            9,
+        )
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        script = " ".join(
+            " ".join(f"palabra{word}" for word in range(10)) + "."
+            for _ in range(9)
+        )
+
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text=script,
+            duration=51.49,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=result,
+            discovery_result=SimpleNamespace(candidates=tuple(assets)),
+            output_path=plan_file,
+        )
+
+        durations = [segment["duration"] for segment in plan["segments"]]
+        timeline = human_review.render_timeline_from_plan(plan)
+
+        self.assertEqual(len(durations), 9)
+        self.assertNotEqual(durations, [5.0] * 9)
+        self.assertAlmostEqual(sum(durations), 51.49, places=6)
+        self.assertAlmostEqual(sum(durations) + 0.10, timeline.required_duration, places=6)
+        self.assertFalse(any(item["segment_id"] == "timeline-tail" for item in timeline.segment_shortfalls))
+        self.assertEqual(plan["segments"][0]["start"], 0.0)
+        for previous, current in zip(plan["segments"], plan["segments"][1:]):
+            self.assertAlmostEqual(previous["end"], current["start"], places=6)
+        self.assertAlmostEqual(plan["segments"][-1]["end"], 51.49, places=6)
+        self.assertEqual(
+            human_review.allocate_script_segment_durations(
+                ["uno", "uno dos", "uno dos tres"], 12.0,
+            ),
+            [2.0, 4.0, 6.0],
+        )
+
+    def test_backup_can_close_missing_duration_for_a_longer_segment_target(self):
+        primary = candidate("asset-primary", duration=2)
+        backup = candidate("asset-backup", duration=7)
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        plan = human_review.build_plan(
+            batch_id="batch",
+            task_id="task-1",
+            stem="story",
+            audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt",
+            script_text="Una escena larga.",
+            duration=9,
+            aspect_ratio="9:16",
+            visual_style="none",
+            selection_result=selection([primary]),
+            discovery_result=SimpleNamespace(candidates=(primary, backup)),
+            output_path=plan_file,
+        )
+
+        self.assertGreater(plan["segments"][0]["coverage"]["missing_duration"], 0)
+        plan = human_review.set_segment_backup(plan_file, "segment-001", "asset-backup", True)
+        self.assertEqual(plan["segments"][0]["coverage"]["missing_duration"], 0.0)
 
     def test_global_missing_requires_segment_missing(self):
         assets = [candidate(f"asset-{index}", duration=2) for index in range(1, 6)]

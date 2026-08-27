@@ -394,7 +394,7 @@ class ProductionPipelineTests(unittest.TestCase):
         self.assertFalse(integrity["ok"])
         self.assertTrue(any("insufficient approved visual coverage" in error for error in integrity["errors"]))
 
-    def test_integrity_allows_short_timeline_tail_by_extending_last_piece(self):
+    def test_integrity_rejects_short_timeline_tail_without_auto_extension(self):
         plan = self.approved_single_segment_plan(primary_duration=4.41)
         plan["segments"][0]["duration"] = 4.31
         plan["duration"] = 5.0
@@ -402,10 +402,10 @@ class ProductionPipelineTests(unittest.TestCase):
 
         integrity = produce_batch.human_review.validate_approved_plan_integrity(plan)
 
-        self.assertTrue(integrity["ok"], integrity["errors"])
-        self.assertEqual(integrity["coverage"]["missing_duration"], 0.0)
-        self.assertEqual(integrity["segment_coverage"]["timeline-tail"]["missing_duration"], 0.0)
-        self.assertAlmostEqual(integrity["coverage"]["covered_duration"], 5.1)
+        self.assertFalse(integrity["ok"])
+        self.assertAlmostEqual(integrity["coverage"]["missing_duration"], 0.69)
+        self.assertAlmostEqual(integrity["segment_coverage"]["timeline-tail"]["missing_duration"], 0.69)
+        self.assertTrue(any("timeline tail" in error for error in integrity["errors"]))
 
     def test_integrity_freezes_real_segment_shortfall_under_limit(self):
         # 3.969s produces 4.41s at the normal slowdown floor, leaving a
@@ -423,7 +423,7 @@ class ProductionPipelineTests(unittest.TestCase):
         self.assertEqual(timeline.pieces[-1]["role"], "FREEZE")
         self.assertAlmostEqual(timeline.pieces[-1]["output_duration"], 0.69)
 
-    def test_integrity_autofills_timeline_tail_under_five_seconds(self):
+    def test_integrity_rejects_timeline_tail_under_five_seconds(self):
         plan = self.approved_single_segment_plan(primary_duration=4.0)
         plan["segments"][0]["duration"] = 3.9
         plan["duration"] = 5.0
@@ -431,10 +431,10 @@ class ProductionPipelineTests(unittest.TestCase):
 
         integrity = produce_batch.human_review.validate_approved_plan_integrity(plan)
 
-        self.assertTrue(integrity["ok"], integrity["errors"])
+        self.assertFalse(integrity["ok"])
         timeline = produce_batch.human_review.render_timeline_from_plan(plan)
-        self.assertEqual(timeline.pieces[-1]["asset_uid"], "primary")
-        self.assertIn(timeline.pieces[-1]["role"], {"EXTEND", "LOOP", "FREEZE"})
+        self.assertFalse(any(piece["segment_id"] == "timeline-tail" for piece in timeline.pieces))
+        self.assertTrue(any(item["segment_id"] == "timeline-tail" for item in timeline.segment_shortfalls))
 
     def test_integrity_allows_approved_backup_that_resolves_deficit(self):
         plan = self.approved_single_segment_plan(primary_duration=4.125, backup_duration=1.0)
