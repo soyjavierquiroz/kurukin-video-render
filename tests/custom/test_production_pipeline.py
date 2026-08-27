@@ -475,6 +475,64 @@ class ProductionPipelineTests(unittest.TestCase):
             )
 
 
+class WorkerRuntimeTests(unittest.TestCase):
+    def test_inside_mpt_runtime_uses_direct_worker_command(self):
+        manifest = produce_batch.CONTAINER_ROOT / "storage/tasks/example/batch-manifest.json"
+        log = Path("/tmp/worker.log")
+        with patch.object(produce_batch, "HOST_ROOT", produce_batch.CONTAINER_ROOT), patch.object(
+            produce_batch, "compose_base_command"
+        ) as compose, patch.object(produce_batch, "run_logged") as run_logged:
+            produce_batch.run_worker(manifest, "review", log)
+
+        compose.assert_not_called()
+        run_logged.assert_called_once_with(
+            [
+                produce_batch.sys.executable,
+                "scripts/batch_mpt_worker.py",
+                manifest.as_posix(),
+                "--stage",
+                "review",
+            ],
+            log,
+            timeout=produce_batch.PROCESS_TIMEOUT,
+        )
+
+    def test_outside_mpt_runtime_preserves_compose_command(self):
+        host_root = Path("/opt/moneyprinterturbo")
+        manifest = host_root / "storage/tasks/example/batch-manifest.json"
+        log = Path("/tmp/worker.log")
+        compose_command = ["docker", "compose", "-f", "docker-compose.yml"]
+        with patch.object(produce_batch, "HOST_ROOT", host_root), patch.object(
+            produce_batch, "compose_base_command", return_value=compose_command
+        ) as compose, patch.object(produce_batch, "run_logged") as run_logged:
+            produce_batch.run_worker(manifest, "master", log)
+
+        compose.assert_called_once_with()
+        run_logged.assert_called_once_with(
+            compose_command + [
+                "exec",
+                "-T",
+                "api",
+                "python3",
+                "scripts/batch_mpt_worker.py",
+                "/MoneyPrinterTurbo/storage/tasks/example/batch-manifest.json",
+                "--stage",
+                "master",
+            ],
+            log,
+            timeout=produce_batch.PROCESS_TIMEOUT,
+        )
+
+    def test_direct_worker_propagates_stage_error_from_run_logged(self):
+        manifest = produce_batch.CONTAINER_ROOT / "storage/tasks/example/batch-manifest.json"
+        error = produce_batch.StageError("review failed exit=1")
+        with patch.object(produce_batch, "HOST_ROOT", produce_batch.CONTAINER_ROOT), patch.object(
+            produce_batch, "run_logged", side_effect=error
+        ):
+            with self.assertRaisesRegex(produce_batch.StageError, "review failed exit=1"):
+                produce_batch.run_worker(manifest, "review", Path("/tmp/worker.log"))
+
+
 class SubtitleRefreshBatchTests(unittest.TestCase):
     def test_refresh_continues_after_one_job_failure(self):
         with tempfile.TemporaryDirectory() as tmp:

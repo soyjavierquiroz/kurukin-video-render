@@ -647,6 +647,11 @@ def compose_base_command() -> list[str]:
     return cmd
 
 
+def running_inside_mpt_runtime() -> bool:
+    """Whether this process already runs in the repository's MPT container."""
+    return HOST_ROOT.resolve() == CONTAINER_ROOT.resolve()
+
+
 def _stage_name_from_command(cmd: list[str]) -> str:
     try:
         return str(cmd[cmd.index("--stage") + 1])
@@ -776,6 +781,17 @@ def write_manifest(
 
 
 def run_worker(manifest: Path, stage: str, log_path: Path) -> None:
+    if running_inside_mpt_runtime():
+        cmd = [
+            sys.executable,
+            "scripts/batch_mpt_worker.py",
+            host_to_container(manifest),
+            "--stage",
+            stage,
+        ]
+        run_logged(cmd, log_path, timeout=PROCESS_TIMEOUT)
+        return
+
     cmd = compose_base_command() + [
         "exec",
         "-T",
