@@ -1,0 +1,187 @@
+import unittest
+from types import SimpleNamespace
+
+from app.custom.material_discovery import MaterialCandidate, MaterialDiscoveryResult
+from app.custom.material_selection import (
+    _is_orientation_compatible,
+    orientation_score,
+    select_material_candidates,
+)
+from app.models.schema import VideoAspect
+
+
+def candidate(key, term="one", provider="pexels", **kwargs):
+    return MaterialCandidate(provider, key, key, term, **kwargs)
+
+
+def discovery(*items):
+    return SimpleNamespace(candidates=items)
+
+
+class TestMaterialSelection(unittest.TestCase):
+    def test_orientation_priorities(self):
+        vertical_4x5 = candidate("v45", orientation="vertical-4x5")
+        vertical = candidate("v", orientation="vertical-9x16")
+        square = candidate("s", orientation="square")
+        horizontal = candidate("h", orientation="horizontal-16x9")
+        self.assertGreater(orientation_score(vertical_4x5, "9:16"), orientation_score(vertical, "9:16"))
+        self.assertGreater(orientation_score(vertical, "9:16"), orientation_score(square, "9:16"))
+        self.assertGreater(orientation_score(vertical, "9:16"), orientation_score(horizontal, "9:16"))
+        self.assertGreater(orientation_score(horizontal, "16:9"), orientation_score(vertical, "16:9"))
+
+    def test_orientation_hard_filter_accepts_matching_vertical_geometry(self):
+        self.assertTrue(_is_orientation_compatible(candidate("v", width=1080, height=1920), "9:16"))
+
+    def test_orientation_hard_filter_accepts_vertical_9x16_metadata(self):
+        self.assertTrue(_is_orientation_compatible(candidate("v9", orientation="vertical-9x16"), "9:16"))
+
+    def test_orientation_hard_filter_accepts_vertical_4x5_metadata(self):
+        self.assertTrue(_is_orientation_compatible(candidate("v45", orientation="vertical-4x5"), "9:16"))
+
+    def test_orientation_hard_filter_excludes_horizontal_from_vertical(self):
+        self.assertFalse(_is_orientation_compatible(candidate("h", width=1920, height=1080), "9:16"))
+        self.assertFalse(_is_orientation_compatible(candidate("h", width=1920, height=1080), VideoAspect.portrait))
+
+    def test_orientation_hard_filter_accepts_matching_horizontal_geometry(self):
+        self.assertTrue(_is_orientation_compatible(candidate("h", width=1920, height=1080), "16:9"))
+
+    def test_orientation_hard_filter_excludes_vertical_from_horizontal(self):
+        self.assertFalse(_is_orientation_compatible(candidate("v", width=1080, height=1920), "16:9"))
+
+    def test_orientation_hard_filter_geometry_overrides_wrong_label(self):
+        self.assertTrue(_is_orientation_compatible(candidate("v", width=1080, height=1920, orientation="horizontal"), "9:16"))
+        self.assertFalse(_is_orientation_compatible(candidate("h", width=1920, height=1080, orientation="vertical"), "9:16"))
+
+    def test_orientation_hard_filter_excludes_unknown_metadata(self):
+        self.assertFalse(_is_orientation_compatible(candidate("u"), "9:16"))
+
+    def test_term_coverage_rank_quality_duration_and_stability(self):
+        items = (candidate("low", "one", rank=8, width=640, height=360, duration=2),
+                 candidate("high", "one", rank=1, width=1920, height=1080, duration=5),
+                 candidate("two", "two", rank=30, width=1280, height=720))
+        result = select_material_candidates(discovery_result=discovery(*items), video_aspect="16:9", target_duration=15, clip_duration=5)
+        self.assertEqual(result.covered_terms, ("one", "two"))
+        self.assertEqual(result.decisions[0].candidate.dedupe_key, "high")
+        self.assertEqual(result.selected_count, 3)
+
+    def test_extended_editorial_metadata_does_not_change_selection_or_coverage(self):
+        best = candidate(
+            "best", rank=1, width=1080, height=1920, duration=5,
+            source_info={"primary_topic": "aceptar ayuda", "people_count": 1, "visual_presentation": "feminine"},
+        )
+        other = candidate(
+            "other", rank=2, width=1080, height=1920, duration=5,
+            source_info={"primary_topic": "otro", "people_count": 2, "visual_presentation": "mixed"},
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(best, other), video_aspect="9:16", target_duration=10, clip_duration=5,
+        )
+
+        self.assertEqual([item.candidate.dedupe_key for item in result.decisions], ["best", "other"])
+        self.assertEqual(result.covered_terms, ("one",))
+
+    def test_diversity_recent_fallback_no_duplicates_and_shortfall(self):
+        items = (candidate("p1", provider="pexels", rank=1, width=1280, height=720),
+                 candidate("p2", provider="pexels", rank=1, width=1280, height=720),
+                 candidate("x", provider="pixabay", rank=1, width=1280, height=720),
+                 candidate("p1", provider="pexels", rank=2, width=1280, height=720))
+        result = select_material_candidates(discovery_result=discovery(*items), video_aspect="16:9", target_duration=20, clip_duration=5, recent_dedupe_keys=("p1", "p2"))
+        self.assertEqual(result.decisions[0].candidate.provider, "pixabay")
+        self.assertEqual(len({d.candidate.dedupe_key for d in result.decisions}), result.selected_count)
+        self.assertTrue(result.used_recent_fallback)
+        self.assertEqual(result.shortfall, 1)
+
+    def test_asset_hub_uids_are_not_collapsed(self):
+        result = select_material_candidates(discovery_result=discovery(candidate("kurukin_media:a", provider="asset_hub", orientation="vertical-9x16"), candidate("kurukin_media:b", provider="asset_hub", orientation="vertical-9x16")), video_aspect="9:16", target_duration=10, clip_duration=5)
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["kurukin_media:a", "kurukin_media:b"])
+
+    def test_title_only_candidates_do_not_displace_real_matches(self):
+        title_only = candidate(
+            "title",
+            term="mi-otra-yo",
+            provider="asset_hub",
+            rank=0,
+            width=1080,
+            height=1920,
+            source_info={"discovery_fallback": "title_only"},
+        )
+        real = candidate("real", term="niño solo", provider="asset_hub", rank=10, width=1080, height=1920)
+
+        result = select_material_candidates(
+            discovery_result=discovery(title_only, real),
+            video_aspect="9:16",
+            target_duration=5,
+            clip_duration=5,
+        )
+
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["real"])
+
+    def test_selection_covers_multiple_terms_in_narrative_order(self):
+        items = (
+            candidate("one-a", "pareja discutiendo", rank=1, width=1080, height=1920),
+            candidate("one-b", "pareja discutiendo", rank=2, width=1080, height=1920),
+            candidate("two-a", "niño solo", rank=5, width=1080, height=1920),
+            candidate("three-a", "mujer laptop", rank=8, width=1080, height=1920),
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(*items),
+            video_aspect="9:16",
+            target_duration=15,
+            clip_duration=5,
+        )
+
+        self.assertEqual(
+            [d.candidate.search_term for d in result.decisions],
+            ["pareja discutiendo", "niño solo", "mujer laptop"],
+        )
+
+    def test_horizontal_asset_never_appears_as_primary_for_vertical_output(self):
+        items = (
+            candidate("h", rank=1, orientation="horizontal-16x9", duration=5),
+            candidate("v9", rank=1, orientation="vertical-9x16", duration=5),
+            candidate("v45", rank=1, orientation="vertical-4x5", duration=5),
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(*items),
+            video_aspect="9:16",
+            target_duration=15,
+            clip_duration=5,
+        )
+
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["v45", "v9"])
+
+    def test_horizontal_production_keeps_previous_landscape_filter(self):
+        items = (
+            candidate("h", rank=1, orientation="horizontal-16x9", duration=5),
+            candidate("v9", rank=1, orientation="vertical-9x16", duration=5),
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(*items),
+            video_aspect="16:9",
+            target_duration=10,
+            clip_duration=5,
+        )
+
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["h"])
+
+    def test_sufficient_duration_is_preferred_without_dropping_short_clip(self):
+        items = (
+            candidate("short", rank=1, width=1080, height=1920, duration=1),
+            candidate("long", rank=1, width=1080, height=1920, duration=5),
+        )
+
+        result = select_material_candidates(
+            discovery_result=discovery(*items),
+            video_aspect="9:16",
+            target_duration=10,
+            clip_duration=5,
+        )
+
+        self.assertEqual([d.candidate.dedupe_key for d in result.decisions], ["long", "short"])
+
+
+if __name__ == "__main__": unittest.main()

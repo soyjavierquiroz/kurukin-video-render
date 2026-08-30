@@ -178,8 +178,41 @@ class TestScriptPromptOptions(unittest.TestCase):
             )
 
         self.assertEqual(result, ["opening city", "middle office", "final sunset"])
-        self.assertIn("chronological stock-video search terms", captured["prompt"])
+        self.assertIn("chronological search terms for a clip search engine", captured["prompt"])
         self.assertIn("same order as the script narration", captured["prompt"])
+        self.assertIn("earlier visual moments", captured["prompt"])
+
+    def test_generate_terms_prompt_requests_concrete_visual_terms(self):
+        """
+        关键词生成必须引导模型输出可搜到素材的画面短语，而不是心理学概念。
+        """
+        captured = {}
+
+        def fake_generate_response(prompt):
+            captured["prompt"] = prompt
+            return '["persona caminando", "persona sentada"]'
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            result = llm.generate_terms(
+                video_subject="Herida del abandono en pareja",
+                video_script="Una mujer llora despues de discutir con su pareja.",
+                amount=2,
+            )
+
+        self.assertEqual(result, ["persona caminando", "persona sentada"])
+        self.assertIn("clip search engine", captured["prompt"])
+        self.assertIn("not a summary of the script", captured["prompt"])
+        self.assertIn("prefer short phrases of 2-3 words", captured["prompt"])
+        self.assertIn("subject + visible action", captured["prompt"])
+        self.assertIn("filename, topic, description, tags", captured["prompt"])
+        self.assertIn("same language as the video script", captured["prompt"])
+        self.assertIn("Avoid inferred relationships", captured["prompt"])
+        self.assertIn("padre ausente", captured["prompt"])
+        self.assertIn("adulto vulnerable", captured["prompt"])
+        self.assertIn("abandonment wound", captured["prompt"])
+        self.assertNotIn("English search terms only", captured["prompt"])
 
     def test_generate_terms_returns_empty_list_on_provider_error(self):
         """

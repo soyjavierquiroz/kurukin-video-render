@@ -10,9 +10,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from moviepy import (
+    ColorClip,
     ImageClip,
     VideoFileClip,
 )
+from PIL import Image
 
 # add project root to python path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -449,6 +451,205 @@ class TestVideoService(unittest.TestCase):
 
         self.assertEqual(vd._get_configured_video_codec(), "libx264")
 
+    def test_vertical_letterbox_detects_4x5_inside_9x16(self):
+        self.assertTrue(
+            vd._has_vertical_letterbox(
+                canvas_size=(1080, 1920),
+                content_size=(1080, 1440),
+            )
+        )
+
+    def test_vertical_letterbox_feather_overlay_has_top_and_bottom_alpha(self):
+        geometry = vd._ScaledContentGeometry(1080, 1920, 1080, 1440, 0, 240, 1080, 1680)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(vd.utils, "storage_dir", return_value=temp_dir):
+                overlay_path = vd._video_edge_feather_overlay_path(geometry=geometry)
+
+            self.assertTrue(overlay_path.startswith(temp_dir))
+            self.assertNotIn("/data/job-assets", overlay_path)
+            with Image.open(overlay_path) as overlay:
+                alpha = overlay.getchannel("A")
+                self.assertEqual(alpha.getpixel((540, 239)), 255)
+                self.assertEqual(alpha.getpixel((540, 240)), 255)
+                self.assertEqual(alpha.getpixel((540, 245)), 255)
+                self.assertGreater(alpha.getpixel((540, 300)), 80)
+                self.assertGreater(alpha.getpixel((540, 1620)), 80)
+                self.assertEqual(alpha.getpixel((540, 1675)), 255)
+                self.assertEqual(alpha.getpixel((540, 1680)), 255)
+                self.assertEqual(alpha.getpixel((540, 960)), 0)
+
+    def test_vertical_letterbox_feather_has_hold_band_and_eased_falloff(self):
+        geometry = vd._ScaledContentGeometry(1080, 1920, 1080, 1440, 0, 240, 1080, 1680)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(vd.utils, "storage_dir", return_value=temp_dir):
+                overlay_path = vd._video_edge_feather_overlay_path(geometry=geometry)
+
+            with Image.open(overlay_path) as overlay:
+                alpha = overlay.getchannel("A")
+                edge_alpha = alpha.getpixel((540, 240))
+                hold_alpha = alpha.getpixel((540, 245))
+                near_fade_alpha = alpha.getpixel((540, 300))
+                far_fade_alpha = alpha.getpixel((540, 360))
+                transparent_alpha = alpha.getpixel((540, 430))
+
+        self.assertEqual(edge_alpha, 255)
+        self.assertEqual(hold_alpha, 255)
+        self.assertGreater(near_fade_alpha, far_fade_alpha)
+        self.assertGreater(far_fade_alpha, 0)
+        self.assertLessEqual(transparent_alpha, 5)
+
+    def test_vertical_letterbox_feather_alpha_decreases_monotonically_after_hold(self):
+        geometry = vd._ScaledContentGeometry(1080, 1920, 1080, 1440, 0, 240, 1080, 1680)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(vd.utils, "storage_dir", return_value=temp_dir):
+                overlay_path = vd._video_edge_feather_overlay_path(geometry=geometry)
+
+            with Image.open(overlay_path) as overlay:
+                alpha = overlay.getchannel("A")
+                values = [alpha.getpixel((540, y)) for y in (252, 280, 320, 360, 410)]
+
+        self.assertEqual(values, sorted(values, reverse=True))
+
+    def test_vertical_letterbox_geometry_reuses_pad_bounds_for_overlay(self):
+        geometry = vd._scaled_content_geometry(
+            source_size=(626, 836),
+            canvas_size=(1080, 1920),
+        )
+
+        self.assertEqual(geometry.scaled_width, 1080)
+        self.assertEqual(geometry.scaled_height, 1442)
+        self.assertEqual(geometry.content_top, 239)
+        self.assertEqual(geometry.content_bottom, 1681)
+        self.assertTrue(vd._geometry_has_vertical_letterbox(geometry))
+
+    def test_vertical_letterbox_feather_is_applied_as_overlay(self):
+        geometry = vd._ScaledContentGeometry(100, 200, 100, 150, 0, 25, 100, 175)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(vd.utils, "storage_dir", return_value=temp_dir):
+                clip = ColorClip(size=(100, 200), color=(10, 20, 30)).with_duration(1)
+                result = vd._apply_vertical_letterbox_feather(
+                    clip,
+                    geometry=geometry,
+                )
+            try:
+                self.assertIsNot(result, clip)
+                self.assertEqual(result.size, (100, 200))
+                self.assertEqual(result.duration, 1)
+            finally:
+                result.close()
+                if result is not clip:
+                    clip.close()
+
+    def test_no_feather_when_material_fills_canvas(self):
+        geometry = vd._ScaledContentGeometry(1080, 1920, 1080, 1920, 0, 0, 1080, 1920)
+        with patch.object(vd, "_video_edge_feather_overlay_path") as overlay_path:
+            clip = ColorClip(size=(1080, 1920), color=(10, 20, 30)).with_duration(1)
+            try:
+                result = vd._apply_vertical_letterbox_feather(
+                    clip,
+                    geometry=geometry,
+                )
+                self.assertIs(result, clip)
+                overlay_path.assert_not_called()
+            finally:
+                clip.close()
+
+    def test_feather_does_not_change_material_aspect_ratio(self):
+        source_size = (626, 836)
+        canvas_size = (1080, 1920)
+        scale_factor = canvas_size[0] / source_size[0]
+        content_size = (
+            int(source_size[0] * scale_factor),
+            int(source_size[1] * scale_factor),
+        )
+
+        self.assertAlmostEqual(
+            content_size[0] / content_size[1],
+            source_size[0] / source_size[1],
+            places=2,
+        )
+        self.assertTrue(
+            vd._has_vertical_letterbox(
+                canvas_size=canvas_size,
+                content_size=content_size,
+            )
+        )
+
+    def test_feather_overlay_does_not_modify_source_file(self):
+        geometry = vd._ScaledContentGeometry(1080, 1920, 1080, 1440, 0, 240, 1080, 1680)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "source.mp4")
+            Path(source_path).write_bytes(b"source")
+            before = os.stat(source_path).st_mtime_ns
+            with patch.object(vd.utils, "storage_dir", return_value=temp_dir):
+                vd._video_edge_feather_overlay_path(geometry=geometry)
+
+            self.assertEqual(os.stat(source_path).st_mtime_ns, before)
+            self.assertEqual(Path(source_path).read_bytes(), b"source")
+
+    def test_dip_to_black_applies_fades_to_intermediate_clip(self):
+        class _FakeClip:
+            duration = 3.0
+
+            def __init__(self):
+                self.effects = None
+
+            def with_effects(self, effects):
+                self.effects = effects
+                return self
+
+        clip = _FakeClip()
+        result = vd._apply_dip_to_black_transition(
+            clip,
+            fade_in=True,
+            fade_out=True,
+        )
+
+        self.assertIs(result, clip)
+        self.assertEqual([type(effect).__name__ for effect in clip.effects], ["FadeIn", "FadeOut"])
+        self.assertTrue(all(abs(effect.duration - 0.18) < 0.001 for effect in clip.effects))
+
+    def test_dip_to_black_flags_do_not_add_timeline_duration(self):
+        clip = ColorClip(size=(16, 16), color=(10, 20, 30)).with_duration(2.0)
+        try:
+            result = vd._apply_dip_to_black_transition(
+                clip,
+                fade_in=True,
+                fade_out=True,
+            )
+            self.assertEqual(result.duration, 2.0)
+            self.assertIsNone(getattr(result, "audio", None))
+        finally:
+            result.close()
+            if result is not clip:
+                clip.close()
+
+    def test_single_clip_has_no_dip_to_black_transition(self):
+        self.assertEqual(
+            vd._dip_to_black_flags(
+                clip_index=0,
+                clip_count=1,
+                selected_count=0,
+                current_duration=0,
+                clip_duration=3,
+                required_duration=3,
+            ),
+            (False, False),
+        )
+
+    def test_last_used_clip_has_no_fade_out_when_it_covers_audio(self):
+        self.assertEqual(
+            vd._dip_to_black_flags(
+                clip_index=1,
+                clip_count=3,
+                selected_count=1,
+                current_duration=3,
+                clip_duration=3,
+                required_duration=5,
+            ),
+            (True, False),
+        )
+
     def test_ffmpeg_encoder_exists_falls_back_when_probe_fails(self):
         """
         Windows 上用户配置的 ffmpeg 可能因为路径损坏、权限或杀软拦截而无法
@@ -725,24 +926,17 @@ class TestVideoService(unittest.TestCase):
                 self.h = 1920
                 self.records_source_range = records_source_range
 
-            def subclipped(self, start_time, end_time):
-                # 只记录直接从源文件读取的范围。变速后的安全裁剪也会调用
-                # subclipped，但它不代表新的源时间段，不能混入断层判断。
-                if self.records_source_range:
-                    source_ranges.append((start_time, end_time))
-                return _FakeVideoClip(end_time - start_time)
-
-            def with_speed_scaled(self, factor):
-                return _FakeVideoClip(self.duration / factor)
-
             def close(self):
                 pass
 
         def _open_fake_video_clip(_video_path):
             return _FakeVideoClip(source_duration, records_source_range=True)
 
-        def _capture_written_clip(clip, *_args, **_kwargs):
-            written_durations.append(clip.duration)
+        def _capture_written_clip(**kwargs):
+            start_time = kwargs["source_start"]
+            source_duration = kwargs["source_duration"]
+            source_ranges.append((start_time, start_time + source_duration))
+            written_durations.append(kwargs["used_duration"])
 
         with tempfile.TemporaryDirectory() as temp_dir:
             combined_video_path = os.path.join(temp_dir, "combined.mp4")
@@ -755,7 +949,7 @@ class TestVideoService(unittest.TestCase):
                 ),
                 patch.object(
                     vd,
-                    "_write_videofile_with_codec_fallback",
+                    "_write_polished_clip_with_ffmpeg",
                     side_effect=_capture_written_clip,
                 ),
                 # random 模式默认会打乱同一源视频的切片。这里保持生成顺序，
@@ -846,7 +1040,7 @@ class TestVideoService(unittest.TestCase):
                     vd, "_open_video_clip_quietly", side_effect=_open_fake_video_clip
                 ):
                     with patch.object(
-                        vd, "_write_videofile_with_codec_fallback"
+                        vd, "_write_polished_clip_with_ffmpeg"
                     ) as write_mock:
                         with patch.object(vd, "concat_video_clips_with_ffmpeg") as concat_mock:
                             with patch.object(vd, "delete_files"):
@@ -863,6 +1057,96 @@ class TestVideoService(unittest.TestCase):
         self.assertEqual(result, combined_video_path)
         self.assertEqual(write_mock.call_count, 4)
         self.assertEqual(concat_mock.call_args.kwargs["max_duration"], 10.0)
+
+    def test_combine_videos_trims_remaining_duration_before_polish(self):
+        class _FakeAudioClip:
+            duration = 5.04
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            duration = 6.58
+            size = (626, 836)
+            w = 626
+            h = 836
+
+            def close(self):
+                pass
+
+        written = []
+
+        def capture_polish(**kwargs):
+            written.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(vd, "_open_video_clip_quietly", return_value=_FakeVideoClip()),
+                patch.object(vd, "_write_polished_clip_with_ffmpeg", side_effect=capture_polish),
+                patch.object(vd, "_write_videofile_with_codec_fallback") as moviepy_writer,
+                patch.object(vd, "concat_video_clips_with_ffmpeg"),
+                patch.object(vd, "delete_files"),
+            ):
+                vd.combine_videos(
+                    combined_video_path=os.path.join(temp_dir, "combined.mp4"),
+                    video_paths=["clip-1.mp4", "clip-2.mp4"],
+                    audio_file="audio.mp3",
+                    video_aspect=vd.VideoAspect.portrait,
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    video_transition_mode=None,
+                    max_clip_duration=5,
+                )
+
+        self.assertEqual(len(written), 2)
+        self.assertAlmostEqual(written[0]["used_duration"], 5.0, places=2)
+        self.assertAlmostEqual(written[1]["used_duration"], 0.14, places=2)
+        self.assertAlmostEqual(written[1]["source_duration"], 0.14, places=2)
+        moviepy_writer.assert_not_called()
+
+    def test_write_polished_clip_ffmpeg_filtergraph_trims_pads_overlays_fades_without_audio(self):
+        commands = []
+
+        def fake_run(command, capture_output, text, check):
+            commands.append(command)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        geometry = vd._scaled_content_geometry(
+            source_size=(626, 836),
+            canvas_size=(1080, 1920),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd.utils, "storage_dir", return_value=temp_dir),
+                patch.object(vd.utils, "get_ffmpeg_binary", return_value="ffmpeg"),
+                patch.object(vd, "_get_effective_video_codec", return_value="libx264"),
+                patch.object(vd.subprocess, "run", side_effect=fake_run),
+            ):
+                vd._write_polished_clip_with_ffmpeg(
+                    source_file="source.mp4",
+                    output_file=os.path.join(temp_dir, "out.mp4"),
+                    source_start=1.25,
+                    source_duration=0.14,
+                    used_duration=0.14,
+                    clip_speed=1.0,
+                    geometry=geometry,
+                    feather_applied=True,
+                    fade_in=True,
+                    fade_out=True,
+                    threads=2,
+                )
+
+        command = commands[0]
+        filtergraph = command[command.index("-filter_complex") + 1]
+        self.assertEqual(command[command.index("-ss") + 1], "1.250")
+        self.assertEqual(command[command.index("-t") + 1], "0.140")
+        self.assertIn("scale=1080:1442", filtergraph)
+        self.assertIn("pad=1080:1920:0:239:black", filtergraph)
+        self.assertIn("overlay=0:0", filtergraph)
+        self.assertIn("fade=t=in:st=0:d=0.180", filtergraph)
+        self.assertIn("fade=t=out:st=0.000:d=0.180", filtergraph)
+        self.assertIn("-an", command)
+        self.assertTrue(any("storage" not in value and temp_dir in value for value in command))
 
     def test_concat_video_clips_limits_output_to_audio_duration(self):
         """最终拼接时应裁到音频时长，避免安全余量带来明显静音尾巴。"""

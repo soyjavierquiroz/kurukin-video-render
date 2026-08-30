@@ -3628,6 +3628,7 @@ def _render_video_settings(panel, params):
                 (tr("Random"), "random"),
             ]
             video_sources = [
+                (tr("Mixed"), "mixed"),
                 (tr("Pexels"), "pexels"),
                 (tr("Pixabay"), "pixabay"),
                 (tr("Coverr"), "coverr"),
@@ -5549,17 +5550,29 @@ def _render_generation_controls(
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
 
-        if params.video_source not in [
-            "pexels",
-            "pixabay",
-            "coverr",
-            "wavespeed",
-            "loomloom",
-            "local",
-        ]:
-            _remove_active_generation_task(task_id)
-            st.error(tr("Please Select a Valid Video Source"))
-            st.stop()
+        video_source_value = (params.video_source or "").strip().lower()
+
+        if video_source_value not in {"local", "wavespeed", "loomloom"}:
+            online_sources = (
+                ["mixed"]
+                if video_source_value == "mixed"
+                else [
+                    item.strip()
+                    for item in video_source_value.split(",")
+                    if item.strip()
+                ]
+            )
+            valid_online_sources = {"pexels", "pixabay", "coverr", "mixed"}
+            if (
+                not online_sources
+                or any(
+                    item not in valid_online_sources
+                    for item in online_sources
+                )
+            ):
+                _remove_active_generation_task(task_id)
+                st.error(tr("Please Select a Valid Video Source"))
+                st.stop()
 
         if params.video_source == "pexels" and not config.app.get(
             "pexels_api_keys", ""

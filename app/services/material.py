@@ -1,7 +1,9 @@
+import json
 import os
 import random
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, List
 from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
@@ -18,6 +20,253 @@ from app.utils import utils
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+ASSET_USAGE_HISTORY_FILE = utils.storage_dir(os.path.join("asset_usage", "external_assets_used.jsonl"))
+_ASSET_USAGE_RECENT_LIMIT = 200
+_EXTERNAL_ASSET_PROVIDERS = {"pexels", "pixabay", "coverr"}
+_SOURCE_ROTATION = ("pexels", "pixabay", "coverr")
+# Discovery calls must fail independently and promptly.  A provider outage
+# must not turn a multi-provider Human Review into a minutes-long serial wait.
+DISCOVERY_SEARCH_TIMEOUT = (5, 15)
+
+
+def parse_material_sources(source: str) -> tuple[str, ...]:
+    source_value = (source or "pexels").strip().lower()
+    if source_value == "mixed":
+        return _SOURCE_ROTATION
+
+    sources = tuple(
+        item.strip().lower() for item in source_value.split(",") if item.strip()
+    )
+    if not sources:
+        return ("pexels",)
+
+    invalid_sources = [item for item in sources if item not in _SOURCE_ROTATION]
+    if invalid_sources:
+        raise ValueError(
+            f"unsupported video source: {', '.join(invalid_sources)}. "
+            f"Expected one or more of: {', '.join(_SOURCE_ROTATION)}, mixed, local."
+        )
+
+    deduped_sources = []
+    for item in sources:
+        if item not in deduped_sources:
+            deduped_sources.append(item)
+    return tuple(deduped_sources)
+
+
+def rotated_material_sources(source: str, index: int) -> tuple[str, ...]:
+    sources = parse_material_sources(source)
+    if len(sources) <= 1:
+        return sources
+
+    offset = index % len(sources)
+    return sources[offset:] + sources[:offset]
+
+
+def _search_videos_for_source(provider: str):
+    if provider == "pixabay":
+        return search_videos_pixabay
+    if provider == "coverr":
+        return search_videos_coverr
+    return search_videos_pexels
+
+
+def search_videos_for_provider(
+    provider: str,
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+) -> List[MaterialInfo]:
+    """Search exactly one supported stock provider through the shared cache.
+
+    This small public entry point is intended for discovery callers which need
+    every enabled provider, unlike ``search_videos_with_fallback`` whose
+    established contract stops at the first provider with results.
+    """
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider not in _EXTERNAL_ASSET_PROVIDERS:
+        raise ValueError(f"unsupported video source: {provider}")
+    return _search_videos_with_cache(
+        normalized_provider,
+        _search_videos_for_source(normalized_provider),
+        search_term,
+        minimum_duration,
+        VideoAspect(video_aspect),
+    )
+
+
+def search_videos_with_fallback(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    source: str = "pexels",
+    index: int = 0,
+) -> tuple[List[MaterialInfo], str]:
+    for provider in rotated_material_sources(source, index):
+        try:
+            video_items = _search_videos_with_cache(
+                provider,
+                _search_videos_for_source(provider),
+                search_term,
+                minimum_duration,
+                video_aspect,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"video source '{provider}' failed for '{search_term}', trying next source: {str(exc)}"
+            )
+            continue
+        if video_items:
+            return video_items, provider
+        logger.info(f"video source '{provider}' returned no videos for '{search_term}'")
+    return [], ""
+
+
+def _asset_provider(item) -> str:
+    provider = (getattr(item, "provider", "") or "").strip().lower()
+    return provider if provider in _EXTERNAL_ASSET_PROVIDERS else "unknown"
+
+
+def _asset_id(item) -> str:
+    for attr_name in (
+        "asset_id",
+        "video_id",
+        "pexels_video_id",
+        "pixabay_video_id",
+        "coverr_video_id",
+        "id",
+    ):
+        value = getattr(item, attr_name, "")
+        if value not in (None, ""):
+            return str(value)
+    source_info = getattr(item, "source_info", None)
+    if isinstance(source_info, dict):
+        value = source_info.get("asset_id", "")
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _asset_url(item) -> str:
+    return str(getattr(item, "url", "") or "")
+
+
+def external_asset_identity(item) -> tuple[str, str, str]:
+    provider = _asset_provider(item)
+    asset_id = _asset_id(item)
+    url = _asset_url(item)
+    if asset_id:
+        return provider, "id", asset_id
+    if url:
+        return provider, "url", url
+    return provider, "path", str(getattr(item, "path", "") or "")
+
+
+def _external_asset_identity_key(item) -> str:
+    provider, identity_type, identity_value = external_asset_identity(item)
+    if not identity_value:
+        return ""
+    return f"{provider}:{identity_type}:{identity_value}"
+
+
+def _recent_external_asset_keys(history_file: str = ASSET_USAGE_HISTORY_FILE) -> set[str]:
+    if not os.path.exists(history_file):
+        return set()
+
+    entries = []
+    try:
+        with open(history_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as exc:
+        logger.warning(f"failed to read external asset usage history: {str(exc)}")
+        return set()
+
+    recent_entries = entries[-_ASSET_USAGE_RECENT_LIMIT:]
+    keys = set()
+    for entry in recent_entries:
+        provider = (entry.get("provider") or "unknown").strip().lower()
+        asset_id = str(entry.get("asset_id") or "")
+        url = str(entry.get("url") or "")
+        path_value = str(entry.get("path") or "")
+        if asset_id:
+            keys.add(f"{provider}:id:{asset_id}")
+        if url:
+            keys.add(f"{provider}:url:{url}")
+        if path_value:
+            keys.add(f"{provider}:path:{path_value}")
+    return keys
+
+
+def recent_external_asset_keys() -> set[str]:
+    """Expose the existing external-asset history keys to selection callers."""
+    return _recent_external_asset_keys()
+
+
+def is_recent_external_asset(item, history_file: str = ASSET_USAGE_HISTORY_FILE) -> bool:
+    identity_key = _external_asset_identity_key(item)
+    if not identity_key:
+        return False
+    return identity_key in _recent_external_asset_keys(history_file)
+
+
+def filter_recent_external_assets(
+    items: List[MaterialInfo],
+    history_file: str = ASSET_USAGE_HISTORY_FILE,
+) -> tuple[List[MaterialInfo], bool]:
+    if not items:
+        return [], False
+    recent_keys = _recent_external_asset_keys(history_file)
+    fresh_items = [
+        item
+        for item in items
+        if _external_asset_identity_key(item) not in recent_keys
+    ]
+    if fresh_items:
+        return fresh_items, False
+    return items, True
+
+
+def record_external_asset_usage(
+    item,
+    task_id: str,
+    subject: str = "",
+    dedup_fallback: bool = False,
+    history_file: str = ASSET_USAGE_HISTORY_FILE,
+) -> None:
+    provider = _asset_provider(item)
+    if provider not in _EXTERNAL_ASSET_PROVIDERS:
+        return
+
+    asset_id = _asset_id(item)
+    url = _asset_url(item)
+    if not asset_id and not url and not getattr(item, "path", ""):
+        return
+
+    payload = {
+        "provider": provider,
+        "asset_id": asset_id,
+        "url": url,
+        "task_id": str(task_id or ""),
+        "subject": str(subject or ""),
+        "used_at": datetime.now(timezone.utc).isoformat(),
+        "transform": "none",
+    }
+    if dedup_fallback:
+        payload["dedup_fallback"] = True
+
+    try:
+        os.makedirs(os.path.dirname(history_file), exist_ok=True)
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning(f"failed to write external asset usage history: {str(exc)}")
 
 
 def _safe_public_url(value: Any) -> str | None:
@@ -316,7 +565,7 @@ def search_videos_pexels(
             headers=headers,
             proxies=config.proxy,
             verify=_get_tls_verify(),
-            timeout=(30, 60),
+            timeout=DISCOVERY_SEARCH_TIMEOUT,
         )
         response = r.json()
         video_items = []
@@ -351,6 +600,7 @@ def search_videos_pexels(
                             str(v.get("id")) if v.get("id") is not None else None
                         ),
                         "source_page": _safe_public_url(v.get("url")),
+                        "thumbnail_url": _safe_public_url(v.get("image")),
                         "creator": _creator_info(v.get("user")),
                         "rendition": {
                             "id": (
@@ -399,7 +649,7 @@ def search_videos_pixabay(
 
     try:
         r = requests.get(
-            query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=(30, 60)
+            query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=DISCOVERY_SEARCH_TIMEOUT
         )
         status_code = int(getattr(r, "status_code", 200))
         headers = getattr(r, "headers", {}) or {}
@@ -475,6 +725,11 @@ def search_videos_pixabay(
                             str(v.get("id")) if v.get("id") is not None else None
                         ),
                         "source_page": _safe_public_url(v.get("pageURL")),
+                        "thumbnail_url": _safe_public_url(
+                            v.get("previewURL")
+                            or v.get("webformatURL")
+                            or v.get("largeImageURL")
+                        ),
                         "creator": _creator_info(
                             {
                                 "id": v.get("user_id"),
@@ -547,7 +802,7 @@ def search_videos_coverr(
             headers=headers,
             proxies=config.proxy,
             verify=_get_tls_verify(),
-            timeout=(30, 60),
+            timeout=DISCOVERY_SEARCH_TIMEOUT,
         )
         response = r.json()
         video_items: List[MaterialInfo] = []
@@ -586,6 +841,14 @@ def search_videos_coverr(
                 "search_term": search_term,
                 "asset_id": str(video_id),
                 "source_page": _safe_public_url(v.get("canonical_url") or v.get("url")),
+                "thumbnail_url": _safe_public_url(
+                    v.get("thumbnail")
+                    or v.get("thumbnail_url")
+                    or v.get("poster")
+                    or v.get("poster_url")
+                    or (v.get("urls") or {}).get("poster")
+                    or (v.get("urls") or {}).get("thumbnail")
+                ),
                 "creator": _creator_info(v.get("creator") or v.get("author")),
                 "rendition": {
                     "id": "mp4_download",
@@ -1044,6 +1307,26 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     return ""
 
 
+def download_material_candidate(candidate: Any, destination_dir: str, task_id: str = "") -> str:
+    """Download one already-selected stock candidate using the shared downloader.
+
+    Selection/acquisition callers deliberately do not implement another HTTP
+    client or permanent cache. ``destination_dir`` is supplied by the task
+    acquisition boundary and is normally its materials directory.
+    """
+    url = str(getattr(candidate, "url", "") or "").strip()
+    if not url:
+        raise ValueError("selected stock candidate has no download URL")
+    saved_path = save_video(url, save_dir=destination_dir)
+    if saved_path:
+        record_external_asset_usage(
+            candidate,
+            task_id=task_id,
+            subject=str(getattr(candidate, "search_term", "") or ""),
+        )
+    return saved_path
+
+
 def _search_videos_with_cache(
     provider: str,
     search_videos: Callable[..., List[MaterialInfo]],
@@ -1147,27 +1430,8 @@ def download_videos(
     max_clip_duration: int = 5,
     match_script_order: bool = False,
 ) -> List[str]:
-    provider = "pexels"
-    remote_search_videos = search_videos_pexels
-    if source == "pixabay":
-        provider = "pixabay"
-        remote_search_videos = search_videos_pixabay
-    elif source == "coverr":
-        provider = "coverr"
-        remote_search_videos = search_videos_coverr
-
-    def search_videos(
-        search_term: str,
-        minimum_duration: int,
-        video_aspect: VideoAspect,
-    ) -> List[MaterialInfo]:
-        return _search_videos_with_cache(
-            provider=provider,
-            search_videos=remote_search_videos,
-            search_term=search_term,
-            minimum_duration=minimum_duration,
-            video_aspect=video_aspect,
-        )
+    if source != "local":
+        parse_material_sources(source)
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
@@ -1193,7 +1457,7 @@ def download_videos(
         return _download_videos_by_script_order(
             task_id=task_id,
             search_terms=search_terms,
-            search_videos=search_videos,
+            source=source,
             video_aspect=video_aspect,
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
@@ -1203,13 +1467,18 @@ def download_videos(
     valid_video_items = []
     valid_video_urls = []
     found_duration = 0.0
-    for search_term in search_terms:
-        video_items = search_videos(
+    for term_index, search_term in enumerate(search_terms):
+        video_items, used_source = search_videos_with_fallback(
             search_term=search_term,
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
+            source=source,
+            index=term_index,
         )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
+        logger.info(
+            f"found {len(video_items)} videos for '{search_term}'"
+            + (f" from {used_source}" if used_source else "")
+        )
 
         for item in video_items:
             if item.url not in valid_video_urls:
@@ -1227,7 +1496,14 @@ def download_videos(
     if concat_mode_value == VideoConcatMode.random.value:
         random.shuffle(valid_video_items)
 
+    valid_video_items, dedup_fallback = filter_recent_external_assets(
+        valid_video_items
+    )
+    if dedup_fallback:
+        logger.warning("external asset dedup fallback: all candidates were recent")
+
     total_duration = 0.0
+    subject = ", ".join(str(term) for term in search_terms)
     for item in valid_video_items:
         try:
             source_info = item.source_info if isinstance(item.source_info, dict) else {}
@@ -1241,6 +1517,12 @@ def download_videos(
             if saved_video_path:
                 logger.info(f"video saved: {saved_video_path}")
                 video_paths.append(saved_video_path)
+                record_external_asset_usage(
+                    item,
+                    task_id=task_id,
+                    subject=subject,
+                    dedup_fallback=dedup_fallback,
+                )
                 try:
                     material_sources.append(
                         _material_source_record(item, saved_video_path)
@@ -1346,7 +1628,7 @@ def _download_videos_wavespeed_on_demand(
 def _download_videos_by_script_order(
     task_id: str,
     search_terms: List[str],
-    search_videos,
+    source: str,
     video_aspect: VideoAspect,
     audio_duration: float,
     max_clip_duration: int,
@@ -1366,13 +1648,18 @@ def _download_videos_by_script_order(
     valid_video_urls = set()
     found_duration = 0.0
 
-    for search_term in search_terms:
-        video_items = search_videos(
+    for term_index, search_term in enumerate(search_terms):
+        video_items, used_source = search_videos_with_fallback(
             search_term=search_term,
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
+            source=source,
+            index=term_index,
         )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
+        logger.info(
+            f"found {len(video_items)} videos for '{search_term}'"
+            + (f" from {used_source}" if used_source else "")
+        )
 
         term_items = []
         for item in video_items:
@@ -1382,7 +1669,14 @@ def _download_videos_by_script_order(
             valid_video_urls.add(item.url)
             found_duration += item.duration
 
+        term_items, dedup_fallback = filter_recent_external_assets(term_items)
         if term_items:
+            if dedup_fallback:
+                logger.warning(
+                    f"external asset dedup fallback for '{search_term}': all candidates were recent"
+                )
+                for item in term_items:
+                    item.dedup_fallback = True
             candidate_groups.append((search_term, term_items))
 
     logger.info(
@@ -1416,6 +1710,12 @@ def _download_videos_by_script_order(
                 if saved_video_path:
                     logger.info(f"video saved: {saved_video_path}")
                     video_paths.append(saved_video_path)
+                    record_external_asset_usage(
+                        item,
+                        task_id=task_id,
+                        subject=search_term,
+                        dedup_fallback=bool(getattr(item, "dedup_fallback", False)),
+                    )
                     try:
                         material_sources.append(
                             _material_source_record(item, saved_video_path)

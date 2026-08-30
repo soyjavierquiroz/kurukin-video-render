@@ -61,6 +61,8 @@ class MaterialInfo:
     # 本地上传素材不需要填写；写入任务文件前仍会按字段白名单重新构造，
     # 避免外部请求传入的签名 URL、凭据或无关字段进入持久化数据。
     source_info: Optional[dict[str, Any]] = None
+    motion: str = ""
+    motion_intensity: float = 0.0
 
 
 class VideoParams(BaseModel):
@@ -93,6 +95,19 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
+    video_resolution: str = ""
+
+    asset_hub_renderer_manifest_path: str = ""
+    asset_hub_bundle_uid: str = ""
+    asset_hub_scene_mode: str = "ordered"
+    asset_hub_strict: bool = True
+    material_source_policy: dict | None = None
+    asset_hub_terms: list[str] = Field(default_factory=list)
+    editorial_profile: dict | None = None
+
+    image_motion_enabled: bool = False
+    image_motion_preset: str = ""
+    image_motion_intensity: float = 0.06
 
     custom_audio_file: Optional[str] = (
         None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
@@ -111,6 +126,10 @@ class VideoParams(BaseModel):
     sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
     subtitle_enabled: Optional[bool] = True
+    custom_subtitle_file: str = ""
+    subtitle_provider: str = ""
+    subtitle_correction_enabled: bool = True
+    subtitle_optimization_enabled: bool = True
     subtitle_position: Optional[str] = config.ui.get(
         "subtitle_position", "bottom"
     )  # top, bottom, center, custom

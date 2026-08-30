@@ -1,0 +1,448 @@
+"""Lexical visual query helpers for Kurukin Asset Hub search V2."""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from typing import Any, Mapping, Sequence
+
+from app.custom.scene_visual_intent import SceneVisualIntent, build_scene_visual_intent
+
+
+_STOPWORDS = {
+    "a", "al", "algo", "ante", "asi", "aunque", "cada", "como", "con",
+    "contra", "cuando", "de", "del", "desde", "donde", "e", "el", "ella",
+    "ellas", "ellos", "en", "entre", "era", "eran", "eres", "es", "esa",
+    "ese", "eso", "esta", "estaba", "estaban", "estas", "este", "esto",
+    "fue", "ha", "habia", "hacia", "hasta", "iba", "la", "las", "le",
+    "les", "lo", "los", "mas", "me", "mi", "mis", "ni", "no", "nos",
+    "o", "para", "pero", "porque", "por", "que", "se", "ser", "si",
+    "sin", "su", "sus", "te", "tenia", "ti", "tu", "tus", "un", "una",
+    "uno", "y", "ya",
+}
+_NARRATIVE_NOISE = {
+    "ademas", "aprendiste", "aquello", "buscando", "creces", "crecés",
+    "demas", "demás", "despues", "después", "elegis", "elegís",
+    "entonces", "llegaron", "necesitaba", "necesitabas", "necesitado",
+    "necesitan", "necesito", "necesitó", "ocurrio", "ocurrió", "pasado",
+    "podias", "podías", "puede", "pueden", "quizas", "quizás", "seguia",
+    "seguís", "sentias", "sentías", "siempre", "tambien", "también",
+    "todavia", "todavía",
+    "hiciste", "querias", "querías",
+}
+
+_SUBJECTS = {
+    "adulto", "adulta", "amiga", "amigo", "familia", "hija", "hijo",
+    "hombre", "joven", "madre", "mama", "mamá", "mujer", "nina", "niña",
+    "nino", "niño", "padre", "pareja", "persona", "personas",
+}
+_ACTIONS = {
+    "abrazando", "abrazandose", "abrazar", "acompañar", "acompanar",
+    "ayuda", "ayudar", "ayudarte", "calma", "cuidar", "descansar", "descanso",
+    "discute", "discutiendo", "escucha",
+    "escuchar", "escuchara", "estar", "llorando", "llorar", "mira", "mirando", "observa",
+    "pedir", "recibir", "pensativa", "pensativo", "proteger", "protegiera", "rescatar",
+    "rescatadas", "rescatados", "salvar", "sostiene", "sosteniendo",
+}
+_MOODS = {
+    "agotamiento", "ansiedad", "asustada", "asustado", "calma", "carga",
+    "culpa", "culpable", "dolor", "emocional", "fuerte", "fortaleza",
+    "incomodidad", "incomoda", "introspeccion", "introspección",
+    "miedo", "nostalgia", "preocupacion", "preocupación", "preocupada",
+    "preocupado", "resiliente", "soledad", "sola", "solo", "triste",
+    "tristeza", "vulnerabilidad", "vulnerable",
+}
+_OBJECTS = {
+    "carta", "celular", "coche", "computadora", "documento", "espejo",
+    "foto", "libro", "laptop", "mesa", "telefono", "teléfono", "ventana",
+}
+_SETTINGS = {
+    "casa", "ciudad", "cocina", "escuela", "habitacion", "habitación",
+    "hospital", "oficina", "parque", "playa", "sala", "trabajo",
+}
+SUPPORTED_SUBJECT_GENDERS = frozenset(
+    {"feminine", "masculine", "mixed", "neutral"}
+)
+_EDITORIAL_SUBJECT_TERMS = {
+    "feminine": ("mujer", "niña", "madre", "hermana"),
+    "masculine": ("hombre", "niño", "padre", "hermano"),
+}
+
+_CONCEPT_RULES: tuple[tuple[set[str], tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        {"escucha", "escuchar", "escuchara", "proteger", "protegiera", "apoyo", "necesito"},
+        ("vulnerable", "apoyo emocional"),
+        ("consuelo", "acompañamiento"),
+        ("protección emocional", "vulnerabilidad"),
+    ),
+    (
+        {"sostiene", "sosteniendo", "cargar", "cuida", "cuidar"},
+        ("preocupada", "miedo"),
+        ("cuidadora", "apoyo emocional"),
+        ("responsabilidad emocional", "ansiedad"),
+    ),
+    (
+        {"rescatar", "rescatarte", "rescatadas", "rescatados", "salvar"},
+        ("dependencia emocional", "relación"),
+        ("cuidadora", "apoyo emocional"),
+        ("relación desequilibrada", "rescate"),
+    ),
+    (
+        {"discute", "discutiendo"},
+        ("tensión emocional", "preocupación"),
+        ("conflicto", "relación"),
+        ("discusión familiar", "desacuerdo"),
+    ),
+    (
+        {"miedo", "asustada", "asustado"},
+        ("miedo", "preocupación"),
+        ("persona", "ansiedad"),
+        ("vulnerabilidad emocional",),
+    ),
+    (
+        {"soledad", "sola", "solo", "nadie"},
+        ("persona", "soledad"),
+        ("introspección",),
+        ("vulnerabilidad emocional", "aislamiento"),
+    ),
+    (
+        {"fuerte", "fortaleza", "resolver", "podes", "podés", "poder"},
+        ("fortaleza", "agotamiento"),
+        ("responsabilidad emocional",),
+        ("carga emocional",),
+    ),
+    (
+        {"infancia", "chica", "nina", "niña", "necesidades"},
+        ("vulnerabilidad", "soledad"),
+        ("infancia",),
+        ("abandono emocional",),
+    ),
+    (
+        {"pedir", "recibir", "necesitar", "necesitas", "necesitás", "ayuda", "ayudar", "ayudarte"},
+        ("vulnerabilidad", "incomodidad"),
+        ("apoyo emocional", "acompañamiento"),
+        ("aceptar ayuda",),
+    ),
+    (
+        {"alguien", "estar", "permitir", "permitirle"},
+        ("vulnerabilidad",),
+        ("apoyo emocional", "acompañamiento"),
+        ("consuelo emocional",),
+    ),
+    (
+        {"descansar", "descanso", "culpa", "culpable"},
+        ("culpa", "agotamiento"),
+        ("descanso",),
+        ("cansancio emocional",),
+    ),
+    (
+        {"vulnerable", "vulnerabilidad", "peligroso"},
+        ("vulnerabilidad", "miedo"),
+        ("ansiedad",),
+        ("riesgo emocional",),
+    ),
+    (
+        {"proteger", "protegió", "protegio", "fortaleza", "prision", "prisión"},
+        ("fortaleza", "aislamiento"),
+        ("protección emocional",),
+        ("carga emocional",),
+    ),
+)
+
+_TERM_ALIASES = {
+    "asustada": ("miedo", "ansiedad", "preocupación"),
+    "asustado": ("miedo", "ansiedad", "preocupación"),
+    "escuchara": ("apoyo emocional", "consuelo"),
+    "escuchar": ("apoyo emocional", "consuelo"),
+    "ayudarte": ("apoyo emocional", "aceptar ayuda"),
+    "alguien": ("apoyo emocional", "acompañamiento"),
+    "estar": ("acompañamiento", "apoyo emocional"),
+    "protegiera": ("protección emocional", "vulnerable"),
+    "rescatarte": ("dependencia emocional", "rescate"),
+    "rescatadas": ("dependencia emocional", "rescate"),
+    "rescatados": ("dependencia emocional", "rescate"),
+    "sostiene": ("cuidadora", "responsabilidad emocional"),
+    "fuerte": ("fortaleza", "responsabilidad emocional", "carga emocional"),
+    "podés": ("fortaleza", "agotamiento"),
+    "podes": ("fortaleza", "agotamiento"),
+    "chica": ("infancia", "vulnerabilidad", "abandono emocional"),
+    "necesidades": ("vulnerabilidad", "abandono emocional"),
+    "recibir": ("apoyo emocional", "aceptar ayuda", "vulnerabilidad"),
+    "descansar": ("descanso", "culpa", "agotamiento"),
+    "descanso": ("descanso", "agotamiento"),
+    "incomoda": ("incomodidad", "vulnerabilidad"),
+    "incomodás": ("incomodidad", "vulnerabilidad"),
+    "prisión": ("aislamiento", "carga emocional"),
+    "prision": ("aislamiento", "carga emocional"),
+    "triste": ("tristeza", "vulnerable"),
+    "tristeza": ("vulnerable", "introspección"),
+}
+
+
+def _fold(text: Any) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def _words(text: Any) -> list[str]:
+    return re.findall(r"[\wáéíóúüñÁÉÍÓÚÜÑ]+", str(text or ""), flags=re.UNICODE)
+
+
+def _clean_tokens(values: Sequence[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    forbidden = {_fold(item) for item in (*_STOPWORDS, *_NARRATIVE_NOISE)}
+    for value in values:
+        for word in _words(value):
+            folded = _fold(word)
+            if len(folded) < 3 or folded in forbidden:
+                continue
+            if folded not in seen:
+                result.append(word.lower())
+                seen.add(folded)
+    return result
+
+
+def _pick(tokens: Sequence[str], allowed: set[str]) -> list[str]:
+    allowed_folded = {_fold(item) for item in allowed}
+    return [token for token in tokens if _fold(token) in allowed_folded]
+
+
+def _append_unique(target: list[str], values: Sequence[Any], *, limit: int = 7) -> None:
+    seen = {_fold(item) for item in target}
+    for value in values:
+        text = str(value or "").strip().lower()
+        folded = _fold(text)
+        if folded and folded not in seen:
+            target.append(text)
+            seen.add(folded)
+        if len(target) >= limit:
+            return
+
+
+def _query(values: Sequence[Any]) -> str:
+    parts: list[str] = []
+    _append_unique(parts, values, limit=7)
+    return " ".join(parts).strip()
+
+
+def normalize_editorial_profile(value: Mapping[str, Any] | None) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    subject_gender = str(value.get("subject_gender") or "").strip().lower()
+    if subject_gender not in SUPPORTED_SUBJECT_GENDERS:
+        return {}
+    return {"subject_gender": subject_gender}
+
+
+def editorial_subject_terms(editorial_profile: Mapping[str, Any] | None) -> tuple[str, ...]:
+    profile = normalize_editorial_profile(editorial_profile)
+    return _EDITORIAL_SUBJECT_TERMS.get(profile.get("subject_gender", ""), ())
+
+
+def _token_set(query: str) -> frozenset[str]:
+    return frozenset(_fold(word) for word in _words(query))
+
+
+def _is_distinct(query: str, existing: Sequence[str]) -> bool:
+    current = _token_set(query)
+    if not current:
+        return False
+    for other in existing:
+        previous = _token_set(other)
+        if current == previous:
+            return False
+        if len(current) >= 3 and len(previous) >= 3:
+            overlap = len(current & previous)
+            if overlap / max(len(current), 1) >= 0.85 and overlap / max(len(previous), 1) >= 0.85:
+                return False
+    return True
+
+
+def _dedupe_phrases(values: Sequence[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        folded = _fold(value)
+        if not folded:
+            continue
+        if any(folded in _fold(other) or _fold(other) in folded for other in result):
+            continue
+        result.append(value)
+    return result
+
+
+def _concept_mood(value: str) -> bool:
+    folded = _fold(value)
+    return (
+        any(word in folded for word in ("agotamiento", "aislamiento", "culpa", "fortaleza", "incomodidad", "miedo", "ansiedad", "vulner", "preocup", "soledad", "triste", "dependencia"))
+        or folded == "relacion"
+    )
+
+
+def _concept_relation(value: str) -> bool:
+    folded = _fold(value)
+    return any(word in folded for word in ("aceptar ayuda", "apoyo", "consuelo", "acompan", "cuidadora", "descanso", "infancia")) and "proteccion" not in folded
+
+
+def _concept_theme(value: str) -> bool:
+    folded = _fold(value)
+    return any(word in folded for word in ("abandono", "cansancio", "carga", "proteccion", "responsabilidad", "riesgo", "desequilibrada", "rescate", "discusion", "desacuerdo"))
+
+
+def _signals(tokens: Sequence[str]) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str]]:
+    folded = {_fold(token) for token in tokens}
+    moods = _pick(tokens, _MOODS)
+    actions = _pick(tokens, _ACTIONS)
+    subjects = _pick(tokens, _SUBJECTS)
+    objects = _pick(tokens, _OBJECTS)
+    settings = _pick(tokens, _SETTINGS)
+    concepts: list[str] = []
+    if "nadie" in folded:
+        _append_unique(
+            concepts,
+            ("persona", "soledad", "aislamiento", "introspección", "vulnerabilidad emocional"),
+            limit=12,
+        )
+    for trigger, mood_terms, relation_terms, theme_terms in _CONCEPT_RULES:
+        if folded & {_fold(item) for item in trigger}:
+            _append_unique(concepts, (*mood_terms, *relation_terms, *theme_terms), limit=12)
+    for token in tokens:
+        _append_unique(concepts, _TERM_ALIASES.get(_fold(token), ()), limit=12)
+    return subjects, actions, moods, objects, settings, concepts
+
+
+def _hints_are_compatible(
+    scene_tokens: Sequence[str],
+    scene_concepts: Sequence[str],
+    hint_tokens: Sequence[str],
+    hint_concepts: Sequence[str],
+) -> bool:
+    scene_folded = {_fold(token) for token in scene_tokens}
+    hint_folded = {_fold(token) for token in hint_tokens}
+    if scene_folded & hint_folded:
+        return True
+    scene_concept_folded = {_fold(item) for item in scene_concepts}
+    hint_concept_folded = {_fold(item) for item in hint_concepts}
+    if scene_concept_folded & hint_concept_folded:
+        return True
+    return (
+        any(_concept_relation(item) for item in scene_concepts)
+        and any(_concept_relation(item) for item in hint_concepts)
+    ) or (
+        any(_concept_theme(item) for item in scene_concepts)
+        and any(_concept_theme(item) for item in hint_concepts)
+    )
+
+
+def build_visual_queries_v2(
+    scene_text: str | SceneVisualIntent,
+    existing_terms: Sequence[str] | None = None,
+    *,
+    editorial_profile: Mapping[str, Any] | None = None,
+    max_queries: int = 3,
+) -> tuple[str, ...]:
+    """Build compact, diverse lexical visual queries without extra AI calls."""
+    # Keep the old string contract for all existing callers, while allowing
+    # Human Review to pass the structured scene understanding directly.
+    if isinstance(scene_text, SceneVisualIntent):
+        intent = scene_text
+        scene_text = " ".join((*intent.literal_concepts, *intent.emotional_intent, *intent.action, *intent.environment, *intent.relationship_context))
+    else:
+        intent = build_scene_visual_intent(scene_text, editorial_profile=editorial_profile)
+    # Intent concepts supplement the established lexical rules; they never
+    # replace them, preserving current query behavior for historical callers.
+    existing_terms = tuple(existing_terms or ()) + tuple(intent.emotional_intent) + tuple(intent.action) + tuple(intent.environment)
+    scene_tokens = _clean_tokens([scene_text])
+    if not scene_tokens:
+        return ()
+
+    editorial_terms = editorial_subject_terms(editorial_profile)
+    hint_tokens = _clean_tokens(existing_terms or ())
+    scene_subjects, scene_actions, scene_moods, scene_objects, scene_settings, scene_concepts = _signals(scene_tokens)
+    _, hint_actions, _, hint_objects, hint_settings, hint_concepts = _signals(hint_tokens)
+    scene_has_visual_signal = bool(scene_actions or scene_moods or scene_objects or scene_settings or scene_concepts)
+
+    if scene_has_visual_signal:
+        subjects = list(scene_subjects)
+        actions = list(scene_actions)
+        moods = list(scene_moods)
+        objects = list(scene_objects)
+        settings = list(scene_settings)
+        concepts = list(scene_concepts)
+        if _hints_are_compatible(scene_tokens, scene_concepts, hint_tokens, hint_concepts):
+            _append_unique(actions, hint_actions, limit=4)
+            _append_unique(concepts, hint_concepts, limit=12)
+            if not objects:
+                _append_unique(objects, hint_objects, limit=1)
+            if not settings:
+                _append_unique(settings, hint_settings, limit=1)
+    else:
+        tokens = list(dict.fromkeys([*scene_tokens, *hint_tokens]))
+        subjects, actions, moods, objects, settings, concepts = _signals(tokens)
+
+    if editorial_terms:
+        explicit_subjects = {_fold(item) for item in subjects}
+        matching_editorial_terms = [
+            term
+            for term in editorial_terms
+            if _fold(term) in {_fold(token) for token in scene_tokens}
+        ]
+        editorial_subject = matching_editorial_terms[:1] or editorial_terms[:1]
+        subjects = [
+            *editorial_subject,
+            *[
+                item
+                for item in subjects
+                if _fold(item) not in {_fold(term) for term in editorial_terms}
+            ],
+        ]
+        if not explicit_subjects:
+            concepts = list(concepts)
+
+    subject = subjects[:1] or (["persona"] if (actions or moods or concepts) else [])
+    relation_subject = subjects[:1] or (["persona"] if (actions or objects or settings) else [])
+
+    concept_moods = _dedupe_phrases([item for item in concepts if _concept_mood(item)])
+    concept_relations = _dedupe_phrases([item for item in concepts if _concept_relation(item)])
+    concept_themes = _dedupe_phrases([item for item in concepts if _concept_theme(item)])
+
+    raw_moods = list(moods)
+    if raw_moods:
+        _append_unique(raw_moods, concept_moods, limit=2)
+    else:
+        _append_unique(raw_moods, concept_moods[:1], limit=2)
+        if len(raw_moods) < 2:
+            _append_unique(raw_moods, concept_relations[:1], limit=2)
+        if len(raw_moods) < 2:
+            _append_unique(raw_moods, concept_moods[1:2], limit=2)
+
+    theme_lane = concept_themes[:2] or concept_relations[:2] or concept_moods[:2]
+    if len(_query(theme_lane).split()) < 3:
+        _append_unique(theme_lane, concept_moods, limit=3)
+
+    lanes = (
+        [*subject, *raw_moods[:2]],
+        [*relation_subject, *(concept_relations[:2] or actions[:2]), *objects[:1], *settings[:1]],
+        theme_lane,
+    )
+
+    queries: list[str] = []
+    for lane in lanes:
+        query = _query(lane)
+        word_count = len(query.split())
+        if 3 <= word_count <= 7 and _is_distinct(query, queries):
+            queries.append(query)
+        if len(queries) >= max(1, min(max_queries, 3)):
+            break
+
+    if not queries and (moods or actions or concepts):
+        fallback = _query([*subject, *(moods[:2] or concepts[:2]), *actions[:1]])
+        if 3 <= len(fallback.split()) <= 7:
+            queries.append(fallback)
+
+    if not queries and editorial_terms:
+        fallback = _query([editorial_terms[0], *scene_tokens[:4]])
+        if 3 <= len(fallback.split()) <= 7:
+            queries.append(fallback)
+
+    return tuple(queries[: max(1, min(max_queries, 3))])

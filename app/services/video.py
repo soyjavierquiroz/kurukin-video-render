@@ -1,5 +1,7 @@
 import itertools
 import io
+import hashlib
+import math
 import os
 import random
 import gc
@@ -8,6 +10,7 @@ import sys
 import tempfile
 import unicodedata
 from contextlib import ExitStack, redirect_stdout
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import List
 from loguru import logger
@@ -21,11 +24,13 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    vfx,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from app.config import config
+from app.custom import asset_hub_manifest
 from app.models import const
 from app.models.schema import (
     MaterialInfo,
@@ -89,6 +94,426 @@ _SUPPORTED_VIDEO_CODECS = (
     "h264_videotoolbox",
 )
 _runtime_disabled_video_codecs = set()
+_IMAGE_MOTION_PRESETS = {
+    "none",
+    "slow_zoom_in",
+    "slow_zoom_out",
+    "pan_left",
+    "pan_right",
+    "pan_up",
+    "pan_down",
+    "subtle_pulse",
+    "handheld_soft",
+}
+_IMAGE_MOTION_ALIASES = {
+    "zoom_in": "slow_zoom_in",
+    "zoom_out": "slow_zoom_out",
+    "ken_burns": "slow_zoom_in",
+    "pulse": "subtle_pulse",
+    "handheld": "handheld_soft",
+}
+_IMAGE_MOTION_DEFAULT_INTENSITY = 0.06
+_IMAGE_MOTION_MAX_INTENSITY = 0.20
+_VIDEO_EDGE_FEATHER_ENABLED = True
+_VIDEO_EDGE_FEATHER_REFERENCE_HEIGHT = 1920
+_VIDEO_EDGE_FEATHER_VISIBLE_RATIO = 0.12
+_VIDEO_EDGE_FEATHER_MAX_ALPHA = 1.0
+_VIDEO_EDGE_FEATHER_HOLD_REFERENCE_SIZE = 12
+_VIDEO_EDGE_FEATHER_BLUR_REFERENCE_RADIUS = 3
+_VIDEO_TRANSITION_DURATION = 0.18
+
+
+@dataclass(frozen=True)
+class _ScaledContentGeometry:
+    canvas_width: int
+    canvas_height: int
+    scaled_width: int
+    scaled_height: int
+    content_left: int
+    content_top: int
+    content_right: int
+    content_bottom: int
+
+    @property
+    def canvas_size(self) -> tuple[int, int]:
+        return (self.canvas_width, self.canvas_height)
+
+    @property
+    def content_size(self) -> tuple[int, int]:
+        return (self.scaled_width, self.scaled_height)
+
+
+def _normalize_video_resolution(video_resolution: str = "") -> str:
+    raw_value = "" if video_resolution is None else str(video_resolution)
+    normalized = raw_value.strip().lower()
+    aliases = {
+        "": "standard_1080p",
+        "standard": "standard_1080p",
+        "standard_1080p": "standard_1080p",
+        "1080p": "standard_1080p",
+        "draft": "draft_720p",
+        "draft_720p": "draft_720p",
+        "720p": "draft_720p",
+        "premium": "premium_2k",
+        "premium_2k": "premium_2k",
+        "2k": "premium_2k",
+        "1440p": "premium_2k",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported video_resolution {raw_value!r}. Expected 720p, 1080p, or 2k."
+        ) from exc
+
+
+def resolve_video_size(video_aspect: str, video_resolution: str = "") -> tuple[int, int]:
+    profile = _normalize_video_resolution(video_resolution)
+    aspect = VideoAspect(video_aspect)
+    sizes = {
+        VideoAspect.portrait: {
+            "draft_720p": (720, 1280),
+            "standard_1080p": (1080, 1920),
+            "premium_2k": (1440, 2560),
+        },
+        VideoAspect.landscape: {
+            "draft_720p": (1280, 720),
+            "standard_1080p": (1920, 1080),
+            "premium_2k": (2560, 1440),
+        },
+    }
+    if aspect in sizes:
+        return sizes[aspect][profile]
+    if profile == "standard_1080p":
+        return aspect.to_resolution()
+    raise ValueError("only 9:16 and 16:9 support non-standard video resolutions")
+
+
+def _has_vertical_letterbox(
+    *,
+    canvas_size: tuple[int, int],
+    content_size: tuple[int, int],
+) -> bool:
+    canvas_width, canvas_height = canvas_size
+    content_width, content_height = content_size
+    if min(canvas_width, canvas_height, content_width, content_height) <= 0:
+        return False
+    return content_width >= canvas_width and content_height < canvas_height
+
+
+def _scaled_content_geometry(
+    *,
+    source_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+) -> _ScaledContentGeometry:
+    source_width, source_height = source_size
+    canvas_width, canvas_height = canvas_size
+    if min(source_width, source_height, canvas_width, canvas_height) <= 0:
+        return _ScaledContentGeometry(
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+            scaled_width=max(1, canvas_width),
+            scaled_height=max(1, canvas_height),
+            content_left=0,
+            content_top=0,
+            content_right=max(1, canvas_width),
+            content_bottom=max(1, canvas_height),
+        )
+
+    source_ratio = source_width / source_height
+    canvas_ratio = canvas_width / canvas_height
+    if math.isclose(source_ratio, canvas_ratio, rel_tol=0.0, abs_tol=1e-6):
+        scaled_width, scaled_height = canvas_width, canvas_height
+    elif source_ratio > canvas_ratio:
+        scale_factor = canvas_width / source_width
+        scaled_width = canvas_width
+        scaled_height = max(1, int(source_height * scale_factor))
+    else:
+        scale_factor = canvas_height / source_height
+        scaled_width = max(1, int(source_width * scale_factor))
+        scaled_height = canvas_height
+
+    content_left = max(0, (canvas_width - scaled_width) // 2)
+    content_top = max(0, (canvas_height - scaled_height) // 2)
+    return _ScaledContentGeometry(
+        canvas_width=canvas_width,
+        canvas_height=canvas_height,
+        scaled_width=scaled_width,
+        scaled_height=scaled_height,
+        content_left=content_left,
+        content_top=content_top,
+        content_right=content_left + scaled_width,
+        content_bottom=content_top + scaled_height,
+    )
+
+
+def _geometry_has_vertical_letterbox(geometry: _ScaledContentGeometry) -> bool:
+    return _has_vertical_letterbox(
+        canvas_size=geometry.canvas_size,
+        content_size=geometry.content_size,
+    )
+
+
+def _video_edge_feather_size(content_height: int) -> int:
+    if content_height <= 0:
+        return 0
+    return max(
+        1,
+        int(round(content_height * _VIDEO_EDGE_FEATHER_VISIBLE_RATIO)),
+    )
+
+
+def _video_edge_feather_hold_size(canvas_height: int) -> int:
+    if canvas_height <= 0:
+        return 0
+    return max(
+        1,
+        int(round(canvas_height * _VIDEO_EDGE_FEATHER_HOLD_REFERENCE_SIZE / _VIDEO_EDGE_FEATHER_REFERENCE_HEIGHT)),
+    )
+
+
+def _video_edge_feather_blur_radius(canvas_height: int) -> float:
+    if canvas_height <= 0:
+        return 0.0
+    return max(
+        0.0,
+        canvas_height * _VIDEO_EDGE_FEATHER_BLUR_REFERENCE_RADIUS / _VIDEO_EDGE_FEATHER_REFERENCE_HEIGHT,
+    )
+
+
+def _video_edge_feather_overlay_path(
+    *,
+    geometry: _ScaledContentGeometry,
+) -> str:
+    canvas_width, canvas_height = geometry.canvas_size
+    feather_total = min(
+        _video_edge_feather_size(geometry.scaled_height),
+        max(1, geometry.scaled_height // 2),
+    )
+    hold = min(
+        _video_edge_feather_hold_size(canvas_height),
+        max(1, feather_total),
+    )
+    feather = max(1, feather_total - hold)
+    max_alpha = max(0, min(255, int(round(255 * _VIDEO_EDGE_FEATHER_MAX_ALPHA))))
+    blur_radius = _video_edge_feather_blur_radius(canvas_height)
+    key = (
+        f"{canvas_width}x{canvas_height}-{geometry.scaled_width}x{geometry.scaled_height}-"
+        f"{geometry.content_top}-{geometry.content_bottom}-{feather}-{hold}-"
+        f"{max_alpha}-{blur_radius:.2f}"
+    )
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    overlay_dir = utils.storage_dir("temp/video_overlays", create=True)
+    overlay_path = os.path.join(overlay_dir, f"edge-feather-{digest}.png")
+    if os.path.exists(overlay_path):
+        return overlay_path
+
+    alpha = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+    top_content_start = geometry.content_top
+    top_hold_end = min(canvas_height, top_content_start + hold)
+    top_feather_end = min(canvas_height, top_hold_end + feather)
+    alpha[:top_hold_end, :] = max_alpha
+    if top_feather_end > top_hold_end:
+        progress = np.linspace(0, 1, top_feather_end - top_hold_end)
+        ramp = (max_alpha * (1 - progress) ** 3).astype(np.uint8)[:, None]
+        alpha[top_hold_end:top_feather_end, :] = np.maximum(
+            alpha[top_hold_end:top_feather_end, :],
+            ramp,
+        )
+
+    bottom_content_end = geometry.content_bottom
+    bottom_hold_start = max(0, bottom_content_end - hold)
+    bottom_feather_start = max(0, bottom_hold_start - feather)
+    if bottom_hold_start > bottom_feather_start:
+        progress = np.linspace(0, 1, bottom_hold_start - bottom_feather_start)
+        ramp = (max_alpha * progress ** 3).astype(np.uint8)[:, None]
+        alpha[bottom_feather_start:bottom_hold_start, :] = np.maximum(
+            alpha[bottom_feather_start:bottom_hold_start, :],
+            ramp,
+        )
+    alpha[bottom_hold_start:, :] = max_alpha
+
+    rgba = np.zeros((canvas_height, canvas_width, 4), dtype=np.uint8)
+    rgba[:, :, 3] = alpha
+    image = Image.fromarray(rgba)
+    if blur_radius > 0:
+        image = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    image.save(overlay_path)
+    return overlay_path
+
+
+def _apply_vertical_letterbox_feather(clip, *, geometry: _ScaledContentGeometry):
+    if not _VIDEO_EDGE_FEATHER_ENABLED:
+        return clip
+    if not _geometry_has_vertical_letterbox(geometry):
+        return clip
+    overlay_path = _video_edge_feather_overlay_path(geometry=geometry)
+    overlay = ImageClip(overlay_path, transparent=True).with_duration(clip.duration)
+    return CompositeVideoClip([clip, overlay], size=geometry.canvas_size).with_duration(clip.duration)
+
+
+def _apply_dip_to_black_transition(clip, *, fade_in: bool, fade_out: bool):
+    duration = float(getattr(clip, "duration", 0) or 0)
+    transition_duration = min(_VIDEO_TRANSITION_DURATION, max(0.0, duration / 2))
+    if transition_duration <= 0:
+        return clip
+    effects = []
+    if fade_in:
+        effects.append(vfx.FadeIn(transition_duration, initial_color=[0, 0, 0]))
+    if fade_out:
+        effects.append(vfx.FadeOut(transition_duration, final_color=[0, 0, 0]))
+    if not effects or not hasattr(clip, "with_effects"):
+        return clip
+    return clip.with_effects(effects)
+
+
+def _dip_to_black_flags(
+    *,
+    clip_index: int,
+    clip_count: int,
+    selected_count: int,
+    current_duration: float,
+    clip_duration: float,
+    required_duration: float,
+) -> tuple[bool, bool]:
+    if clip_count <= 1:
+        return False, False
+    fade_in = selected_count > 0
+    fade_out = (
+        clip_index < clip_count - 1
+        and current_duration + clip_duration < required_duration
+    )
+    return fade_in, fade_out
+
+
+def normalize_image_motion_preset(value: str) -> str:
+    raw_value = "" if value is None else str(value)
+    normalized = raw_value.strip().lower()
+    if not normalized:
+        return "none"
+    normalized = _IMAGE_MOTION_ALIASES.get(normalized, normalized)
+    if normalized not in _IMAGE_MOTION_PRESETS:
+        raise ValueError(f"Unsupported image motion preset {raw_value!r}.")
+    return normalized
+
+
+def clamp_image_motion_intensity(value: float | int | None) -> float:
+    if value in (None, ""):
+        return _IMAGE_MOTION_DEFAULT_INTENSITY
+    if isinstance(value, bool):
+        raise ValueError("image motion intensity must be a number between 0.0 and 0.20")
+    try:
+        intensity = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "image motion intensity must be a number between 0.0 and 0.20"
+        ) from exc
+    if not math.isfinite(intensity):
+        raise ValueError("image motion intensity must be a finite number")
+    if intensity < 0.0 or intensity > _IMAGE_MOTION_MAX_INTENSITY:
+        raise ValueError("image motion intensity must be between 0.0 and 0.20")
+    return intensity
+
+
+def is_image_file(path_or_name: str) -> bool:
+    extension = os.path.splitext(str(path_or_name or ""))[1].lower().lstrip(".")
+    return extension in {"jpg", "jpeg", "png"}
+
+
+def _progress(current_time: float, duration: float) -> float:
+    return min(max(current_time / max(duration, 0.001), 0.0), 1.0)
+
+
+def _cover_image_size(image_path: str, target_size: tuple[int, int]) -> tuple[int, int]:
+    target_width, target_height = target_size
+    if not hasattr(Image, "open"):
+        return target_size
+    with Image.open(image_path) as image:
+        image_width, image_height = image.size
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError(f"invalid image size for {image_path}")
+    cover_scale = max(target_width / image_width, target_height / image_height)
+    return (
+        max(target_width, int(math.ceil(image_width * cover_scale))),
+        max(target_height, int(math.ceil(image_height * cover_scale))),
+    )
+
+
+def create_image_motion_clip(
+    image_path: str,
+    duration: float,
+    target_size: tuple[int, int],
+    motion_preset: str = "none",
+    intensity: float = _IMAGE_MOTION_DEFAULT_INTENSITY,
+):
+    preset = normalize_image_motion_preset(motion_preset)
+    motion_intensity = clamp_image_motion_intensity(intensity)
+    target_width, target_height = target_size
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("target_size must contain positive width and height")
+    clip_duration = float(duration)
+    if clip_duration <= 0:
+        raise ValueError("image motion duration must be greater than 0")
+
+    base_width, base_height = _cover_image_size(image_path, target_size)
+    motion_pad = 1.0 + max(motion_intensity, 0.01)
+
+    if preset in {"pan_left", "pan_right", "pan_up", "pan_down", "handheld_soft"}:
+        base_width = int(math.ceil(base_width * motion_pad))
+        base_height = int(math.ceil(base_height * motion_pad))
+
+    def scale_at(current_time: float) -> float:
+        progress = _progress(current_time, clip_duration)
+        if preset == "slow_zoom_in":
+            return 1.0 + (motion_intensity * progress)
+        if preset == "slow_zoom_out":
+            return 1.0 + (motion_intensity * (1.0 - progress))
+        if preset == "subtle_pulse":
+            return 1.0 + (motion_intensity * 0.5 * math.sin(math.pi * progress) ** 2)
+        if preset == "handheld_soft":
+            return 1.0 + min(motion_intensity * 0.25, 0.02)
+        return 1.0
+
+    def position_at(current_time: float):
+        progress = _progress(current_time, clip_duration)
+        scale = scale_at(current_time)
+        width = base_width * scale
+        height = base_height * scale
+        overflow_x = max(width - target_width, 0.0)
+        overflow_y = max(height - target_height, 0.0)
+        center_x = -overflow_x / 2.0
+        center_y = -overflow_y / 2.0
+
+        if preset == "pan_left":
+            return (-overflow_x * progress, center_y)
+        if preset == "pan_right":
+            return (-overflow_x * (1.0 - progress), center_y)
+        if preset == "pan_up":
+            return (center_x, -overflow_y * progress)
+        if preset == "pan_down":
+            return (center_x, -overflow_y * (1.0 - progress))
+        if preset == "handheld_soft":
+            amplitude_x = min(target_width * motion_intensity * 0.10, 12.0)
+            amplitude_y = min(target_height * motion_intensity * 0.08, 12.0)
+            return (
+                center_x + math.sin(current_time * 2.1) * amplitude_x,
+                center_y + math.cos(current_time * 1.7) * amplitude_y,
+            )
+        return (center_x, center_y)
+
+    image_clip = ImageClip(image_path)
+    if not hasattr(image_clip, "with_duration"):
+        image_clip.size = target_size
+        image_clip.duration = clip_duration
+        return image_clip
+
+    image_clip = image_clip.with_duration(clip_duration).resized(
+        new_size=(base_width, base_height)
+    )
+    if preset in {"slow_zoom_in", "slow_zoom_out", "subtle_pulse", "handheld_soft"}:
+        image_clip = image_clip.resized(scale_at)
+    image_clip = image_clip.with_position(position_at)
+    return CompositeVideoClip([image_clip], size=target_size).with_duration(clip_duration)
 
 
 def _get_required_video_duration(audio_duration: float) -> float:
@@ -312,6 +737,132 @@ def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **k
         )
 
 
+def _run_ffmpeg_video_command_with_codec_fallback(build_command):
+    effective_codec = _get_effective_video_codec()
+
+    def run(codec: str):
+        command = build_command(codec)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            error_message = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(error_message or "ffmpeg video polish failed")
+        return codec
+
+    try:
+        try:
+            return run(effective_codec)
+        except Exception as exc:
+            if effective_codec == _DEFAULT_VIDEO_CODEC:
+                raise
+            result_codec = run(_DEFAULT_VIDEO_CODEC)
+            _disable_runtime_video_codec(effective_codec, str(exc))
+            return result_codec
+    except Exception:
+        raise
+
+
+def _ffmpeg_seconds(value: float) -> str:
+    return f"{max(0.0, float(value)):.3f}"
+
+
+def _write_polished_clip_with_ffmpeg(
+    *,
+    source_file: str,
+    output_file: str,
+    source_start: float,
+    source_duration: float,
+    used_duration: float,
+    clip_speed: float,
+    geometry: _ScaledContentGeometry,
+    feather_applied: bool,
+    fade_in: bool,
+    fade_out: bool,
+    threads: int,
+):
+    overlay_path = (
+        _video_edge_feather_overlay_path(geometry=geometry)
+        if feather_applied
+        else ""
+    )
+
+    def build_filter() -> str:
+        speed = max(0.01, float(clip_speed))
+        setpts = f"setpts=(PTS-STARTPTS)/{speed:.6f}"
+        base_chain = (
+            f"[0:v]{setpts},"
+            f"scale={geometry.scaled_width}:{geometry.scaled_height}:flags=lanczos,"
+            f"pad={geometry.canvas_width}:{geometry.canvas_height}:"
+            f"{geometry.content_left}:{geometry.content_top}:black,"
+            f"setsar=1[base]"
+        )
+        if overlay_path:
+            overlay_chain = "[base][1:v]overlay=0:0:format=auto[polished]"
+            input_label = "[polished]"
+        else:
+            overlay_chain = ""
+            input_label = "[base]"
+
+        effect_filters = []
+        if fade_in:
+            effect_filters.append(
+                f"fade=t=in:st=0:d={_ffmpeg_seconds(_VIDEO_TRANSITION_DURATION)}:color=black"
+            )
+        if fade_out:
+            fade_start = max(0.0, used_duration - _VIDEO_TRANSITION_DURATION)
+            effect_filters.append(
+                f"fade=t=out:st={_ffmpeg_seconds(fade_start)}:"
+                f"d={_ffmpeg_seconds(_VIDEO_TRANSITION_DURATION)}:color=black"
+            )
+        effect_filters.extend([f"fps={fps}", "format=yuv420p"])
+        effect_chain = f"{input_label}{','.join(effect_filters)}[v]"
+        return ";".join(part for part in (base_chain, overlay_chain, effect_chain) if part)
+
+    def build_command(codec: str) -> list[str]:
+        command = [
+            utils.get_ffmpeg_binary(),
+            "-y",
+            "-ss",
+            _ffmpeg_seconds(source_start),
+            "-t",
+            _ffmpeg_seconds(source_duration),
+            "-i",
+            source_file,
+        ]
+        if overlay_path:
+            command.extend([
+                "-loop",
+                "1",
+                "-t",
+                _ffmpeg_seconds(used_duration),
+                "-i",
+                overlay_path,
+            ])
+        command.extend([
+            "-filter_complex",
+            build_filter(),
+            "-map",
+            "[v]",
+            "-an",
+            "-t",
+            _ffmpeg_seconds(used_duration),
+            "-c:v",
+            codec,
+            "-threads",
+            str(threads or 2),
+            "-pix_fmt",
+            "yuv420p",
+            output_file,
+        ])
+        return command
+
+    return _run_ffmpeg_video_command_with_codec_fallback(build_command)
+
+
 def _escape_ffmpeg_concat_path(file_path: str) -> str:
     # concat demuxer 使用单引号包裹路径，路径中的单引号需要先转义。
     return file_path.replace("'", "'\\''")
@@ -450,6 +1001,71 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
     return clip
 
 
+def _sanitize_video_file_for_moviepy(video_path: str) -> str:
+    sanitized_dir = utils.storage_dir("temp/sanitized_videos", create=True)
+    descriptor, sanitized_path = tempfile.mkstemp(
+        prefix="moviepy-sanitized-",
+        suffix=".mp4",
+        dir=sanitized_dir,
+    )
+    os.close(descriptor)
+
+    sanitized_realpath = os.path.realpath(sanitized_path)
+    sanitized_root = os.path.realpath(sanitized_dir)
+    if not sanitized_realpath.startswith(sanitized_root + os.sep):
+        raise ValueError(f"sanitized video path escaped temp directory: {sanitized_path}")
+    if sanitized_realpath.startswith(os.path.realpath("/data/job-assets") + os.sep):
+        raise ValueError(f"sanitized video path must not be under /data/job-assets: {sanitized_path}")
+
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        "-i",
+        video_path,
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-map_chapters",
+        "-1",
+        "-map_metadata",
+        "-1",
+        "-c:v",
+        "copy",
+        "-movflags",
+        "+faststart",
+        sanitized_path,
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        delete_files(sanitized_path)
+        error_message = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(error_message or "ffmpeg sanitized remux failed")
+
+    return sanitized_path
+
+
+def _open_video_clip_with_sanitized_fallback(
+    video_path: str,
+    audio: bool = False,
+) -> tuple[VideoFileClip, str]:
+    try:
+        return _open_video_clip_quietly(video_path, audio=audio), video_path
+    except Exception as first_exc:
+        logger.warning(
+            "failed to open video directly, trying sanitized remux: "
+            f"{video_path}, error: {str(first_exc)}"
+        )
+        sanitized_path = _sanitize_video_file_for_moviepy(video_path)
+        return _open_video_clip_quietly(sanitized_path, audio=audio), sanitized_path
+
+
 def close_clip(clip):
     if clip is None:
         return
@@ -545,6 +1161,7 @@ def combine_videos(
     max_clip_duration: int = 5,
     threads: int = 2,
     clip_speed: float = 1.0,
+    video_resolution: str = "",
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -577,7 +1194,7 @@ def combine_videos(
     output_dir = os.path.dirname(combined_video_path)
 
     aspect = VideoAspect(video_aspect)
-    video_width, video_height = aspect.to_resolution()
+    video_width, video_height = resolve_video_size(video_aspect, video_resolution)
 
     processed_clips = []
     subclipped_items = []
@@ -623,96 +1240,142 @@ def combine_videos(
     for i, subclipped_item in enumerate(subclipped_items):
         if video_duration >= required_video_duration:
             break
-        
+
+        remaining_duration = max(0.0, required_video_duration - video_duration)
+        source_available_duration = max(
+            0.0,
+            float(subclipped_item.end_time or 0) - float(subclipped_item.start_time or 0),
+        )
+        used_duration = min(
+            float(max_clip_duration),
+            remaining_duration,
+            source_available_duration / normalized_clip_speed,
+        )
+        if used_duration <= 0:
+            continue
+        source_used_duration = used_duration * normalized_clip_speed
+        geometry = _scaled_content_geometry(
+            source_size=(int(subclipped_item.width or 0), int(subclipped_item.height or 0)),
+            canvas_size=(video_width, video_height),
+        )
+        feather_applied = (
+            _VIDEO_EDGE_FEATHER_ENABLED
+            and _geometry_has_vertical_letterbox(geometry)
+        )
+        fade_in, fade_out = _dip_to_black_flags(
+            clip_index=i,
+            clip_count=len(subclipped_items),
+            selected_count=len(processed_clips),
+            current_duration=video_duration,
+            clip_duration=used_duration,
+            required_duration=required_video_duration,
+        )
+        transition_is_legacy = transition_value not in (None, VideoTransitionMode.none.value)
+        backend = "moviepy" if transition_is_legacy else "ffmpeg"
         logger.debug(
-            f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, "
-            f"source: {os.path.basename(subclipped_item.source_file_path)}, "
-            f"current duration: {video_duration:.2f}s, "
-            f"remaining: {required_video_duration - video_duration:.2f}s"
+            "video polish: "
+            f"source={source_available_duration:.2f} "
+            f"used={used_duration:.2f} "
+            f"remaining={remaining_duration:.2f} "
+            f"bounds={geometry.content_top}:{geometry.content_bottom} "
+            f"feather={str(feather_applied).lower()} "
+            f"fade_in={str(fade_in).lower()} "
+            f"fade_out={str(fade_out).lower()} "
+            f"backend={backend}"
         )
         
         try:
-            clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
-                subclipped_item.start_time, subclipped_item.end_time
-            )
-            # 播放速度属于素材本身属性，应在转场前应用。这样 Fade/Slide 等一秒转场
-            # 不会跟随素材速度变成 0.5 秒或 2 秒；后续最大时长裁剪继续作为
-            # 浮点误差或异常素材时长的安全兜底，保证最终片段不突破配置上限。
-            if normalized_clip_speed != 1.0:
-                clip = clip.with_speed_scaled(normalized_clip_speed)
-            clip_duration = clip.duration
-            # Not all videos are same size, so we need to resize them
-            clip_w, clip_h = clip.size
-            if clip_w != video_width or clip_h != video_height:
-                clip_ratio = clip.w / clip.h
-                video_ratio = video_width / video_height
-                logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
-                
-                if clip_ratio == video_ratio:
-                    clip = clip.resized(new_size=(video_width, video_height))
-                else:
-                    if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
-                        scale_factor = video_height / clip_h
-
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
-                    
-            shuffle_side = random.choice(["left", "right", "top", "bottom"])
-            if transition_value in (None, VideoTransitionMode.none.value):
-                clip = clip
-            elif transition_value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.zoom_in.value:
-                clip = video_effects.zoomin_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.zoom_out.value:
-                clip = video_effects.zoomout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.shuffle.value:
-                transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.zoomin_transition(c, 1),
-                    lambda c: video_effects.zoomout_transition(c, 1),
-                ]
-                shuffle_transition = random.choice(transition_funcs)
-                clip = shuffle_transition(clip)
-
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
-                
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
-            _write_videofile_with_codec_fallback(
-                clip,
-                clip_file,
-                codec=_get_configured_video_codec(),
-                logger=None,
-                fps=fps,
-            )
+            if not transition_is_legacy:
+                _write_polished_clip_with_ffmpeg(
+                    source_file=subclipped_item.file_path,
+                    output_file=clip_file,
+                    source_start=float(subclipped_item.start_time or 0),
+                    source_duration=source_used_duration,
+                    used_duration=used_duration,
+                    clip_speed=normalized_clip_speed,
+                    geometry=geometry,
+                    feather_applied=feather_applied,
+                    fade_in=fade_in,
+                    fade_out=fade_out,
+                    threads=threads,
+                )
+                clip_duration_saved = used_duration
+            else:
+                clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
+                    subclipped_item.start_time,
+                    float(subclipped_item.start_time or 0) + source_used_duration,
+                )
+                # 播放速度属于素材本身属性，应在转场前应用。这样 Fade/Slide 等一秒转场
+                # 不会跟随素材速度变成 0.5 秒或 2 秒；后续最大时长裁剪继续作为
+                # 浮点误差或异常素材时长的安全兜底，保证最终片段不突破配置上限。
+                if normalized_clip_speed != 1.0:
+                    clip = clip.with_speed_scaled(normalized_clip_speed)
+                if clip.duration > used_duration:
+                    clip = clip.subclipped(0, used_duration)
+                # Not all videos are same size, so we need to resize them
+                if geometry.content_size == geometry.canvas_size:
+                    if clip.size != [video_width, video_height] and clip.size != (video_width, video_height):
+                        clip = clip.resized(new_size=(video_width, video_height))
+                else:
+                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip.duration)
+                    clip_resized = clip.resized(new_size=geometry.content_size).with_position(
+                        (geometry.content_left, geometry.content_top)
+                    )
+                    clip = CompositeVideoClip([background, clip_resized], size=(video_width, video_height)).with_duration(clip.duration)
+                    clip = _apply_vertical_letterbox_feather(clip, geometry=geometry)
 
-            # Store clip duration before closing
-            clip_duration_saved = clip.duration
-            close_clip(clip)
+                shuffle_side = random.choice(["left", "right", "top", "bottom"])
+                if transition_value == VideoTransitionMode.fade_in.value:
+                    clip = video_effects.fadein_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.fade_out.value:
+                    clip = video_effects.fadeout_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.slide_in.value:
+                    clip = video_effects.slidein_transition(clip, 1, shuffle_side)
+                elif transition_value == VideoTransitionMode.slide_out.value:
+                    clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+                elif transition_value == VideoTransitionMode.zoom_in.value:
+                    clip = video_effects.zoomin_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.zoom_out.value:
+                    clip = video_effects.zoomout_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.shuffle.value:
+                    transition_funcs = [
+                        lambda c: video_effects.fadein_transition(c, 1),
+                        lambda c: video_effects.fadeout_transition(c, 1),
+                        lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
+                        lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                        lambda c: video_effects.zoomin_transition(c, 1),
+                        lambda c: video_effects.zoomout_transition(c, 1),
+                    ]
+                    shuffle_transition = random.choice(transition_funcs)
+                    clip = shuffle_transition(clip)
+
+                if clip.duration > used_duration:
+                    clip = clip.subclipped(0, used_duration)
+                clip = _apply_dip_to_black_transition(
+                    clip,
+                    fade_in=fade_in,
+                    fade_out=fade_out,
+                )
+                _write_videofile_with_codec_fallback(
+                    clip,
+                    clip_file,
+                    codec=_get_configured_video_codec(),
+                    logger=None,
+                    fps=fps,
+                )
+
+                # Store clip duration before closing
+                clip_duration_saved = clip.duration
+                close_clip(clip)
 
             processed_clips.append(
                 SubClippedVideoClip(
                     file_path=clip_file,
                     duration=clip_duration_saved,
-                    width=clip_w,
-                    height=clip_h,
+                    width=geometry.canvas_width,
+                    height=geometry.canvas_height,
                     source_file_path=subclipped_item.source_file_path,
                 )
             )
@@ -1003,8 +1666,9 @@ def generate_video(
     BGM 但加载、特效或混合失败时返回 False。即使 BGM 失败仍会继续输出只有
     旁白的视频，让任务编排层决定是否向用户展示降级警告。
     """
-    aspect = VideoAspect(params.video_aspect)
-    video_width, video_height = aspect.to_resolution()
+    video_width, video_height = resolve_video_size(
+        params.video_aspect, getattr(params, "video_resolution", "")
+    )
 
     logger.info(f"generating video: {video_width} x {video_height}")
     logger.info(f"  ① video: {video_path}")
@@ -1297,7 +1961,15 @@ def generate_video(
         return bgm_mix_succeeded
 
 
-def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
+def preprocess_video(
+    materials: List[MaterialInfo],
+    clip_duration=4,
+    video_aspect: str = VideoAspect.portrait.value,
+    video_resolution: str = "",
+    image_motion_enabled: bool = False,
+    image_motion_preset: str = "",
+    image_motion_intensity: float = _IMAGE_MOTION_DEFAULT_INTENSITY,
+):
     # WebUI 在某些二次生成场景下可能传入空素材列表，这里直接返回空结果，避免抛出 NoneType 异常。
     if not materials:
         return []
@@ -1305,21 +1977,33 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
     # 仅返回通过预处理校验的素材，避免低分辨率图片继续进入后续的视频合成流程。
     valid_materials = []
     local_videos_dir = utils.storage_dir("local_videos", create=True)
+    target_size = resolve_video_size(video_aspect, video_resolution)
+    global_motion_preset = normalize_image_motion_preset(image_motion_preset)
+    global_motion_intensity = clamp_image_motion_intensity(image_motion_intensity)
 
     for material in materials:
         if not material.url:
             continue
 
         try:
-            material_source_path = file_security.resolve_path_within_directory(
-                local_videos_dir, material.url
-            )
+            if getattr(material, "provider", "") == "asset_hub":
+                material_source_path = str(
+                    asset_hub_manifest.resolve_asset_hub_asset_path(material.url)
+                )
+            else:
+                material_source_path = file_security.resolve_path_within_directory(
+                    local_videos_dir, material.url
+                )
         except ValueError as exc:
             # local video_source 的素材路径来自 API 参数，必须限制在专用素材目录。
             # 允许用户传文件名，也兼容历史返回的绝对路径，但不允许逃逸到系统
             # 其他目录，避免任意文件读取或通过 MoviePy 探测本地敏感文件。
+            if getattr(material, "provider", "") == "asset_hub":
+                message_prefix = "asset hub path rejected"
+            else:
+                message_prefix = "skip unsafe local material"
             logger.warning(
-                f"skip unsafe local material: {material.url}, "
+                f"{message_prefix}: {material.url}, "
                 f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
             )
             continue
@@ -1331,10 +2015,19 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 clip, material_source_path = _open_image_clip_with_fallback(
                     material_source_path
                 )
+            elif ext in const.FILE_TYPE_VIDEOS:
+                clip, material_source_path = _open_video_clip_with_sanitized_fallback(
+                    material_source_path
+                )
             else:
                 clip = _open_video_clip_quietly(material_source_path)
-        except Exception:
+        except Exception as exc:
             # 非标准扩展名或探测失败时再回退到图片模式，兼容历史上直接传本地图片路径的情况。
+            if ext in const.FILE_TYPE_VIDEOS:
+                logger.warning(
+                    f"skip unreadable local material: {material.url}, error: {str(exc)}"
+                )
+                continue
             try:
                 clip, material_source_path = _open_image_clip_with_fallback(
                     material_source_path
@@ -1361,27 +2054,64 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 logger.info(f"processing image: {material_source_path}")
                 # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再重新创建用于导出的图片 clip。
                 close_clip(clip)
-                # Create an image clip and set its duration to 3 seconds
-                clip = (
-                    ImageClip(material_source_path)
-                    .with_duration(clip_duration)
-                    .with_position("center")
-                )
-                # Apply a zoom effect using the resize method.
-                # A lambda function is used to make the zoom effect dynamic over time.
-                # The zoom effect starts from the original size and gradually scales up to 120%.
-                # t represents the current time, and clip.duration is the total duration of the clip (3 seconds).
-                # Note: 1 represents 100% size, so 1.2 represents 120% size.
-                zoom_clip = clip.resized(
-                    lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
-                )
+                duration = float(material.duration or clip_duration)
+                asset_motion = getattr(material, "motion", "") or ""
+                if asset_motion:
+                    motion_preset = normalize_image_motion_preset(asset_motion)
+                    motion_intensity = clamp_image_motion_intensity(
+                        getattr(material, "motion_intensity", None)
+                    )
+                elif image_motion_enabled:
+                    motion_preset = global_motion_preset
+                    motion_intensity = global_motion_intensity
+                else:
+                    motion_preset = "none"
+                    motion_intensity = global_motion_intensity
 
-                # Optionally, create a composite video clip containing the zoomed clip.
-                # This is useful when you want to add other elements to the video.
-                final_clip = CompositeVideoClip([zoom_clip])
+                if motion_preset == "none":
+                    logger.info(
+                        "image motion skipped: "
+                        f"file={os.path.basename(material_source_path)}, preset=none"
+                    )
+                    # Preserve the historical local image behavior when motion is disabled.
+                    clip = (
+                        ImageClip(material_source_path)
+                        .with_duration(duration)
+                        .with_position("center")
+                    )
+                    zoom_clip = clip.resized(
+                        lambda t: 1 + (duration * 0.03) * (t / clip.duration)
+                    )
+                    final_clip = CompositeVideoClip([zoom_clip])
+                else:
+                    logger.info(
+                        "image motion applied: "
+                        f"file={os.path.basename(material_source_path)}, "
+                        f"preset={motion_preset}, "
+                        f"intensity={motion_intensity:.2f}, "
+                        f"duration={duration:g}"
+                    )
+                    clip = None
+                    final_clip = create_image_motion_clip(
+                        image_path=material_source_path,
+                        duration=duration,
+                        target_size=target_size,
+                        motion_preset=motion_preset,
+                        intensity=motion_intensity,
+                    )
 
-                # Output the video to a file.
-                video_file = f"{material_source_path}.mp4"
+                if getattr(material, "provider", "") == "asset_hub":
+                    processed_dir = utils.storage_dir(
+                        "cache_videos/asset_hub_images",
+                        create=True,
+                    )
+                    digest = hashlib.sha1(
+                        material_source_path.encode("utf-8")
+                    ).hexdigest()[:12]
+                    stem = os.path.splitext(os.path.basename(material_source_path))[0]
+                    video_file = os.path.join(processed_dir, f"{stem}-{digest}.mp4")
+                else:
+                    video_file = f"{material_source_path}.mp4"
                 final_clip.write_videofile(video_file, fps=30, logger=None)
                 close_clip(clip)
                 close_clip(final_clip)

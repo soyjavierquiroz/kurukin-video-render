@@ -603,12 +603,18 @@ def generate_terms(
 ) -> List[str]:
     if match_script_order:
         goal = (
-            f"Generate {amount} chronological stock-video search terms that follow "
-            "the order of topics in the video script."
+            f"Generate {amount} chronological search terms for a clip search engine. "
+            "These are not a summary of the script."
         )
         ordering_rule = (
-            "6. keep the terms in the same order as the script narration; "
-            "earlier terms must describe earlier visual moments."
+            "Ordering rule: keep the terms in the same order as the script narration; "
+            "earlier terms must describe earlier visual moments.\n"
+        )
+        abstract_rule = (
+            "Avoid inferred relationships, causes, therapy labels, or psychological "
+            "meaning such as padre ausente, adulto vulnerable, empezar camino, "
+            "conflicto relacion, abandonment wound, childhood trauma, emotional fear, "
+            "or emotional healing. convert abstract ideas into visible clip content."
         )
         # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
         # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
@@ -620,10 +626,16 @@ def generate_terms(
         output_example = json.dumps(example_terms[:amount], ensure_ascii=False)
     else:
         goal = (
-            f"Generate {amount} search terms for stock videos, depending on the "
-            "subject of a video."
+            f"Generate {amount} search terms for a clip search engine. These are "
+            "not a summary of the script."
         )
         ordering_rule = ""
+        abstract_rule = (
+            "Avoid inferred relationships, causes, therapy labels, or psychological "
+            "meaning such as padre ausente, adulto vulnerable, empezar camino, "
+            "conflicto relacion, abandonment wound, childhood trauma, emotional fear, "
+            "or emotional healing. convert abstract ideas into visible clip content."
+        )
         output_example = (
             '["search term 1", "search term 2", "search term 3",'
             '"search term 4", "search term 5"]'
@@ -637,14 +649,21 @@ def generate_terms(
 
 ## Constrains:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
+2. prefer short phrases of 2-3 words.
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
-4. the search terms must be related to the subject of the video.
-5. reply with english search terms only.
+4. write terms for searching clip metadata, not for explaining the script. use words likely to appear literally in filename, topic, description, tags.
+5. preferred structures: subject + visible action, or subject + visible emotion.
+6. describe only visual and observable clip content: people, actions, visible emotions, places, and situations. do not describe psychological meaning.
+7. use the same language as the video script. if the subject and script use different languages, prefer the script language.
 {ordering_rule}
+{abstract_rule}
 
 ## Output Example:
 {output_example}
+
+## Example Style:
+These are examples of the kind of concrete searchable phrase to produce. Do not copy them unless they truly fit the script:
+["mujer triste", "mujer llorando", "mujer preocupada", "mujer sola", "pareja abrazandose", "mujer reflexionando"]
 
 ## Context:
 ### Video Subject
@@ -652,8 +671,6 @@ def generate_terms(
 
 ### Video Script
 {video_script}
-
-Please note that you must use English for generating video search terms; Chinese is not accepted.
 """.strip()
 
     logger.info(f"subject: {video_subject}, match_script_order: {match_script_order}")

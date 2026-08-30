@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,46 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.services import subtitle
+
+
+def _srt_block(index, start, end, text):
+    return f"{index}\n{start} --> {end}\n{text}\n\n"
+
+
+def _write_srt(path, blocks):
+    path.write_text("".join(blocks), encoding="utf-8")
+
+
+def _read_report(subtitle_file):
+    report_file = subtitle_file.with_name(f"{subtitle_file.stem}-alignment.json")
+    return json.loads(report_file.read_text(encoding="utf-8"))
+
+
+def _srt_time(seconds):
+    milliseconds = int(round(float(seconds) * 1000))
+    hours, remainder = divmod(milliseconds, 3600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _write_word_timed_srt(path, text, step=0.5):
+    words = text.split()
+    blocks = []
+    for index, word in enumerate(words, start=1):
+        blocks.append(
+            _srt_block(
+                index,
+                _srt_time((index - 1) * step),
+                _srt_time(index * step),
+                word,
+            )
+        )
+    _write_srt(path, blocks)
+
+
+def _content_text(items):
+    return " ".join(" ".join(item[2].splitlines()) for item in items)
 
 
 class TestSubtitleService(unittest.TestCase):
@@ -114,46 +155,360 @@ class TestSubtitleService(unittest.TestCase):
         self.assertNotIn("---", corrected_srt)
         self.assertNotIn("00:00:00,000 --> 00:00:00,000", corrected_srt)
 
-    def test_correct_merges_adjacent_subtitles_for_one_script_sentence(self):
-        """
-        Whisper 可能把一句文案拆成多个时间块。校正逻辑应合并时间范围并恢复
-        原始脚本文本，避免最终字幕出现不必要的碎片。
-        """
-        original_srt = (
-            "1\n00:00:00,100 --> 00:00:01,000\nHello\n\n"
-            "2\n00:00:01,000 --> 00:00:02,000\nworld\n\n"
+    def test_correct_exact_match_uses_script_text_and_writes_report(self):
+        original_srt = _srt_block(
+            1,
+            "00:00:00,100",
+            "00:00:02,100",
+            "el nino penso una relacion dificil",
         )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             subtitle_file = Path(tmp_dir) / "subtitle.srt"
-            subtitle_file.write_text(original_srt, encoding="utf-8")
+            _write_srt(subtitle_file, [original_srt])
 
-            subtitle.correct(str(subtitle_file), "Hello world")
+            report = subtitle.correct(
+                str(subtitle_file), "El niño pensó una relación difícil."
+            )
             items = subtitle.file_to_subtitles(str(subtitle_file))
+            report_from_disk = _read_report(subtitle_file)
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0][1], "00:00:00,100 --> 00:00:02,000")
-        self.assertEqual(items[0][2], "Hello world")
+        self.assertEqual(items[0][2], "El niño pensó una relación difícil.")
+        self.assertEqual(report["status"], "ok")
+        self.assertAlmostEqual(report["confidence"], 1.0)
+        self.assertFalse(report["review_required"])
+        self.assertEqual(report_from_disk["status"], "ok")
 
-    def test_correct_replaces_mismatch_and_appends_missing_script_line(self):
-        """
-        转写结果与脚本完全不一致时仍应以脚本为准；脚本多出的句子没有可复用
-        时间轴时使用明确的零时间占位，避免丢失文本且保持现有兼容行为。
-        """
-        original_srt = "1\n00:00:00,100 --> 00:00:01,000\nWrong text\n\n"
+    def test_correct_handles_omitted_word_when_global_coverage_is_high(self):
+        original_srt = _srt_block(
+            1,
+            "00:00:00,000",
+            "00:00:05,000",
+            "Esas personas adultas ahora deciden con calma sobre su futuro",
+        )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             subtitle_file = Path(tmp_dir) / "subtitle.srt"
-            subtitle_file.write_text(original_srt, encoding="utf-8")
+            _write_srt(subtitle_file, [original_srt])
 
-            subtitle.correct(str(subtitle_file), "Expected sentence. Extra sentence.")
+            report = subtitle.correct(
+                str(subtitle_file),
+                "Esas personas ya adultas ahora deciden con calma sobre su futuro.",
+            )
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+            final_srt = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertEqual(report["status"], "ok")
+        self.assertGreaterEqual(report["confidence"], subtitle.GLOBAL_OK_THRESHOLD)
+        self.assertEqual(
+            _content_text(items),
+            "Esas personas ya adultas ahora deciden con calma sobre su futuro.",
+        )
+        self.assertNotIn("00:00:00,000 --> 00:00:00,000", final_srt)
+
+    def test_correct_wrong_word_does_not_shift_later_alignment(self):
+        original_srt = _srt_block(
+            1,
+            "00:00:00,000",
+            "00:00:06,000",
+            "Ella sufrio abandono pero luego encontro apoyo estable y digno",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_srt(subtitle_file, [original_srt])
+
+            report = subtitle.correct(
+                str(subtitle_file),
+                "Ella sufrió abandonó pero luego encontró apoyo estable y digno.",
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertGreaterEqual(report["lines"][0]["coverage"], 0.9)
+
+    def test_correct_added_whisper_word_keeps_later_alignment(self):
+        original_srt = _srt_block(
+            1,
+            "00:00:00,000",
+            "00:00:06,000",
+            "Hoy muy temprano revisamos el plan completo con calma",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_srt(subtitle_file, [original_srt])
+
+            report = subtitle.correct(
+                str(subtitle_file), "Hoy temprano revisamos el plan completo con calma."
+            )
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(_content_text(items), "Hoy temprano revisamos el plan completo con calma.")
+
+    def test_correct_combines_two_whisper_subtitles_for_one_script_line(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_srt(
+                subtitle_file,
+                [
+                    _srt_block(1, "00:00:00,000", "00:00:01,000", "Hello"),
+                    _srt_block(2, "00:00:01,000", "00:00:02,000", "world"),
+                ],
+            )
+
+            report = subtitle.correct(str(subtitle_file), "Hello world.")
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0][1], "00:00:00,000 --> 00:00:02,000")
+        self.assertEqual(items[0][2], "Hello world.")
+
+    def test_correct_splits_one_whisper_subtitle_across_two_script_lines(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_srt(
+                subtitle_file,
+                [_srt_block(1, "00:00:00,000", "00:00:04,000", "First line Second line")],
+            )
+
+            report = subtitle.correct(str(subtitle_file), "First line. Second line.")
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(_content_text(items), "First line. Second line.")
+        self.assertEqual([item[2] for item in items], ["First line.", "Second line."])
+        self.assertEqual(items[0][1], "00:00:00,000 --> 00:00:02,000")
+        self.assertEqual(items[1][1], "00:00:02,000 --> 00:00:04,000")
+
+    def test_semantic_srt_never_outputs_internal_newlines(self):
+        text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
+        whisper = "La fortaleza que un dia te protegio no tiene que convertirse en la prision donde vivas para siempre"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertTrue(items)
+        self.assertTrue(all("\n" not in item[2] for item in items))
+        self.assertEqual(_content_text(items), text)
+
+    def test_semantic_short_text_stays_one_cue(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, "Hola mundo")
+
+            subtitle.correct(str(subtitle_file), "Hola mundo.")
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0][2], "Hola mundo.")
+
+    def test_semantic_two_short_sentences_use_natural_cue_boundary(self):
+        text = "Por eso descansar te da culpa. Recibir te incomoda."
+        whisper = "Por eso descansar te da culpa Recibir te incomoda"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
             items = subtitle.file_to_subtitles(str(subtitle_file))
 
         self.assertEqual(
             [item[2] for item in items],
-            ["Expected sentence", "Extra sentence"],
+            ["Por eso descansar te da culpa.", "Recibir te incomoda."],
         )
-        self.assertEqual(items[1][1], "00:00:00,000 --> 00:00:00,000")
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all("\n" not in item[2] for item in items))
+
+    def test_semantic_long_text_creates_multiple_plain_text_cues(self):
+        text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
+        whisper = "La fortaleza que un dia te protegio no tiene que convertirse en la prision donde vivas para siempre"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertGreater(len(items), 1)
+        self.assertTrue(all("\n" not in item[2] for item in items))
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all(len(item[2]) <= 56 for item in items))
+
+    def test_semantic_long_sentence_splits_without_changing_text(self):
+        text = "¿Te cuesta decir lo que sientes sin preparar antes un discurso completo?"
+        whisper = "Te cuesta decir lo que sientes sin preparar antes un discurso completo"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(
+            [item[2] for item in items],
+            [
+                "¿Te cuesta decir lo",
+                "que sientes sin preparar",
+                "antes un discurso completo?",
+            ],
+        )
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all("\n" not in item[2] for item in items))
+        self.assertEqual(items[0][1], "00:00:00,000 --> 00:00:02,000")
+        self.assertEqual(items[1][1], "00:00:02,000 --> 00:00:04,000")
+
+    def test_semantic_cue_timings_use_first_and_last_aligned_tokens(self):
+        text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
+        whisper = "La fortaleza que un dia te protegio no tiene que convertirse en la prision donde vivas para siempre"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(items[0][1].split(" --> ")[0], "00:00:00,000")
+        first_words = items[0][2].split()
+        expected_end = _srt_time(len(first_words) * 0.5)
+        self.assertEqual(items[0][1].split(" --> ")[1], expected_end)
+
+    def test_semantic_timings_are_monotonic_without_artificial_overlap(self):
+        text = "La fortaleza que un día te protegió no tiene que convertirse en la prisión donde vivas para siempre."
+        whisper = "La fortaleza que un dia te protegio no tiene que convertirse en la prision donde vivas para siempre"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        previous_end = 0
+        for _index, timerange, _text in items:
+            start, end = subtitle._parse_srt_timerange(timerange)
+            self.assertGreaterEqual(start, previous_end)
+            self.assertGreater(end, start)
+            previous_end = end
+
+    def test_semantic_cues_avoid_single_word_segments_when_possible(self):
+        text = "Que pedir algo era molestar. Entonces comenzaste a observar antes de hablar."
+        whisper = "Que pedir algo era molestar Entonces comenzaste a observar antes de hablar"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(
+            [item[2] for item in items],
+            [
+                "Que pedir algo era molestar.",
+                "Entonces comenzaste a",
+                "observar antes de hablar.",
+            ],
+        )
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all("\n" not in item[2] for item in items))
+        for item in items:
+            self.assertGreater(len(item[2].split()), 1)
+
+    def test_semantic_requested_example_splits_into_short_cues(self):
+        text = "Y tú también tienes derecho a construir una vida que no esté organizada alrededor de las necesidades de los demás."
+        whisper = "Y tu tambien tienes derecho a construir una vida que no este organizada alrededor de las necesidades de los demas"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_word_timed_srt(subtitle_file, whisper)
+
+            subtitle.correct(str(subtitle_file), text)
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertGreater(len(items), 2)
+        self.assertEqual(_content_text(items), text)
+        self.assertTrue(all("\n" not in item[2] for item in items))
+        self.assertTrue(all(len(item[2]) <= 48 for item in items))
+
+    def test_semantic_compound_token_alignment_still_passes(self):
+        original_srt = _srt_block(
+            1,
+            "00:00:00,000",
+            "00:00:02,000",
+            "Por eso descansarte da culpa recibirte incomoda",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_srt(subtitle_file, [original_srt])
+
+            report = subtitle.correct(
+                str(subtitle_file),
+                "Por eso descansar te da culpa. Recibir te incomoda.",
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertGreaterEqual(report["confidence"], subtitle.GLOBAL_OK_THRESHOLD)
+
+    def test_semantic_alignment_thresholds_remain_unchanged(self):
+        self.assertEqual(subtitle.GLOBAL_OK_THRESHOLD, 0.90)
+        self.assertEqual(subtitle.LINE_MIN_COVERAGE, 0.40)
+
+    def test_correct_low_confidence_keeps_raw_whisper_and_requires_review(self):
+        original_srt = _srt_block(
+            1,
+            "00:00:00,100",
+            "00:00:01,000",
+            "Completely different audio",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_srt(subtitle_file, [original_srt])
+
+            report = subtitle.correct(
+                str(subtitle_file),
+                "Expected sentence with many unrelated canonical script words.",
+            )
+            final_srt = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertEqual(report["status"], "review_required")
+        self.assertTrue(report["review_required"])
+        self.assertEqual(final_srt, original_srt)
+        self.assertNotIn("Expected sentence", final_srt)
+
+    def test_correct_writes_exact_raw_backup(self):
+        original_srt = _srt_block(1, "00:00:00,000", "00:00:01,000", "Hello world")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            raw_file = Path(tmp_dir) / "subtitle.raw.srt"
+            _write_srt(subtitle_file, [original_srt])
+
+            subtitle.correct(str(subtitle_file), "Hello world.")
+
+            self.assertEqual(raw_file.read_text(encoding="utf-8"), original_srt)
+
+    def test_correct_outputs_monotonic_timings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            _write_srt(
+                subtitle_file,
+                [_srt_block(1, "00:00:00,000", "00:00:04,000", "One two three four")],
+            )
+
+            report = subtitle.correct(str(subtitle_file), "One two. Three four.")
+
+        self.assertEqual(report["status"], "ok")
+        previous_end = 0
+        for line in report["lines"]:
+            self.assertIsNotNone(line["start"])
+            self.assertIsNotNone(line["end"])
+            self.assertGreater(line["end"], line["start"])
+            self.assertGreaterEqual(line["start"], previous_end)
+            previous_end = line["end"]
 
     def test_file_to_subtitles_keeps_last_block_without_trailing_newline(self):
         """

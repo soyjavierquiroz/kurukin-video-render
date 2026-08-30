@@ -508,16 +508,27 @@ def save_config():
                 if f.read() == serialized_config:
                     _cfg.clear()
                     _cfg.update(config_to_save)
-                    return
-        except (OSError, UnicodeError):
+                    return True
+        except OSError as exc:
+            if exc.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
+                logger.warning(
+                    "config file is not writable; skipping save_config: "
+                    f"{config_file}"
+                )
+                return False
+            if exc.errno != errno.ENOENT:
+                raise
+        except UnicodeError:
             pass
 
         temp_path = ""
+        save_result = True
         try:
+            target_dir = os.path.dirname(os.path.abspath(config_file))
             fd, temp_path = tempfile.mkstemp(
                 prefix=".config-",
                 suffix=".toml.tmp",
-                dir=root_dir,
+                dir=target_dir,
             )
             with os.fdopen(fd, mode="w", encoding="utf-8") as f:
                 f.write(serialized_config)
@@ -539,9 +550,32 @@ def save_config():
                     os.fsync(f.fileno())
             _cfg.clear()
             _cfg.update(config_to_save)
+        except OSError as exc:
+            # An immutable or permission-restricted bind mount must not take
+            # down the running application.  EBUSY is handled above with the
+            # upstream in-place fallback; these errors mean that neither write
+            # strategy is permitted.
+            if exc.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
+                logger.warning(
+                    "config file is not writable; skipping save_config: "
+                    f"{config_file}"
+                )
+                return False
+            raise
         finally:
             if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except OSError as exc:
+                    if exc.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
+                        logger.warning(
+                            "failed to clean temporary config file; "
+                            f"skipping cleanup: {temp_path}"
+                        )
+                        save_result = False
+                    else:
+                        raise
+        return save_result
 
 
 _cfg = load_config()

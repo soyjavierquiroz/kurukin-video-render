@@ -1,17 +1,41 @@
+import json
 import math
 import os
 import re
+import shutil
 import socket
 import threading
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from functools import partial
 from os import path
+from pathlib import Path
 from uuid import uuid4
 
 from loguru import logger
 
 from app.config import config
+from app.custom import asset_hub_manifest
+from app.custom import human_review
+from app.custom.kurukin_asset_hub import KurukinAssetHubUnavailableError
+from app.custom.material_acquisition import acquire_selected_materials
+from app.custom.material_discovery import (
+    MaterialDiscoveryResult,
+    discover_asset_hub_review_reserve_candidates,
+    discover_asset_hub_title_fallback_candidates,
+    discover_material_candidates,
+    provider_diagnostics_for_review,
+)
+from app.custom.material_selection import (
+    empty_material_selection_result,
+    select_material_candidates,
+)
+from app.custom.material_source_policy import (
+    PROVIDER_ASSET_HUB,
+    build_discovery_plan,
+    material_source_policy_from_dict,
+)
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
@@ -30,6 +54,241 @@ from app.services import (
 from app.services import upload_post
 from app.services import state as sm
 from app.utils import file_security, utils
+
+
+def _ensure_material_service_contract() -> None:
+    if hasattr(material, "record_external_asset_usage"):
+        return
+
+    source_rotation = ("pexels", "pixabay", "coverr")
+    external_providers = set(source_rotation)
+    recent_limit = 200
+    history_file = utils.storage_dir(
+        os.path.join("asset_usage", "external_assets_used.jsonl")
+    )
+
+    def parse_material_sources(source: str) -> tuple[str, ...]:
+        source_value = (source or "pexels").strip().lower()
+        if source_value == "mixed":
+            return source_rotation
+        sources = tuple(
+            item.strip().lower()
+            for item in source_value.split(",")
+            if item.strip()
+        )
+        if not sources:
+            return ("pexels",)
+        invalid_sources = [item for item in sources if item not in source_rotation]
+        if invalid_sources:
+            raise ValueError(
+                f"unsupported video source: {', '.join(invalid_sources)}. "
+                f"Expected one or more of: {', '.join(source_rotation)}, mixed, local."
+            )
+        deduped_sources = []
+        for item in sources:
+            if item not in deduped_sources:
+                deduped_sources.append(item)
+        return tuple(deduped_sources)
+
+    def rotated_material_sources(source: str, index: int) -> tuple[str, ...]:
+        sources = parse_material_sources(source)
+        if len(sources) <= 1:
+            return sources
+        offset = index % len(sources)
+        return sources[offset:] + sources[:offset]
+
+    def _search_videos_for_source(provider: str):
+        return getattr(material, f"search_videos_{provider}")
+
+    def _search_videos_with_cache(
+        provider,
+        search_videos,
+        search_term,
+        minimum_duration,
+        video_aspect,
+    ):
+        return search_videos(
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            video_aspect=video_aspect,
+        )
+
+    def search_videos_with_fallback(
+        search_term: str,
+        minimum_duration: int,
+        video_aspect=None,
+        source: str = "pexels",
+        index: int = 0,
+    ):
+        for provider in material.rotated_material_sources(source, index):
+            try:
+                video_items = material._search_videos_with_cache(
+                    provider,
+                    material._search_videos_for_source(provider),
+                    search_term,
+                    minimum_duration,
+                    video_aspect,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"video source '{provider}' failed for '{search_term}', trying next source: {str(exc)}"
+                )
+                continue
+            if video_items:
+                return video_items, provider
+            logger.info(
+                f"video source '{provider}' returned no videos for '{search_term}'"
+            )
+        return [], ""
+
+    def _asset_provider(item) -> str:
+        provider = (getattr(item, "provider", "") or "").strip().lower()
+        return provider if provider in external_providers else "unknown"
+
+    def _asset_id(item) -> str:
+        for attr_name in (
+            "asset_id",
+            "video_id",
+            "pexels_video_id",
+            "pixabay_video_id",
+            "coverr_video_id",
+            "id",
+        ):
+            value = getattr(item, attr_name, "")
+            if value not in (None, ""):
+                return str(value)
+        source_info = getattr(item, "source_info", None)
+        if isinstance(source_info, dict):
+            value = source_info.get("asset_id", "")
+            if value not in (None, ""):
+                return str(value)
+        return ""
+
+    def _asset_url(item) -> str:
+        return str(getattr(item, "url", "") or "")
+
+    def external_asset_identity(item) -> tuple[str, str, str]:
+        provider = _asset_provider(item)
+        asset_id = _asset_id(item)
+        url = _asset_url(item)
+        if asset_id:
+            return provider, "id", asset_id
+        if url:
+            return provider, "url", url
+        return provider, "path", str(getattr(item, "path", "") or "")
+
+    def _external_asset_identity_key(item) -> str:
+        provider, identity_type, identity_value = external_asset_identity(item)
+        if not identity_value:
+            return ""
+        return f"{provider}:{identity_type}:{identity_value}"
+
+    def _recent_external_asset_keys(history_file_override: str = history_file):
+        if not os.path.exists(history_file_override):
+            return set()
+        entries = []
+        try:
+            with open(history_file_override, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as exc:
+            logger.warning(
+                f"failed to read external asset usage history: {str(exc)}"
+            )
+            return set()
+        keys = set()
+        for entry in entries[-recent_limit:]:
+            provider = (entry.get("provider") or "unknown").strip().lower()
+            asset_id = str(entry.get("asset_id") or "")
+            url = str(entry.get("url") or "")
+            path_value = str(entry.get("path") or "")
+            if asset_id:
+                keys.add(f"{provider}:id:{asset_id}")
+            if url:
+                keys.add(f"{provider}:url:{url}")
+            if path_value:
+                keys.add(f"{provider}:path:{path_value}")
+        return keys
+
+    def is_recent_external_asset(item, history_file: str = history_file) -> bool:
+        identity_key = _external_asset_identity_key(item)
+        if not identity_key:
+            return False
+        return identity_key in _recent_external_asset_keys(history_file)
+
+    def filter_recent_external_assets(items, history_file: str = history_file):
+        if not items:
+            return [], False
+        recent_keys = _recent_external_asset_keys(history_file)
+        fresh_items = [
+            item
+            for item in items
+            if _external_asset_identity_key(item) not in recent_keys
+        ]
+        if fresh_items:
+            return fresh_items, False
+        return items, True
+
+    def record_external_asset_usage(
+        item,
+        task_id: str,
+        subject: str = "",
+        dedup_fallback: bool = False,
+        history_file: str = history_file,
+    ) -> None:
+        provider = _asset_provider(item)
+        if provider not in external_providers:
+            return
+        asset_id = _asset_id(item)
+        url = _asset_url(item)
+        if not asset_id and not url and not getattr(item, "path", ""):
+            return
+        payload = {
+            "provider": provider,
+            "asset_id": asset_id,
+            "url": url,
+            "task_id": str(task_id or ""),
+            "subject": str(subject or ""),
+            "used_at": datetime.now(timezone.utc).isoformat(),
+            "transform": "none",
+        }
+        if dedup_fallback:
+            payload["dedup_fallback"] = True
+        try:
+            os.makedirs(os.path.dirname(history_file), exist_ok=True)
+            with open(history_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning(
+                f"failed to write external asset usage history: {str(exc)}"
+            )
+
+    material.ASSET_USAGE_HISTORY_FILE = history_file
+    material._ASSET_USAGE_RECENT_LIMIT = recent_limit
+    material._EXTERNAL_ASSET_PROVIDERS = external_providers
+    material._asset_provider = _asset_provider
+    material._asset_id = _asset_id
+    material._asset_url = _asset_url
+    material._external_asset_identity_key = _external_asset_identity_key
+    material._recent_external_asset_keys = _recent_external_asset_keys
+    material._search_videos_for_source = _search_videos_for_source
+    material._search_videos_with_cache = _search_videos_with_cache
+    material.parse_material_sources = parse_material_sources
+    material.rotated_material_sources = rotated_material_sources
+    material.search_videos_with_fallback = search_videos_with_fallback
+    material.is_recent_external_asset = is_recent_external_asset
+    material.external_asset_identity = external_asset_identity
+    material.filter_recent_external_assets = filter_recent_external_assets
+    material.record_external_asset_usage = record_external_asset_usage
+
+
+_ensure_material_service_contract()
 
 
 # 发布请求最长可等待数分钟，不能继续占用视频生成任务的并发名额。
@@ -553,6 +812,129 @@ def generate_audio(
         return custom_audio_file, audio_duration, None
 
 
+def apply_asset_hub_renderer_manifest(params: VideoParams) -> dict | None:
+    manifest_path = (
+        getattr(params, "asset_hub_renderer_manifest_path", "") or ""
+    ).strip()
+    if not manifest_path:
+        return None
+
+    scene_mode = (
+        getattr(params, "asset_hub_scene_mode", "ordered") or "ordered"
+    ).strip()
+    if scene_mode != "ordered":
+        raise ValueError("asset_hub_scene_mode only supports 'ordered' for MVP")
+
+    manifest = asset_hub_manifest.load_asset_hub_renderer_manifest(manifest_path)
+    asset_hub_manifest.validate_asset_hub_renderer_manifest(manifest)
+
+    expected_bundle_uid = (
+        getattr(params, "asset_hub_bundle_uid", "") or ""
+    ).strip()
+    manifest_bundle_uid = manifest.get("bundle_uid")
+    if expected_bundle_uid and expected_bundle_uid != manifest_bundle_uid:
+        raise ValueError(
+            "asset_hub_bundle_uid does not match renderer manifest bundle_uid: "
+            f"{expected_bundle_uid!r} != {manifest_bundle_uid!r}"
+        )
+
+    if getattr(params, "video_materials", None):
+        logger.info(
+            "asset hub renderer manifest replaces provided video_materials "
+            "for this MVP"
+        )
+
+    materials = asset_hub_manifest.convert_asset_hub_manifest_to_materials(
+        manifest,
+        strict=bool(getattr(params, "asset_hub_strict", True)),
+    )
+    summary = asset_hub_manifest.summarize_asset_hub_manifest(manifest)
+    logger.info(
+        "asset hub manifest loaded: "
+        f"bundle_uid={summary.get('bundle_uid')}, "
+        f"scenes={summary.get('total_scenes')}, "
+        f"assets={summary.get('total_assets')}"
+    )
+    for warning in asset_hub_manifest.collect_asset_hub_render_warnings(manifest):
+        logger.warning(f"asset hub warning: {warning}")
+
+    params.video_source = "local"
+    params.video_materials = materials
+    params.video_terms = []
+    logger.info(
+        "asset hub materials applied: "
+        f"count={len(materials)}, video_source={params.video_source}"
+    )
+    return summary
+
+
+def resolve_custom_subtitle_file(custom_subtitle_file: str, task_dir: str) -> str:
+    requested_file = (custom_subtitle_file or "").strip()
+    if not requested_file:
+        return ""
+
+    if path.splitext(requested_file)[1].lower() != ".srt":
+        raise ValueError("custom subtitle file must use .srt extension")
+
+    try:
+        return file_security.resolve_path_within_directory(
+            task_dir,
+            requested_file,
+        )
+    except ValueError as exc:
+        task_dir_error = exc
+
+    server_subtitle_file = path.realpath(
+        requested_file
+        if path.isabs(requested_file)
+        else path.join(utils.root_dir(), requested_file)
+    )
+    project_root = path.realpath(utils.root_dir())
+    try:
+        if path.commonpath([project_root, server_subtitle_file]) != project_root:
+            raise ValueError("custom subtitle file must be task-local or an existing project file")
+    except ValueError as exc:
+        raise ValueError(
+            "custom subtitle file must be task-local or an existing project file"
+        ) from exc
+
+    if not path.isfile(server_subtitle_file):
+        raise ValueError(
+            "custom subtitle file does not exist or is not a file"
+        ) from task_dir_error
+
+    return server_subtitle_file
+
+
+def resolve_subtitle_provider(params) -> str:
+    requested = (getattr(params, "subtitle_provider", "") or "").strip().lower()
+    provider = requested or (config.app.get("subtitle_provider", "edge") or "").strip().lower()
+    if not provider:
+        return ""
+    if provider not in {"edge", "whisper"}:
+        raise ValueError(
+            f"Unsupported subtitle_provider '{provider}'. Expected 'edge' or 'whisper'."
+        )
+    return provider
+
+
+def optimize_subtitle_if_enabled(subtitle_path: str, params):
+    if not getattr(params, "subtitle_optimization_enabled", True):
+        logger.info("subtitle optimizer skipped by request")
+        return None
+    try:
+        from app.custom.subtitle_optimizer import optimize_srt_file
+
+        optimize_result = optimize_srt_file(
+            subtitle_path=subtitle_path,
+            aspect=getattr(params, "video_aspect", "9:16"),
+        )
+        logger.info(f"subtitle optimizer result: {optimize_result}")
+        return optimize_result
+    except Exception as exc:
+        logger.warning(f"subtitle optimizer skipped: {str(exc)}")
+        return None
+
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     """
     Generate subtitle for the video script.
@@ -565,8 +947,33 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     if not params.subtitle_enabled:
         return ""
 
-    subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
-    subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
+    task_dir = utils.task_dir(task_id)
+    subtitle_path = path.join(task_dir, "subtitle.srt")
+    requested_custom = getattr(params, "custom_subtitle_file", "").strip()
+    if requested_custom:
+        try:
+            custom_file = resolve_custom_subtitle_file(requested_custom, task_dir)
+        except ValueError as exc:
+            logger.error(
+                "custom subtitle file is invalid, "
+                f"task_id: {task_id}, path: {requested_custom}, error: {str(exc)}"
+            )
+            _mark_task_failed(
+                task_id,
+                "subtitle",
+                f"invalid custom subtitle file: {exc}",
+            )
+            return ""
+
+        logger.info(f"using custom subtitle file: {custom_file}")
+        shutil.copyfile(custom_file, subtitle_path)
+        optimize_subtitle_if_enabled(subtitle_path, params)
+        subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
+        if not subtitle_lines:
+            logger.warning(f"subtitle file is invalid: {subtitle_path}")
+            return ""
+        return subtitle_path
+    subtitle_provider = resolve_subtitle_provider(params)
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
 
     if not subtitle_provider:
@@ -600,8 +1007,19 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     if subtitle_provider == "whisper":
         subtitle.create(audio_file=audio_file, subtitle_file=subtitle_path)
-        logger.info("\n\n## correcting subtitle")
-        subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+        if getattr(params, "subtitle_correction_enabled", True):
+            logger.info("\n\n## correcting subtitle")
+            alignment_result = subtitle.correct(
+                subtitle_file=subtitle_path, video_script=video_script
+            )
+            logger.info(
+                "subtitle alignment result, "
+                f"status: {alignment_result.get('status')}, "
+                f"confidence: {alignment_result.get('confidence')}, "
+                f"review_required: {alignment_result.get('review_required')}"
+            )
+
+    optimize_subtitle_if_enabled(subtitle_path, params)
 
     subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
     if not subtitle_lines:
@@ -621,7 +1039,13 @@ def get_video_materials(
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+            materials=params.video_materials,
+            clip_duration=params.video_clip_duration,
+            video_aspect=params.video_aspect,
+            video_resolution=params.video_resolution,
+            image_motion_enabled=params.image_motion_enabled,
+            image_motion_preset=params.image_motion_preset,
+            image_motion_intensity=params.image_motion_intensity,
         )
         if not materials:
             _mark_task_failed(
@@ -763,6 +1187,346 @@ def _record_loomloom_run_reference(
     return None
 
 
+def _select_autonomous_materials(task_id, params, video_terms, audio_duration, video_script: str = ""):
+    """Run discovery and ranking without materializing selected assets."""
+    policy = material_source_policy_from_dict(params.material_source_policy)
+    is_human_review = bool(getattr(params, "human_review", None))
+    # Keep established V1 multi-provider discovery and selection for open
+    # policies (including GENERALES). Human Review applies the common V2
+    # editorial ranking later, after candidates have been normalized.
+    is_asset_hub_only_review = (
+        is_human_review
+        and policy.providers.enabled == (PROVIDER_ASSET_HUB,)
+    )
+    if is_asset_hub_only_review:
+        # Review derives cadence from audio/clip duration and discovers its
+        # candidate pool exclusively from the V2 reserve below.
+        discovery = MaterialDiscoveryResult((), (), (), (), {"stock": (), "asset_hub": ()})
+    else:
+        # Human Review retrieval is scene-driven, not driven by the LLM's
+        # broad video terms.  Keep provider implementations untouched; this
+        # only supplies their normal discovery API with provider-local forms.
+        if is_human_review and video_script:
+            segment_count = max(1, int(math.ceil(max(float(audio_duration or 0), params.video_clip_duration) / params.video_clip_duration)))
+            query_maps = human_review.retrieval_queries_for_review_segments(
+                video_script, segment_count, getattr(params, "editorial_profile", None) or {},
+            )
+            stock_terms = tuple(dict.fromkeys(
+                query for item in query_maps for provider in ("pexels", "pixabay", "coverr")
+                for query in item.get(provider, ())
+            ))
+            asset_hub_terms = tuple(dict.fromkeys(
+                query for item in query_maps for query in item.get("asset_hub", ())
+            ))
+        else:
+            stock_terms = video_terms
+            asset_hub_terms = params.asset_hub_terms or None
+        discovery = discover_material_candidates(
+            policy=policy,
+            stock_terms=stock_terms,
+            asset_hub_terms=asset_hub_terms,
+            video_aspect=params.video_aspect,
+            minimum_duration=params.video_clip_duration,
+        )
+
+    target_duration = audio_duration
+    if target_duration <= 0:
+        target_duration = max(
+            params.video_clip_duration,
+            len(video_terms) * params.video_clip_duration,
+        )
+    recent_keys = material.recent_external_asset_keys() if not is_asset_hub_only_review else ()
+    selection = (
+        empty_material_selection_result(
+            video_aspect=params.video_aspect,
+            target_duration=target_duration,
+            clip_duration=params.video_clip_duration,
+        )
+        if is_asset_hub_only_review
+        else select_material_candidates(
+            discovery_result=discovery,
+            video_aspect=params.video_aspect,
+            target_duration=target_duration,
+            clip_duration=params.video_clip_duration,
+            recent_dedupe_keys=recent_keys,
+        )
+    )
+    if selection.shortfall > 0 and not is_asset_hub_only_review:
+        title_fallback = discover_asset_hub_title_fallback_candidates(
+            policy=policy,
+            video_aspect=params.video_aspect,
+        )
+        if title_fallback.candidates:
+            discovery = MaterialDiscoveryResult(
+                candidates=tuple(getattr(discovery, "candidates", ()) or ()) + title_fallback.candidates,
+                diagnostics=tuple(getattr(discovery, "diagnostics", ()) or ()) + title_fallback.diagnostics,
+                providers_attempted=tuple(dict.fromkeys(
+                    tuple(getattr(discovery, "providers_attempted", ()) or ()) + title_fallback.providers_attempted
+                )),
+                providers_succeeded=tuple(dict.fromkeys(
+                    tuple(getattr(discovery, "providers_succeeded", ()) or ()) + title_fallback.providers_succeeded
+                )),
+                terms_used=getattr(discovery, "terms_used", {"stock": tuple(video_terms), "asset_hub": tuple(params.asset_hub_terms or video_terms)}),
+            )
+            selection = select_material_candidates(
+                discovery_result=discovery,
+                video_aspect=params.video_aspect,
+                target_duration=target_duration,
+                clip_duration=params.video_clip_duration,
+                recent_dedupe_keys=recent_keys,
+            )
+    # Human Review requires many more candidates than
+    # autonomous rendering. PRIMARY selection is already frozen
+    # above; everything added here is suggestions/backups only.
+    if is_asset_hub_only_review:
+        segment_queries = (
+            human_review.visual_queries_for_review_segments(
+                video_script,
+                max(
+                    len(getattr(selection, "decisions", ()) or ()),
+                    int(getattr(selection, "target_count", 0) or 0),
+                ),
+                tuple(params.asset_hub_terms or video_terms),
+                getattr(params, "editorial_profile", None) or {},
+            )
+            if video_script
+            else []
+        )
+        review_terms = tuple(
+            dict.fromkeys(
+                query
+                for queries in segment_queries
+                for query in queries
+                if str(query or "").strip()
+            )
+        ) or tuple(
+            params.asset_hub_terms or video_terms
+        )
+
+        semantic_reserve = (
+            discover_asset_hub_review_reserve_candidates(
+                policy=policy,
+                terms=review_terms,
+                video_aspect=params.video_aspect,
+                limit_per_term=100,
+                queries_are_visual=True,
+            )
+        )
+
+        merged_candidates = []
+        seen_dedupe_keys = set()
+
+        candidate_sources = (
+            tuple(
+                getattr(
+                    discovery,
+                    "candidates",
+                    (),
+                )
+                or ()
+            )
+            + tuple(semantic_reserve.candidates)
+        )
+
+        for candidate in candidate_sources:
+            key = str(
+                getattr(
+                    candidate,
+                    "dedupe_key",
+                    "",
+                )
+                or getattr(
+                    candidate,
+                    "canonical_id",
+                    "",
+                )
+                or ""
+            )
+
+            if not key or key in seen_dedupe_keys:
+                continue
+
+            seen_dedupe_keys.add(key)
+            merged_candidates.append(candidate)
+
+        discovery = MaterialDiscoveryResult(
+            candidates=tuple(merged_candidates),
+            diagnostics=(
+                tuple(
+                    getattr(
+                        discovery,
+                        "diagnostics",
+                        (),
+                    )
+                    or ()
+                )
+                + tuple(
+                    semantic_reserve.diagnostics
+                )
+            ),
+            providers_attempted=tuple(
+                dict.fromkeys(
+                    tuple(
+                        getattr(
+                            discovery,
+                            "providers_attempted",
+                            (),
+                        )
+                        or ()
+                    )
+                    + tuple(
+                        semantic_reserve.providers_attempted
+                    )
+                )
+            ),
+            providers_succeeded=tuple(
+                dict.fromkeys(
+                    tuple(
+                        getattr(
+                            discovery,
+                            "providers_succeeded",
+                            (),
+                        )
+                        or ()
+                    )
+                    + tuple(
+                        semantic_reserve.providers_succeeded
+                    )
+                )
+            ),
+            terms_used=getattr(
+                discovery,
+                "terms_used",
+                {
+                    "stock": tuple(video_terms),
+                    "asset_hub": review_terms,
+                },
+            ),
+        )
+
+        logger.info(
+            "human review reserve pool expanded: "
+            f"{len(discovery.candidates)} "
+            "unique candidates"
+        )
+
+    return discovery, selection
+
+
+def _human_review_plan_has_usable_candidates(plan: dict, target_count: int) -> bool:
+    """Reject a review plan that would otherwise complete with no choices."""
+    if target_count <= 0:
+        return True
+    for segment in plan.get("segments", ()) or ():
+        candidates = [segment.get("selected_asset")] + list(segment.get("alternatives", ()) or ())
+        if any(
+            isinstance(candidate, dict)
+            and str(candidate.get("asset_uid") or candidate.get("canonical_id") or candidate.get("url") or "").strip()
+            for candidate in candidates
+        ):
+            return True
+    return False
+
+
+def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) -> str | None:
+    """Materialize policy-selected assets into the normal local-material path."""
+    discovery, selection = _select_autonomous_materials(
+        task_id, params, video_terms, audio_duration
+    )
+    if not selection.decisions:
+        return "No usable visual materials found"
+    if selection.shortfall > 0:
+        logger.warning(
+            "autonomous material selection shortfall: "
+            f"selected={selection.selected_count}, shortfall={selection.shortfall}"
+        )
+    acquisition = acquire_selected_materials(
+        selection_result=selection,
+        task_id=task_id,
+    )
+    params.video_source = "local"
+    params.video_materials = list(acquisition.materials)
+    return None
+
+
+def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio_file, audio_duration):
+    if params.material_source_policy is None:
+        return _mark_task_failed(
+            task_id,
+            "review",
+            "human review requires material_source_policy selection",
+        )
+    try:
+        discovery, selection = _select_autonomous_materials(
+            task_id, params, video_terms, audio_duration, video_script
+        )
+    except KurukinAssetHubUnavailableError:
+        # The host-owned review preparation record recognizes this as
+        # transient and moves it to retry_wait.  Do not convert it to a
+        # completed task with a missing plan.
+        raise
+    except Exception as exc:
+        return _mark_task_failed(task_id, "materials", str(exc))
+    if not selection.decisions and not getattr(params, "human_review", None):
+        return _mark_task_failed(task_id, "materials", "No usable visual materials found")
+
+    review = getattr(params, "human_review", None) or {}
+    policy = material_source_policy_from_dict(params.material_source_policy)
+    discovery_plan = build_discovery_plan(policy)
+    output_path = Path(review.get("production_plan_path") or human_review.plan_path(
+        str(review.get("batch_id") or "batch"),
+        str(review.get("stem") or task_id),
+    ))
+    plan = human_review.build_plan(
+        batch_id=str(review.get("batch_id") or "batch"),
+        task_id=task_id,
+        stem=str(review.get("stem") or task_id),
+        audio_path=str(review.get("audio_path") or audio_file),
+        script_path=str(review.get("script_path") or ""),
+        script_text=video_script,
+        duration=float(audio_duration or 0),
+        aspect_ratio=str(params.video_aspect),
+        visual_style=str(review.get("visual_style") or "none"),
+        editorial_profile=(
+            getattr(params, "editorial_profile", None)
+            or review.get("editorial_profile")
+            or {}
+        ),
+        material_source_policy=params.material_source_policy or {},
+        asset_hub_source_policy=(
+            discovery_plan.get("asset_hub", {}).get("source_policy")
+            or {}
+        ),
+        material_title=str(review.get("material_title") or ""),
+        source_policy=str(review.get("source_policy") or ""),
+        provider_diagnostics=provider_diagnostics_for_review(
+            discovery,
+            enabled_providers=policy.providers.enabled,
+            selection=selection,
+        ),
+        selection_result=selection,
+        discovery_result=discovery,
+        output_path=output_path,
+    )
+    if not _human_review_plan_has_usable_candidates(
+        plan,
+        int(getattr(selection, "target_count", 0) or 0),
+    ):
+        return _mark_task_failed(
+            task_id,
+            "review",
+            "human review preparation produced no usable candidates",
+        )
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_COMPLETE,
+        progress=100,
+        review_status=human_review.STATUS_PENDING,
+        production_plan_path=output_path.as_posix(),
+    )
+    return {"production_plan_path": output_path.as_posix(), "review_status": plan.get("review_status")}
+
+
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
 ):
@@ -801,6 +1565,7 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            video_resolution=params.video_resolution,
         )
 
         _progress += 50 / params.video_count / 2
@@ -1290,6 +2055,8 @@ def _run_pipeline(
         )
         return {"script": video_script}
 
+    apply_asset_hub_renderer_manifest(params)
+
     # 2. Generate terms
     video_terms = ""
     if params.video_source != "local":
@@ -1337,6 +2104,16 @@ def _run_pipeline(
         )
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
+    if stop_at == "review":
+        return _prepare_human_review_plan(
+            task_id,
+            params,
+            video_script,
+            video_terms,
+            audio_file,
+            audio_duration,
+        )
+
     # 4. Generate subtitle
     subtitle_path = generate_subtitle(
         task_id, params, video_script, sub_maker, audio_file
@@ -1354,6 +2131,18 @@ def _run_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
+    explicit_asset_hub_manifest = bool(
+        (getattr(params, "asset_hub_renderer_manifest_path", "") or "").strip()
+    )
+    if params.material_source_policy is not None and not explicit_asset_hub_manifest:
+        try:
+            autonomous_error = _prepare_autonomous_materials(
+                task_id, params, video_terms, audio_duration
+            )
+        except Exception as exc:
+            return _mark_task_failed(task_id, "materials", str(exc))
+        if autonomous_error:
+            return _mark_task_failed(task_id, "materials", autonomous_error)
     downloaded_videos = get_video_materials(
         task_id,
         params,
