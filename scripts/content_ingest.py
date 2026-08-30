@@ -206,12 +206,15 @@ def ingest_content(
     script_path = job_dir / "script.txt"
 
     if job_dir.exists() and not metadata_path.is_file():
-        raise ContentIngestError(f"content job directory exists without content.json: {job_dir}")
+        # The asynchronous API writes this durable command before ingest.
+        # No other partial content-job layout is safe to adopt.
+        if {entry.name for entry in job_dir.iterdir()} != {"review-preparation.json"}:
+            raise ContentIngestError(f"content job directory exists without content.json: {job_dir}")
     existing = metadata_path.is_file()
     if existing:
         _existing_identity(metadata_path, audio_file_id, script_file_id, asset_profile)
     else:
-        job_dir.mkdir(parents=True, exist_ok=False)
+        job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         if not (audio_path.is_file() and script_path.is_file()):
@@ -259,12 +262,25 @@ def ingest_content(
         return metadata
     except ContentIngestError:
         if not existing:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            _remove_incomplete_ingest_artifacts(job_dir)
         raise
     except Exception as exc:
         if not existing:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            _remove_incomplete_ingest_artifacts(job_dir)
         raise ContentIngestError("content ingest failed before content.json was committed") from exc
+
+
+def _remove_incomplete_ingest_artifacts(job_dir: Path) -> None:
+    """Retain the durable async command while clearing failed download residue."""
+    if not job_dir.exists():
+        return
+    for child in job_dir.iterdir():
+        if child.name == "review-preparation.json":
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -11,9 +11,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import subprocess
-import sys
-import threading
 import time
 from typing import Any
 from urllib.parse import quote
@@ -24,15 +21,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.custom import human_review
-from scripts import content_delivery, content_ingest, create_content_job_review, nightly_runner
+from scripts import content_delivery, content_ingest, create_content_job_review, nightly_runner, review_preparation
 from scripts.niche_registry import NicheRegistryError, enabled_niches, load_niche
 
 
 LOG = logging.getLogger(__name__)
 app = FastAPI(title="MPT internal automation API", docs_url=None, redoc_url=None, openapi_url=None)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_nightly_launch_lock = threading.Lock()
-_nightly_process: subprocess.Popen[bytes] | None = None
 CANONICAL_SHEET_STATUSES = frozenset({
     "DRAFT", "READY", "PREPARING_REVIEW", "HUMAN_REVIEW_READY",
     "PRODUCTION_READY", "QUEUED_NIGHT", "PRODUCING", "COMPLETED", "ERROR",
@@ -54,6 +49,7 @@ class ReviewRequest(BaseModel):
 
 class ScheduleRequest(BaseModel):
     run_mode: str
+    retry: bool = False
 
     class Config:
         extra = "forbid"
@@ -69,6 +65,13 @@ class ReconcileRequest(BaseModel):
     script_file_id: str | None = None
     asset_profile: str | None = None
     cleanup_approved: bool | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class NicheRequest(BaseModel):
+    niche_id: str = Field(min_length=1)
 
     class Config:
         extra = "forbid"
@@ -129,51 +132,9 @@ def _read_optional_object(path: Path) -> dict[str, Any] | None:
 
 
 def _plan_provenance_matches(plan: dict[str, Any], metadata: dict[str, Any], content_id: str) -> bool:
-    """Verify that a review plan belongs to one immutable content job.
-
-    Legacy plans persist a content-job provenance snapshot.  Current automation
-    plans intentionally do not, so their canonical batch identity and source
-    artifact paths provide the equivalent proof.  A batch_id alone is never
-    sufficient evidence.
-    """
-    provenance = plan.get("content_job")
-    if isinstance(provenance, dict):
-        if provenance.get("content_id") != content_id:
-            return False
-        fields = (
-            "niche_id", "asset_profile", "audio_sha256", "script_sha256",
-            "resolved_asset_policy",
-        )
-        return all(provenance.get(field) == metadata.get(field) for field in fields)
-
-    # Only an omitted/null content_job denotes the current format.  Other
-    # malformed legacy provenance must not silently fall through to it.
-    if provenance is not None:
-        return False
-
-    niche_id = metadata.get("niche_id")
-    if not isinstance(niche_id, str) or not niche_id:
-        return False
-    if plan.get("batch_id") != content_id:
-        return False
-    try:
-        batch_id = create_content_job_review.deterministic_batch_id(niche_id, content_id)
-    except (TypeError, ValueError, create_content_job_review.ContentJobReviewError):
-        return False
-    task_id = plan.get("task_id")
-    if not isinstance(task_id, str) or not task_id.startswith(f"batch-{batch_id}-"):
-        return False
-
-    def has_canonical_suffix(value: Any, filename: str) -> bool:
-        if not isinstance(value, str):
-            return False
-        normalized = value.replace("\\", "/").rstrip("/")
-        suffix = f"/storage/content_jobs/{niche_id}/{content_id}/{filename}"
-        return normalized.endswith(suffix)
-
-    return (
-        has_canonical_suffix(plan.get("audio_path"), "source.mp3")
-        and has_canonical_suffix(plan.get("script_path"), "script.txt")
+    """Compatibility wrapper for the shared review-plan identity proof."""
+    return create_content_job_review.plan_identity_matches_content_job(
+        plan, metadata, content_id,
     )
 
 
@@ -305,14 +266,43 @@ def _write_schedule_record(path: Path, payload: dict[str, Any]) -> None:
     human_review.write_json_atomic(path, payload)
 
 
-def _launch_immediate_production(schedule_record: Path) -> None:
-    """Detach the canonical approved-plan producer from the API request."""
-    subprocess.Popen(
-        [sys.executable, "-m", "scripts.automation_api", "--run-now", schedule_record.as_posix()],
-        cwd=PROJECT_ROOT.as_posix(),
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+def _retry_now_schedule(
+    job_dir: Path, content_id: str, plan_path: Path,
+) -> dict[str, Any]:
+    """Explicitly re-arm one failed NOW schedule without touching queue history."""
+    schedule_path = _schedule_record_path(job_dir)
+    record = _read_optional_object(schedule_path)
+    if record is None:
+        raise HTTPException(status_code=409, detail="production schedule not found")
+
+    state = record.get("production_state")
+    if state != "error":
+        # A retry request is intentionally a no-op outside the terminal error
+        # state. In particular, never create another producer while a prior
+        # attempt is launching, producing, or already completed.
+        return {
+            "ok": True,
+            "content_id": content_id,
+            "run_mode": "NOW",
+            "production_state": state if isinstance(state, str) else "not_scheduled",
+        }
+
+    if record.get("content_id") != content_id or not _same_plan_path(record.get("production_plan_path"), plan_path):
+        raise HTTPException(status_code=409, detail="production schedule provenance conflict")
+
+    # Retain schedule identity and future-compatible fields, removing only
+    # runtime facts from the failed attempt.
+    retry_record = dict(record)
+    for field in ("pid", "boot_id", "error", "finished_at"):
+        retry_record.pop(field, None)
+    retry_record["production_state"] = "launching"
+    _write_schedule_record(schedule_path, retry_record)
+    return {
+        "ok": True,
+        "content_id": content_id,
+        "run_mode": "NOW",
+        "production_state": "launching",
+    }
 
 
 def _nightly_queue_dir() -> Path:
@@ -339,22 +329,11 @@ def _processing_job_identity(queue_root: Path) -> str | None:
     return jobs[0].parent.name if jobs else None
 
 
-def _tracked_nightly_process_is_active() -> bool:
-    global _nightly_process
-    if _nightly_process is None:
-        return False
-    if _nightly_process.poll() is None:
-        return True
-    _nightly_process = None
-    return False
-
-
 def _nightly_status_payload() -> dict[str, Any]:
     queue_root = _nightly_queue_dir()
     lock_present = (queue_root / "nightly_runner.lock").is_file()
-    # A lock is the canonical runner's cross-process authority.  The tracked
-    # child covers the brief interval after Popen and before it creates lock.
-    running = lock_present or _tracked_nightly_process_is_active()
+    # The canonical runner's lock is the cross-process running authority.
+    running = lock_present
     return {
         "ok": True,
         "running": running,
@@ -375,52 +354,18 @@ def _nightly_window_is_open() -> bool:
     )
 
 
-def _launch_nightly_runner() -> subprocess.Popen[bytes]:
-    queue_root = _nightly_queue_dir()
-    logs = queue_root / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    log_path = logs / f"nightly-runner-launch-{nightly_runner.timestamp()}.log"
-    with log_path.open("ab") as output:
-        return subprocess.Popen(
-            [sys.executable, "scripts/nightly_runner.py"],
-            cwd=PROJECT_ROOT.as_posix(),
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-
-
-def _run_immediate_production(schedule_record: Path) -> int:
-    """Worker entry point which invokes the existing approved-plan producer only."""
-    try:
-        record = _read_object(schedule_record)
-        plan_path = Path(str(record["production_plan_path"]))
-        record["production_state"] = "producing"
-        record["pid"] = os.getpid()
-        _write_schedule_record(schedule_record, record)
-        status = create_content_job_review.produce_batch.process_approved_review_plan(plan_path)
-        if status == "completed":
-            content_delivery.finalize_production_plan(plan_path)
-            record["production_state"] = "completed"
-        else:
-            record["production_state"] = "error"
-        _write_schedule_record(schedule_record, record)
-        return 0 if status == "completed" else 1
-    except Exception:
-        try:
-            record = _read_object(schedule_record)
-            record["production_state"] = "error"
-            _write_schedule_record(schedule_record, record)
-        except Exception:
-            LOG.error("immediate production state update failed")
-        LOG.exception("immediate production failed")
-        return 1
-
-
 def _status_payload(content_id: str) -> dict[str, Any]:
     found = _content_job_for(content_id)
     if found is None:
+        records = list(content_ingest.DEFAULT_JOB_ROOT.glob(f"*/{content_id}/{review_preparation.STATE_NAME}"))
+        if len(records) == 1:
+            record = _read_object(records[0])
+            return {
+                "ok": True, "content_id": content_id, "niche_id": record.get("niche_id"),
+                "content_job_exists": False, "review_exists": False,
+                "review_status": None, "review_relative_url": None,
+                "status": review_preparation.public_state(record), "production_state": "not_scheduled",
+            }
         raise HTTPException(status_code=404, detail="content job not found")
     job_dir, metadata = found
     niche_id = metadata.get("niche_id")
@@ -440,6 +385,11 @@ def _status_payload(content_id: str) -> dict[str, Any]:
             job_dir, plan_path, create_content_job_review.produce_batch.HOST_ROOT, plan,
         ) if plan_path else "not_scheduled",
     }
+
+
+def _review_preparation_record(niche_id: str, content_id: str) -> dict[str, Any] | None:
+    path = review_preparation.state_path(niche_id, content_id, job_root=content_ingest.DEFAULT_JOB_ROOT)
+    return _read_optional_object(path)
 
 
 def _sheet_projection(
@@ -572,26 +522,23 @@ def nightly_status() -> dict[str, Any]:
 
 @app.post("/v1/nightly/run")
 def run_nightly() -> dict[str, Any]:
-    global _nightly_process
-    # This lock only serializes API requests in this worker.  The canonical
-    # file lock in nightly_runner remains the cross-process final authority.
-    with _nightly_launch_lock:
-        try:
-            status = _nightly_status_payload()
-            if status["running"]:
-                return {"ok": True, "nightly_state": "already_running"}
-            if status["pending_count"] == 0:
-                return {"ok": True, "nightly_state": "no_pending"}
-            if not _nightly_window_is_open():
-                return {"ok": True, "nightly_state": "outside_window"}
-            _nightly_process = _launch_nightly_runner()
-            return {"ok": True, "nightly_state": "started"}
-        except OSError:
-            LOG.exception("nightly runner launch failed")
-            raise HTTPException(status_code=500, detail="unable to launch nightly runner")
-        except Exception:
-            LOG.exception("nightly runner request failed")
-            raise HTTPException(status_code=500, detail="unable to launch nightly runner")
+    try:
+        status = _nightly_status_payload()
+        if status["running"]:
+            return {"ok": True, "nightly_state": "already_running"}
+        if status["pending_count"] == 0:
+            return {"ok": True, "nightly_state": "no_pending"}
+        if not _nightly_window_is_open():
+            return {"ok": True, "nightly_state": "outside_window"}
+        # pending/ is the durable request signal; the host execution runner
+        # observes it and invokes the canonical runner on its next tick.
+        return {"ok": True, "nightly_state": "started"}
+    except OSError:
+        LOG.exception("nightly status lookup failed")
+        raise HTTPException(status_code=500, detail="unable to read nightly state")
+    except Exception as exc:
+        LOG.exception("nightly run status check failed")
+        raise HTTPException(status_code=500, detail="unable to check nightly state")
 
 
 @app.get("/v1/content/{content_id}")
@@ -609,6 +556,8 @@ def get_content(content_id: str) -> dict[str, Any]:
 def schedule_content(content_id: str, payload: ScheduleRequest) -> dict[str, Any]:
     if payload.run_mode not in {"NIGHT", "NOW"}:
         raise HTTPException(status_code=400, detail="invalid run_mode")
+    if payload.retry and payload.run_mode != "NOW":
+        raise HTTPException(status_code=400, detail="retry is only supported for NOW")
     try:
         found = _content_job_for(content_id)
         if found is None:
@@ -622,6 +571,9 @@ def schedule_content(content_id: str, payload: ScheduleRequest) -> dict[str, Any
             raise HTTPException(status_code=409, detail="review provenance conflict")
         if plan.get("review_status") != human_review.STATUS_APPROVED:
             raise HTTPException(status_code=409, detail="review is not approved")
+
+        if payload.retry:
+            return _retry_now_schedule(job_dir, content_id, plan_path)
 
         project_root = create_content_job_review.produce_batch.HOST_ROOT
         state = _production_state(job_dir, plan_path, project_root, plan)
@@ -683,15 +635,6 @@ def schedule_content(content_id: str, payload: ScheduleRequest) -> dict[str, Any
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        try:
-            _launch_immediate_production(schedule_record)
-        except Exception:
-            _write_schedule_record(schedule_record, {
-                "content_id": content_id,
-                "production_plan_path": plan_path.as_posix(),
-                "production_state": "error",
-            })
-            raise
         response = {"ok": True, "content_id": content_id, "run_mode": "NOW", "production_state": "producing"}
         if promoted_from:
             response.update({"schedule_state": "started_now", "promoted_from": promoted_from})
@@ -728,21 +671,13 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
         found = _content_job_for(content_id)
         if found is None:
             review = _require_review_fields(content_id, payload)
-            try:
-                create_review(review)
-            except HTTPException as exc:
-                if exc.status_code < 500:
-                    raise
-                return _sheet_projection(
-                    content_id, payload.niche_id, "ERROR", run_mode,
-                    error="unable to prepare human review",
-                )
+            create_review(review)
+            preparation = _review_preparation_record(payload.niche_id, content_id)
+            if preparation is not None:
+                return _sheet_projection(content_id, payload.niche_id, review_preparation.public_state(preparation), run_mode)
             found = _content_job_for(content_id)
-            if found is None:  # Defensive: the canonical adapter must persist the job.
-                return _sheet_projection(
-                    content_id, payload.niche_id, "ERROR", run_mode,
-                    error="unable to prepare human review",
-                )
+            if found is None:
+                return _sheet_projection(content_id, payload.niche_id, "PREPARING_REVIEW", run_mode)
 
         job_dir, metadata = found
         if metadata.get("niche_id") != payload.niche_id:
@@ -753,16 +688,14 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
             # Existing jobs without a plan can still use the canonical review
             # creation path, but only when the inputs needed by that path exist.
             review = _require_review_fields(content_id, payload)
-            try:
-                create_review(review)
-            except HTTPException as exc:
-                if exc.status_code < 500:
-                    raise
-                return _sheet_projection(content_id, payload.niche_id, "ERROR", run_mode, error="unable to prepare human review")
+            create_review(review)
+            preparation = _review_preparation_record(payload.niche_id, content_id)
+            if preparation is not None:
+                return _sheet_projection(content_id, payload.niche_id, review_preparation.public_state(preparation), run_mode)
             plan_path = _plan_for(job_dir, metadata)
             plan = _read_object(plan_path) if plan_path else None
             if plan is None:
-                return _sheet_projection(content_id, payload.niche_id, "ERROR", run_mode, error="unable to prepare human review")
+                return _sheet_projection(content_id, payload.niche_id, "PREPARING_REVIEW", run_mode)
 
         state = _production_state(job_dir, plan_path, create_content_job_review.produce_batch.HOST_ROOT, plan)
         if state == "error":
@@ -810,8 +743,8 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
         return _sheet_projection(content_id, payload.niche_id, "ERROR", run_mode, error="unable to reconcile content")
 
 
-@app.post("/v1/content/review")
-def create_review(payload: ReviewRequest) -> dict[str, Any]:
+@app.post("/v1/content/review", response_model=None)
+def create_review(payload: ReviewRequest) -> JSONResponse | dict[str, Any]:
     try:
         # Validate before any Drive/Asset Hub work so client mistakes are 400s.
         content_ingest.validate_request(
@@ -827,44 +760,42 @@ def create_review(payload: ReviewRequest) -> dict[str, Any]:
                 "ok": True,
                 "content_id": payload.content_id,
                 "niche_id": payload.niche_id,
+                "status": "HUMAN_REVIEW_READY",
                 "review_status": human_review.STATUS_PENDING,
                 "review_relative_url": review_relative_url(payload.content_id),
             }
-        metadata = content_ingest.ingest_content(
-            niche_id=payload.niche_id,
-            content_id=payload.content_id,
-            title=payload.title,
-            audio_file_id=payload.audio_file_id,
-            script_file_id=payload.script_file_id,
-            asset_profile=payload.asset_profile,
-        )
-        _, plan_path = create_content_job_review.create_content_job_review(
-            content_ingest.DEFAULT_JOB_ROOT / metadata["niche_id"] / metadata["content_id"]
-        )
-        _validate_pending_plan(plan_path, payload.content_id, metadata)
+        record = review_preparation.enqueue(payload.model_dump() if hasattr(payload, "model_dump") else payload.dict(), job_root=content_ingest.DEFAULT_JOB_ROOT)
     except content_ingest.ContentIngestError as exc:
         status = 409 if _is_identity_conflict(str(exc)) else 500
-        LOG.warning("content ingest failed for content_id=%r: %s", payload.content_id, exc)
+        LOG.warning("review request persistence failed content_id=%r exception_class=%s message=%s", payload.content_id, type(exc).__name__, review_preparation._sanitized_message(exc))
         raise HTTPException(status_code=status, detail="content identity conflict" if status == 409 else "content ingest failed")
-    except create_content_job_review.ContentJobReviewError as exc:
-        LOG.warning("review creation failed for content_id=%r: %s", payload.content_id, exc)
-        raise HTTPException(status_code=409 if "differs" in str(exc) else 500, detail="review conflict" if "differs" in str(exc) else "review creation failed")
     except Exception:
         # Do not include an upstream exception value here: libraries may echo
         # credentials in it.  The request identity is sufficient for diagnosis.
-        LOG.error("automation request failed for content_id=%r", payload.content_id)
+        LOG.error("review request persistence failed content_id=%r stage=enqueue exception_class=%s message=%s", payload.content_id, type(exc).__name__, review_preparation._sanitized_message(exc))
         raise HTTPException(status_code=500, detail="unable to prepare human review")
 
-    return {
+    return JSONResponse(status_code=202, content={
         "ok": True,
         "content_id": payload.content_id,
         "niche_id": payload.niche_id,
+        "status": review_preparation.public_state(record),
         "review_status": human_review.STATUS_PENDING,
-        "review_relative_url": review_relative_url(payload.content_id),
-    }
+        "review_relative_url": review_relative_url(payload.content_id) if record.get("state") == "completed" else None,
+    })
 
 
-if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--run-now":
-        sys.exit(_run_immediate_production(Path(sys.argv[2])))
-    raise SystemExit("automation_api is served by uvicorn")
+@app.post("/v1/content/{content_id}/review/retry")
+def retry_review_preparation(content_id: str, payload: NicheRequest) -> dict[str, Any]:
+    """Explicitly re-arm only a terminal review-preparation failure."""
+    _validate_enabled_niche(payload.niche_id)
+    path = review_preparation.state_path(payload.niche_id, content_id, job_root=content_ingest.DEFAULT_JOB_ROOT)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="review preparation not found")
+    try:
+        record = review_preparation.rearm(path)
+    except (OSError, ValueError) as exc:
+        LOG.error("review retry failed content_id=%r stage=rearm exception_class=%s message=%s", content_id, type(exc).__name__, review_preparation._sanitized_message(exc))
+        raise HTTPException(status_code=500, detail="unable to retry review preparation")
+    return {"ok": True, "content_id": content_id, "niche_id": payload.niche_id,
+            "status": review_preparation.public_state(record)}

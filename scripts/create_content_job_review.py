@@ -129,6 +129,57 @@ def content_job_provenance(metadata: dict[str, Any], policy: Any) -> dict[str, A
     }
 
 
+def plan_identity_matches_content_job(
+    plan: dict[str, Any], metadata: dict[str, Any], content_id: str,
+) -> bool:
+    """Verify that a review plan belongs to one immutable content job.
+
+    Legacy plans persist a content-job provenance snapshot.  Current plans
+    intentionally do not, so their canonical batch/task identity and source
+    artifact paths provide the equivalent proof.  A batch_id alone is never
+    sufficient evidence.
+    """
+    provenance = plan.get("content_job")
+    if isinstance(provenance, dict):
+        if provenance.get("content_id") != content_id:
+            return False
+        fields = (
+            "niche_id", "asset_profile", "audio_sha256", "script_sha256",
+            "resolved_asset_policy",
+        )
+        return all(provenance.get(field) == metadata.get(field) for field in fields)
+
+    # Only an omitted/null content_job denotes the current format.  Other
+    # malformed legacy provenance must not silently fall through to it.
+    if provenance is not None:
+        return False
+
+    niche_id = metadata.get("niche_id")
+    if not isinstance(niche_id, str) or not niche_id:
+        return False
+    if plan.get("batch_id") != content_id:
+        return False
+    try:
+        batch_id = deterministic_batch_id(niche_id, content_id)
+    except (TypeError, ValueError, ContentJobReviewError):
+        return False
+    task_id = plan.get("task_id")
+    if not isinstance(task_id, str) or not task_id.startswith(f"batch-{batch_id}-"):
+        return False
+
+    def has_canonical_suffix(value: Any, filename: str) -> bool:
+        if not isinstance(value, str):
+            return False
+        normalized = value.replace("\\", "/").rstrip("/")
+        suffix = f"/storage/content_jobs/{niche_id}/{content_id}/{filename}"
+        return normalized.endswith(suffix)
+
+    return (
+        has_canonical_suffix(plan.get("audio_path"), "source.mp3")
+        and has_canonical_suffix(plan.get("script_path"), "script.txt")
+    )
+
+
 def _existing_plan_matches_content_job(
     plan: dict[str, Any],
     *,
@@ -253,8 +304,8 @@ def create_content_job_review(
     plan = human_review.read_json(plan_path)
     if (
         plan.get("review_status") != human_review.STATUS_PENDING
-        or plan.get("batch_id") != batch_id
         or plan.get("stem") != stem
+        or not plan_identity_matches_content_job(plan, metadata, content_id)
     ):
         raise ContentJobReviewError("generated review plan identity differs from content job")
     plan["content_job"] = provenance

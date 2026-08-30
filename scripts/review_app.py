@@ -522,6 +522,16 @@ def main() -> None:
                 )
 
                 show_asset_metadata(selected)
+                ranking_v2 = selected.get("ranking_v2")
+                if isinstance(ranking_v2, dict):
+                    score = ranking_v2.get("score")
+                    reasons = ", ".join(ranking_v2.get("reason_codes") or [])
+                    penalties = ", ".join(ranking_v2.get("penalty_codes") or [])
+                    st.caption(f"Score {score:.2f}" if isinstance(score, (int, float)) else "Score n/a")
+                    if reasons:
+                        st.caption("+ " + reasons)
+                    if penalties:
+                        st.caption("- " + penalties)
             else:
                 st.warning("REVIEW REQUIRED")
                 st.caption("0 visible PRIMARY candidates")

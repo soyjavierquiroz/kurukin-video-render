@@ -6,9 +6,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.custom import human_review
@@ -21,7 +20,6 @@ class AutomationApiTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.jobs = self.root / "content_jobs"
         self.client = TestClient(automation_api.app)
-        automation_api._nightly_process = None
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -192,27 +190,35 @@ class AutomationApiTests(unittest.TestCase):
             disabled = self._reconcile(status="DRAFT")
         self.assertEqual(disabled.status_code, 403)
 
-    def test_reconcile_ready_creates_canonical_review_and_sanitizes_failure(self):
-        job, metadata = self._identity_job()
-        plan = self._identity_plan(metadata)
-        review = automation_api.ReviewRequest(**self._identity_payload())
-        with patch.object(automation_api, "_validate_enabled_niche"), patch.object(
-            automation_api, "_content_job_for", side_effect=[None, (job, metadata)]
-        ), patch.object(automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root), patch.object(
-            automation_api, "create_review", return_value={"ok": True}
-        ) as create:
+    def test_reconcile_ready_accepts_review_preparation_before_a_plan_exists(self):
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
+            automation_api.content_ingest, "validate_request"
+        ), patch.object(automation_api.content_ingest, "ingest_content") as ingest, patch.object(
+            automation_api.create_content_job_review, "create_content_job_review"
+        ) as review:
+            response = self._reconcile(**self._identity_payload())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "PREPARING_REVIEW")
+        self.assertIsNone(response.json()["review_url"])
+        path = automation_api.review_preparation.state_path("test-niche", "cid_001", job_root=self.jobs)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["state"], "pending")
+        ingest.assert_not_called()
+        review.assert_not_called()
+
+    def test_reconcile_completed_preparation_with_valid_plan_is_human_review_ready(self):
+        _, metadata = self._identity_job()
+        self._current_plan(metadata)
+        record = automation_api.review_preparation.enqueue(self._identity_payload(), job_root=self.jobs)
+        record["state"] = "completed"
+        path = automation_api.review_preparation.state_path("test-niche", "cid_001", job_root=self.jobs)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
             response = self._reconcile(**self._identity_payload())
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "HUMAN_REVIEW_READY")
-        create.assert_called_once()
-        self.assertEqual(create.call_args.args[0], review)
-
-        with patch.object(automation_api, "_validate_enabled_niche"), patch.object(
-            automation_api, "create_review", side_effect=HTTPException(status_code=500, detail="secret=x")
-        ):
-            failed = self._reconcile(**self._identity_payload())
-        self.assertEqual(failed.json()["status"], "ERROR")
-        self.assertNotIn("secret", failed.text)
+        self.assertEqual(response.json()["review_url"], "/?content_id=cid_001")
 
     def test_reconcile_unapproved_and_identity_conflict_are_safe(self):
         _, metadata = self._identity_job()
@@ -234,9 +240,7 @@ class AutomationApiTests(unittest.TestCase):
         jobs_root, host_root = self._schedule_context()
         with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
             automation_api, "_nightly_queue_dir", return_value=self.root / "storage/nightly_jobs",
-        ), patch.object(
-            automation_api, "_launch_immediate_production"
-        ) as launch:
+        ):
             night = self._reconcile(status="QUEUED_NIGHT", run_mode="NIGHT")
             night_again = self._reconcile(status="QUEUED_NIGHT", run_mode="NIGHT")
             now = self._reconcile(status="QUEUED_NIGHT", run_mode="NOW")
@@ -244,18 +248,16 @@ class AutomationApiTests(unittest.TestCase):
         self.assertEqual(night_again.json()["status"], "QUEUED_NIGHT")
         self.assertEqual(now.json()["status"], "PRODUCING")
         self.assertEqual(len(list((self.root / "storage/nightly_jobs/pending").glob("*.json"))), 0)
-        launch.assert_called_once_with(job / "production-schedule.json")
+        schedule = json.loads((job / "production-schedule.json").read_text(encoding="utf-8"))
+        self.assertEqual(schedule["production_state"], "launching")
 
     def test_reconcile_producing_completed_and_error_are_idempotent(self):
         job, _, _ = self._approved_schedule_fixture()
         jobs_root, host_root = self._schedule_context()
         (job / "production-schedule.json").write_text(json.dumps({"production_state": "producing"}), encoding="utf-8")
-        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
-            automation_api, "_launch_immediate_production"
-        ) as producing_launch:
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
             producing = self._reconcile(status="PRODUCING", run_mode="NOW")
         self.assertEqual(producing.json()["status"], "PRODUCING")
-        producing_launch.assert_not_called()
 
         (job / "production-schedule.json").write_text(json.dumps({"production_state": "completed"}), encoding="utf-8")
         (job / "delivery.json").write_text(json.dumps({
@@ -263,24 +265,18 @@ class AutomationApiTests(unittest.TestCase):
             "final_drive_url": "https://drive.google.com/file/d/file-1/view", "checksum": "a" * 64,
         }), encoding="utf-8")
         jobs_root, host_root = self._schedule_context()
-        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
-            automation_api, "_launch_immediate_production"
-        ) as completed_launch:
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
             completed = self._reconcile(status="COMPLETED", run_mode="NOW")
         self.assertEqual(completed.json()["status"], "COMPLETED")
         self.assertEqual(completed.json()["final_drive_file_id"], "file-1")
         self.assertEqual(completed.json()["final_drive_url"], "https://drive.google.com/file/d/file-1/view")
         self.assertEqual(completed.json()["checksum"], "a" * 64)
-        completed_launch.assert_not_called()
 
         (job / "production-schedule.json").write_text(json.dumps({"production_state": "error"}), encoding="utf-8")
         jobs_root, host_root = self._schedule_context()
-        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
-            automation_api, "_launch_immediate_production"
-        ) as failed_launch:
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
             errored = self._reconcile(status="ERROR", run_mode="NOW")
         self.assertEqual(errored.json()["status"], "ERROR")
-        failed_launch.assert_not_called()
 
     def test_reconcile_review_projection_statuses_follow_actual_review_facts(self):
         _, metadata = self._identity_job()
@@ -310,88 +306,57 @@ class AutomationApiTests(unittest.TestCase):
             "completed_count": 0, "failed_count": 0, "current_job": None,
         })
 
-    def test_nightly_status_reports_processing_job_and_lock(self):
-        queue = self._nightly_queue(processing=1)
+    def test_nightly_status_reports_queue_counts_processing_job_and_lock(self):
+        queue = self._nightly_queue(pending=1, processing=1, completed=1, failed=1)
         (queue / "nightly_runner.lock").write_text("pid=123\n", encoding="utf-8")
         with patch.object(automation_api, "_nightly_queue_dir", return_value=queue):
             response = self.client.get("/v1/nightly/status")
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["running"])
-        self.assertTrue(response.json()["lock_present"])
-        self.assertEqual(response.json()["processing_count"], 1)
-        self.assertEqual(response.json()["current_job"], "run-0")
+        self.assertEqual(response.json(), {
+            "ok": True, "running": True, "lock_present": True,
+            "pending_count": 1, "processing_count": 1,
+            "completed_count": 1, "failed_count": 1, "current_job": "run-0",
+        })
 
-    def test_nightly_run_with_no_pending_does_not_launch(self):
+    def test_nightly_run_with_no_pending_does_not_create_a_process(self):
         queue = self._nightly_queue()
-        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
-            automation_api, "_launch_nightly_runner"
-        ) as launch:
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch("subprocess.Popen") as popen:
             response = self.client.post("/v1/nightly/run")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"ok": True, "nightly_state": "no_pending"})
-        launch.assert_not_called()
+        popen.assert_not_called()
 
-    def test_nightly_run_with_active_runner_does_not_launch(self):
+    def test_nightly_run_outside_window_does_not_create_a_process(self):
+        queue = self._nightly_queue(pending=1)
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
+            automation_api, "_nightly_window_is_open", return_value=False
+        ), patch("subprocess.Popen") as popen:
+            response = self.client.post("/v1/nightly/run")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "nightly_state": "outside_window"})
+        popen.assert_not_called()
+
+    def test_nightly_run_with_active_runner_does_not_create_a_process(self):
         queue = self._nightly_queue(pending=1)
         (queue / "nightly_runner.lock").write_text("pid=123\n", encoding="utf-8")
-        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
-            automation_api, "_launch_nightly_runner"
-        ) as launch:
+        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch("subprocess.Popen") as popen:
             response = self.client.post("/v1/nightly/run")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"ok": True, "nightly_state": "already_running"})
-        launch.assert_not_called()
+        popen.assert_not_called()
 
-    def test_nightly_run_launches_canonical_runner_once_without_window_override(self):
+    def test_nightly_run_accepts_pending_job_without_creating_process_or_logs(self):
         queue = self._nightly_queue(pending=1)
-        process = MagicMock()
-        process.poll.return_value = None
         with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
             automation_api, "_nightly_window_is_open", return_value=True
-        ), patch.object(automation_api, "_launch_nightly_runner", return_value=process) as launch:
+        ), patch("subprocess.Popen") as popen:
             response = self.client.post("/v1/nightly/run")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"ok": True, "nightly_state": "started"})
-        launch.assert_called_once_with()
-
-    def test_nightly_duplicate_api_call_does_not_intentionally_launch_second_runner(self):
-        queue = self._nightly_queue(pending=1)
-        process = MagicMock()
-        process.poll.return_value = None
-        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
-            automation_api, "_nightly_window_is_open", return_value=True
-        ), patch.object(automation_api, "_launch_nightly_runner", return_value=process) as launch:
-            first = self.client.post("/v1/nightly/run")
-            second = self.client.post("/v1/nightly/run")
-        self.assertEqual(first.json()["nightly_state"], "started")
-        self.assertEqual(second.json()["nightly_state"], "already_running")
-        launch.assert_called_once_with()
-
-    def test_nightly_launch_command_is_detached_and_preserves_default_window(self):
-        queue = self._nightly_queue(pending=1)
-        args = automation_api.nightly_runner.build_parser().parse_args([])
-        self.assertEqual(args.window_start.strftime("%H:%M"), "00:00")
-        self.assertEqual(args.window_end.strftime("%H:%M"), "07:00")
-        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
-            automation_api.subprocess, "Popen"
-        ) as popen:
-            automation_api._launch_nightly_runner()
-        command = popen.call_args.args[0]
-        self.assertEqual(command, [automation_api.sys.executable, "scripts/nightly_runner.py"])
-        self.assertNotIn("--ignore-window", command)
-        self.assertEqual(popen.call_args.kwargs["cwd"], automation_api.PROJECT_ROOT.as_posix())
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertEqual(popen.call_args.kwargs["stderr"], automation_api.subprocess.STDOUT)
-
-    def test_nightly_launch_failure_is_sanitized(self):
-        queue = self._nightly_queue(pending=1)
-        with patch.object(automation_api, "_nightly_queue_dir", return_value=queue), patch.object(
-            automation_api, "_nightly_window_is_open", return_value=True
-        ), patch.object(automation_api, "_launch_nightly_runner", side_effect=RuntimeError("secret=never-returned")):
-            response = self.client.post("/v1/nightly/run")
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.json()["detail"], "unable to launch nightly runner")
-        self.assertNotIn("secret", response.text)
+        popen.assert_not_called()
+        self.assertEqual(len(list((queue / "pending").glob("*.json"))), 1)
+        self.assertFalse((queue / "logs").exists())
+        self.assertFalse(hasattr(automation_api, "_launch_nightly_runner"))
 
     def test_review_url_encodes_content_id(self):
         self.assertEqual(automation_api.review_relative_url("a b/?"), "/?content_id=a%20b%2F%3F")
@@ -420,23 +385,24 @@ class AutomationApiTests(unittest.TestCase):
 
     def test_existing_identity_is_reused_without_approval_or_production(self):
         _, metadata = self._identity_job()
-        plan = self._identity_plan(metadata)
-        payload = {
-            "niche_id": "test-niche", "content_id": "cid_001", "title": "A title",
-            "audio_file_id": "audio-id", "script_file_id": "script-id", "asset_profile": "GENERALES",
-        }
+        payload = self._identity_payload()
         with patch.object(automation_api.content_ingest, "validate_request"), patch.object(
             automation_api.content_ingest, "ingest_content", return_value=metadata
         ) as ingest, patch.object(
-            automation_api.create_content_job_review, "create_content_job_review", return_value=("already_exists", plan)
+            automation_api.create_content_job_review, "create_content_job_review"
         ) as review, patch.object(human_review, "approve_plan") as approve, patch.object(
             automation_api.create_content_job_review.produce_batch, "process_job"
-        ) as production:
+        ) as production, patch.object(
+            automation_api.review_preparation, "enqueue", return_value={"state": "pending"}
+        ) as enqueue:
             response = self.client.post("/v1/content/review", json=payload)
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "PREPARING_REVIEW")
         self.assertEqual(response.json()["review_status"], "pending_review")
-        ingest.assert_called_once()
-        review.assert_called_once()
+        self.assertIsNone(response.json()["review_relative_url"])
+        enqueue.assert_called_once()
+        ingest.assert_not_called()
+        review.assert_not_called()
         approve.assert_not_called()
         production.assert_not_called()
 
@@ -452,13 +418,15 @@ class AutomationApiTests(unittest.TestCase):
             automation_api.create_content_job_review, "create_content_job_review"
         ) as review, patch.object(human_review, "approve_plan") as approve, patch.object(
             automation_api.create_content_job_review.produce_batch, "process_job"
-        ) as process:
+        ) as process, patch.object(automation_api.review_preparation, "enqueue") as enqueue:
             response = self.client.post("/v1/content/review", json=payload)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
             "ok": True, "content_id": "cid_001", "niche_id": "test-niche",
-            "review_status": "pending_review", "review_relative_url": "/?content_id=cid_001",
+            "status": "HUMAN_REVIEW_READY", "review_status": "pending_review",
+            "review_relative_url": "/?content_id=cid_001",
         })
+        enqueue.assert_not_called()
         ingest.assert_not_called()
         review.assert_not_called()
         process.assert_not_called()
@@ -545,35 +513,37 @@ class AutomationApiTests(unittest.TestCase):
             self.assertEqual(response.json()["detail"], "content identity conflict")
             ingest.assert_not_called()
 
-    def test_identity_conflict_is_409(self):
-        payload = {
-            "niche_id": "test-niche", "content_id": "cid_001", "title": "A title",
-            "audio_file_id": "audio-id", "script_file_id": "script-id", "asset_profile": "GENERALES",
-        }
-        conflict = automation_api.content_ingest.ContentIngestError(
-            "content_id already exists with different source Drive IDs; refusing to overwrite content identity"
-        )
-        with patch.object(automation_api.content_ingest, "validate_request"), patch.object(
-            automation_api.content_ingest, "ingest_content", side_effect=conflict
-        ):
-            response = self.client.post("/v1/content/review", json=payload)
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json()["detail"], "content identity conflict")
-
-    def test_underlying_failure_is_a_safe_500(self):
+    def test_review_request_is_accepted_before_runner_resolves_ingest_conflicts(self):
         payload = {
             "niche_id": "test-niche", "content_id": "cid_001", "title": "A title",
             "audio_file_id": "audio-id", "script_file_id": "script-id", "asset_profile": "GENERALES",
         }
         with patch.object(automation_api.content_ingest, "validate_request"), patch.object(
-            automation_api.content_ingest, "ingest_content", side_effect=RuntimeError("secret=never-returned")
+            automation_api.content_ingest, "ingest_content"
+        ) as ingest, patch.object(
+            automation_api.review_preparation, "enqueue", return_value={"state": "pending"}
         ):
             response = self.client.post("/v1/content/review", json=payload)
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.json()["detail"], "unable to prepare human review")
-        self.assertNotIn("secret", response.text)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "PREPARING_REVIEW")
+        ingest.assert_not_called()
 
-    def test_review_adapter_failure_is_a_safe_500(self):
+    def test_underlying_failure_is_acknowledged_for_durable_runner(self):
+        payload = {
+            "niche_id": "test-niche", "content_id": "cid_001", "title": "A title",
+            "audio_file_id": "audio-id", "script_file_id": "script-id", "asset_profile": "GENERALES",
+        }
+        with patch.object(automation_api.content_ingest, "validate_request"), patch.object(
+            automation_api.content_ingest, "ingest_content"
+        ) as ingest, patch.object(
+            automation_api.review_preparation, "enqueue", return_value={"state": "pending"}
+        ):
+            response = self.client.post("/v1/content/review", json=payload)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "PREPARING_REVIEW")
+        ingest.assert_not_called()
+
+    def test_review_adapter_failure_is_acknowledged_for_durable_runner(self):
         payload = {
             "niche_id": "test-niche", "content_id": "cid_001", "title": "A title",
             "audio_file_id": "audio-id", "script_file_id": "script-id", "asset_profile": "GENERALES",
@@ -584,15 +554,18 @@ class AutomationApiTests(unittest.TestCase):
         ), patch.object(
             automation_api.create_content_job_review, "create_content_job_review",
             side_effect=automation_api.create_content_job_review.ContentJobReviewError("Asset Hub unavailable"),
+        ) as review, patch.object(
+            automation_api.review_preparation, "enqueue", return_value={"state": "pending"}
         ):
             response = self.client.post("/v1/content/review", json=payload)
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.json()["detail"], "review creation failed")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "PREPARING_REVIEW")
+        review.assert_not_called()
 
-    def test_night_approved_content_enqueues_once_and_never_starts_immediate_production(self):
+    def test_night_approved_content_enqueues_once(self):
         _, _, plan = self._approved_schedule_fixture()
         jobs_root, host_root = self._schedule_context()
-        with jobs_root, host_root, patch.object(automation_api, "_launch_immediate_production") as launch, patch.object(
+        with jobs_root, host_root, patch.object(
             human_review, "approve_plan"
         ) as approve:
             first = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NIGHT"})
@@ -603,33 +576,135 @@ class AutomationApiTests(unittest.TestCase):
         queue = self.root / "storage/nightly_jobs/pending"
         self.assertEqual(list(queue.glob("*.json")).__len__(), 1)
         self.assertEqual(json.loads(next(queue.glob("*.json")).read_text())["production_plan_path"], plan.as_posix())
-        launch.assert_not_called()
         approve.assert_not_called()
 
     def test_night_schedule_accepts_approved_current_plan_and_queues_it(self):
         _, metadata = self._identity_job()
         plan = self._current_plan(metadata, review_status=human_review.STATUS_APPROVED)
         jobs_root, host_root = self._schedule_context()
-        with jobs_root, host_root, patch.object(automation_api, "_launch_immediate_production") as launch:
+        with jobs_root, host_root:
             response = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NIGHT"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["production_state"], "queued_night")
         queued = list((self.root / "storage/nightly_jobs/pending").glob("*.json"))
         self.assertEqual(len(queued), 1)
         self.assertEqual(json.loads(queued[0].read_text())["production_plan_path"], plan.as_posix())
-        launch.assert_not_called()
 
-    def test_now_approved_content_launches_canonical_producer_once_without_nightly_enqueue(self):
+    def test_now_approved_content_persists_launching_and_never_launches_production(self):
         job, _, _ = self._approved_schedule_fixture()
         jobs_root, host_root = self._schedule_context()
-        with jobs_root, host_root, patch.object(automation_api, "_launch_immediate_production") as launch:
+        with jobs_root, host_root, patch("subprocess.Popen") as popen, patch.object(
+            automation_api.create_content_job_review.produce_batch, "process_approved_review_plan"
+        ) as produce:
             first = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
             second = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
         self.assertEqual(first.json()["production_state"], "producing")
-        launch.assert_called_once_with(job / "production-schedule.json")
+        self.assertEqual(second.json()["production_state"], "producing")
+        schedule = json.loads((job / "production-schedule.json").read_text(encoding="utf-8"))
+        self.assertEqual(schedule["production_state"], "launching")
+        self.assertEqual(len(list(job.glob("production-schedule.json"))), 1)
+        popen.assert_not_called()
+        produce.assert_not_called()
         self.assertFalse((self.root / "storage/nightly_jobs/pending").exists())
+
+    def test_explicit_now_retry_rearms_failed_schedule_and_cleans_obsolete_runtime_fields(self):
+        job, _, plan = self._approved_schedule_fixture()
+        original = {
+            "content_id": "cid_001",
+            "niche_id": "test-niche",
+            "production_plan_path": plan.as_posix(),
+            "production_state": "error",
+            "pid": 123,
+            "boot_id": "old-boot",
+            "error": "render failed",
+            "finished_at": "2026-08-28T00:00:00Z",
+            "retry_metadata": {"keep": True},
+        }
+        (job / "production-schedule.json").write_text(json.dumps(original), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root:
+            response = self.client.post(
+                "/v1/content/cid_001/schedule", json={"run_mode": "NOW", "retry": True},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["production_state"], "launching")
+        schedule = json.loads((job / "production-schedule.json").read_text(encoding="utf-8"))
+        self.assertEqual(schedule["production_state"], "launching")
+        self.assertEqual(schedule["content_id"], "cid_001")
+        self.assertEqual(schedule["niche_id"], "test-niche")
+        self.assertEqual(schedule["production_plan_path"], plan.as_posix())
+        self.assertEqual(schedule["retry_metadata"], {"keep": True})
+        for field in ("pid", "boot_id", "error", "finished_at"):
+            self.assertNotIn(field, schedule)
+
+    def test_now_retry_is_idempotent_for_launching_producing_and_completed(self):
+        job, _, plan = self._approved_schedule_fixture()
+        for state in ("launching", "producing", "completed"):
+            with self.subTest(state=state):
+                original = {
+                    "content_id": "cid_001",
+                    "production_plan_path": plan.as_posix(),
+                    "production_state": state,
+                    "marker": state,
+                }
+                (job / "production-schedule.json").write_text(json.dumps(original), encoding="utf-8")
+                jobs_root, host_root = self._schedule_context()
+                with jobs_root, host_root:
+                    response = self.client.post(
+                        "/v1/content/cid_001/schedule", json={"run_mode": "NOW", "retry": True},
+                    )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["production_state"], state)
+                self.assertEqual(
+                    json.loads((job / "production-schedule.json").read_text(encoding="utf-8")), original,
+                )
+
+    def test_now_retry_without_approved_plan_is_rejected_without_changing_schedule(self):
+        job, metadata = self._identity_job()
+        self._identity_plan(metadata, review_status=human_review.STATUS_PENDING)
+        original = {"production_state": "error", "pid": 123}
+        record = job / "production-schedule.json"
+        record.write_text(json.dumps(original), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root:
+            response = self.client.post(
+                "/v1/content/cid_001/schedule", json={"run_mode": "NOW", "retry": True},
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")), original)
+
+    def test_night_retry_is_rejected_without_changing_failed_schedule(self):
+        job, _, plan = self._approved_schedule_fixture()
+        original = {"content_id": "cid_001", "production_plan_path": plan.as_posix(), "production_state": "error"}
+        record = job / "production-schedule.json"
+        record.write_text(json.dumps(original), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with jobs_root, host_root:
+            response = self.client.post(
+                "/v1/content/cid_001/schedule", json={"run_mode": "NIGHT", "retry": True},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")), original)
+
+    def test_reconcile_error_does_not_auto_retry_failed_now_schedule(self):
+        job, _, plan = self._approved_schedule_fixture()
+        original = {
+            "content_id": "cid_001",
+            "production_plan_path": plan.as_posix(),
+            "production_state": "error",
+            "pid": 123,
+            "error": "render failed",
+        }
+        record = job / "production-schedule.json"
+        record.write_text(json.dumps(original), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root:
+            response = self._reconcile(status="ERROR", run_mode="NOW")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ERROR")
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")), original)
 
     def test_now_promotes_only_matching_pending_nightly_job_to_held_once(self):
         job, _, plan = self._approved_schedule_fixture()
@@ -645,7 +720,7 @@ class AutomationApiTests(unittest.TestCase):
         jobs_root, host_root = self._schedule_context()
         with jobs_root, host_root, patch.object(
             automation_api, "_nightly_queue_dir", return_value=pending.parent,
-        ), patch.object(automation_api, "_launch_immediate_production") as launch:
+        ), patch("subprocess.Popen") as popen:
             first = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
             second = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
         self.assertEqual(first.status_code, 200)
@@ -656,11 +731,12 @@ class AutomationApiTests(unittest.TestCase):
         held = list((self.root / "storage/nightly_jobs/held").glob("*.json"))
         self.assertEqual(len(held), 1)
         self.assertEqual(json.loads(held[0].read_text(encoding="utf-8")), exact_payload)
-        launch.assert_called_once_with(job / "production-schedule.json")
+        self.assertEqual(json.loads((job / "production-schedule.json").read_text())["production_state"], "launching")
+        popen.assert_not_called()
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.json()["production_state"], "producing")
 
-    def test_now_does_not_promote_or_launch_a_nightly_job_already_processing(self):
+    def test_now_does_not_promote_a_nightly_job_already_processing(self):
         _, _, plan = self._approved_schedule_fixture()
         processing = self.root / "storage/nightly_jobs/processing/run-1"
         processing.mkdir(parents=True)
@@ -670,36 +746,11 @@ class AutomationApiTests(unittest.TestCase):
         jobs_root, host_root = self._schedule_context()
         with jobs_root, host_root, patch.object(
             automation_api, "_nightly_queue_dir", return_value=processing.parent.parent,
-        ), patch.object(automation_api, "_launch_immediate_production") as launch:
+        ):
             response = self.client.post("/v1/content/cid_001/schedule", json={"run_mode": "NOW"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["schedule_state"], "already_processing")
         self.assertEqual(response.json()["production_state"], "producing")
-        launch.assert_not_called()
-
-    def test_now_worker_uses_canonical_approved_plan_producer(self):
-        job, _, plan = self._approved_schedule_fixture()
-        record = job / "production-schedule.json"
-        record.write_text(json.dumps({"content_id": "cid_001", "production_plan_path": plan.as_posix()}), encoding="utf-8")
-        with patch.object(
-            automation_api.create_content_job_review.produce_batch,
-            "process_approved_review_plan", return_value="completed",
-        ) as produce, patch.object(automation_api.content_delivery, "finalize_production_plan") as deliver:
-            self.assertEqual(automation_api._run_immediate_production(record), 0)
-        produce.assert_called_once_with(plan)
-        deliver.assert_called_once_with(plan)
-        self.assertEqual(json.loads(record.read_text())["production_state"], "completed")
-
-    def test_now_delivery_failure_marks_schedule_error(self):
-        job, _, plan = self._approved_schedule_fixture()
-        record = job / "production-schedule.json"
-        record.write_text(json.dumps({"content_id": "cid_001", "production_plan_path": plan.as_posix()}), encoding="utf-8")
-        with patch.object(
-            automation_api.create_content_job_review.produce_batch,
-            "process_approved_review_plan", return_value="completed",
-        ), patch.object(automation_api.content_delivery, "finalize_production_plan", side_effect=RuntimeError("offline")):
-            self.assertEqual(automation_api._run_immediate_production(record), 1)
-        self.assertEqual(json.loads(record.read_text())["production_state"], "error")
 
     def test_reconcile_completed_without_delivery_is_error(self):
         job, _, _ = self._approved_schedule_fixture()
