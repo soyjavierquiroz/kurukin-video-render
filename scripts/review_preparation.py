@@ -10,6 +10,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -62,6 +63,23 @@ def _sanitized_message(exc: BaseException) -> str:
     if any(word in value.lower() for word in ("api_key", "apikey", "authorization", "token", "secret")):
         return "<redacted>"
     return value[:500] or type(exc).__name__
+
+
+def sheet_error_message(record: dict[str, Any]) -> str | None:
+    """Return the bounded, system-owned diagnostic intended for the Sheet."""
+    if record.get("state") != "error":
+        return None
+    value = str(record.get("last_error_message") or "").replace("\n", " ").strip()
+    # Current worker failures carry a concise leading summary.  For older
+    # records, do not project their arbitrary worker output to the Sheet.
+    match = re.match(r"review failed exit=\d+:\s*(.+)", value, re.IGNORECASE)
+    if match:
+        value = match.group(1).strip()
+    elif value.lower().startswith("review failed exit="):
+        value = "Human Review preparation failed"
+    if not value or any(word in value.lower() for word in ("api_key", "apikey", "authorization", "token", "secret")):
+        return "Human Review preparation failed"
+    return f"Human Review preparation failed: {value[:240]}"
 
 
 def _exception_chain(exc: BaseException) -> str:

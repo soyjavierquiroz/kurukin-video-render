@@ -395,6 +395,7 @@ def _review_preparation_record(niche_id: str, content_id: str) -> dict[str, Any]
 def _sheet_projection(
     content_id: str, niche_id: str, status: str, run_mode: str | None,
     *, review_exists: bool = False, error: str | None = None,
+    error_message: str | None = None,
 ) -> dict[str, Any]:
     """Return the small, path-free Sheet representation used by n8n."""
     return {
@@ -408,6 +409,9 @@ def _sheet_projection(
         "final_drive_url": None,
         "checksum": None,
         "error": error,
+        # This value is derived only from durable host state; n8n must never
+        # accept it as an operator-owned input.
+        "error_message": error_message,
     }
 
 
@@ -420,6 +424,26 @@ def _require_review_fields(content_id: str, payload: ReconcileRequest) -> Review
         hook_title=payload.hook_title, audio_file_id=payload.audio_file_id,
         script_file_id=payload.script_file_id, asset_profile=payload.asset_profile,
     )
+
+
+def _require_matching_preparation_identity(
+    content_id: str, payload: ReconcileRequest, metadata: dict[str, Any] | None, record: dict[str, Any],
+) -> ReviewRequest:
+    """Fail closed before projecting a durable review-preparation result."""
+    review = _require_review_fields(content_id, payload)
+    expected = {
+        "content_id": content_id,
+        "niche_id": payload.niche_id,
+        "audio_file_id": review.audio_file_id,
+        "script_file_id": review.script_file_id,
+        "asset_profile": review.asset_profile,
+    }
+    for source in (metadata, record):
+        if source is None:
+            continue
+        if any(source.get(field) != value for field, value in expected.items()):
+            raise HTTPException(status_code=409, detail="content identity conflict")
+    return review
 
 
 def _is_identity_conflict(message: str) -> bool:
@@ -670,11 +694,21 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
     try:
         found = _content_job_for(content_id)
         if found is None:
+            preparation = _review_preparation_record(payload.niche_id, content_id)
+            if preparation is not None and preparation.get("state") == "error":
+                _require_matching_preparation_identity(content_id, payload, None, preparation)
+                return _sheet_projection(
+                    content_id, payload.niche_id, "ERROR", run_mode,
+                    error_message=review_preparation.sheet_error_message(preparation),
+                )
             review = _require_review_fields(content_id, payload)
             create_review(review)
             preparation = _review_preparation_record(payload.niche_id, content_id)
             if preparation is not None:
-                return _sheet_projection(content_id, payload.niche_id, review_preparation.public_state(preparation), run_mode)
+                return _sheet_projection(
+                    content_id, payload.niche_id, review_preparation.public_state(preparation), run_mode,
+                    error_message=review_preparation.sheet_error_message(preparation),
+                )
             found = _content_job_for(content_id)
             if found is None:
                 return _sheet_projection(content_id, payload.niche_id, "PREPARING_REVIEW", run_mode)
@@ -685,13 +719,23 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
         plan_path = _plan_for(job_dir, metadata)
         plan = _read_object(plan_path) if plan_path else None
         if plan is None:
+            preparation = _review_preparation_record(payload.niche_id, content_id)
+            if preparation is not None and preparation.get("state") == "error":
+                _require_matching_preparation_identity(content_id, payload, metadata, preparation)
+                return _sheet_projection(
+                    content_id, payload.niche_id, "ERROR", run_mode,
+                    error_message=review_preparation.sheet_error_message(preparation),
+                )
             # Existing jobs without a plan can still use the canonical review
             # creation path, but only when the inputs needed by that path exist.
             review = _require_review_fields(content_id, payload)
             create_review(review)
             preparation = _review_preparation_record(payload.niche_id, content_id)
             if preparation is not None:
-                return _sheet_projection(content_id, payload.niche_id, review_preparation.public_state(preparation), run_mode)
+                return _sheet_projection(
+                    content_id, payload.niche_id, review_preparation.public_state(preparation), run_mode,
+                    error_message=review_preparation.sheet_error_message(preparation),
+                )
             plan_path = _plan_for(job_dir, metadata)
             plan = _read_object(plan_path) if plan_path else None
             if plan is None:

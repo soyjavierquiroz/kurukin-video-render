@@ -652,6 +652,18 @@ class ProductionPipelineTests(unittest.TestCase):
                 log,
             )
 
+    def test_worker_failure_summary_prefers_terminal_mpt_stage_error(self):
+        log = self.root / "worker.log"
+        log.write_text(
+            "script output that is not a failure\n"
+            "task failed, task_id: example, stage: audio, error: invalid custom audio file\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            produce_batch._worker_failure_summary(log),
+            "invalid custom audio file",
+        )
+
 
 class WorkerRuntimeTests(unittest.TestCase):
     def test_inside_mpt_runtime_uses_direct_worker_command(self):

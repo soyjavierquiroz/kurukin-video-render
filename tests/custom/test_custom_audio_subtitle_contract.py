@@ -1,4 +1,5 @@
 import contextlib
+import importlib
 import io
 import json
 import os
@@ -33,17 +34,17 @@ class _Logger:
         pass
 
 
-def _install_task_import_stubs() -> None:
+def _task_import_stubs() -> dict[str, ModuleType]:
     loguru = ModuleType("loguru")
     loguru.logger = _Logger()
-    sys.modules.setdefault("loguru", loguru)
+    stubs = {"loguru": loguru}
 
     config_module = ModuleType("app.config")
     config_module.config = SimpleNamespace(
         app={"subtitle_provider": "edge"},
         ui={"subtitle_position": "bottom"},
     )
-    sys.modules.setdefault("app.config", config_module)
+    stubs["app.config"] = config_module
 
     schema_module = ModuleType("app.models.schema")
 
@@ -56,10 +57,11 @@ def _install_task_import_stubs() -> None:
 
     schema_module.VideoConcatMode = VideoConcatMode
     schema_module.VideoParams = VideoParams
-    sys.modules.setdefault("app.models.schema", schema_module)
+    schema_module.MaterialInfo = SimpleNamespace
+    stubs["app.models.schema"] = schema_module
 
     for module_name in ("llm", "material", "twelvelabs", "video"):
-        sys.modules.setdefault(f"app.services.{module_name}", ModuleType(f"app.services.{module_name}"))
+        stubs[f"app.services.{module_name}"] = ModuleType(f"app.services.{module_name}")
 
     subtitle_module = ModuleType("app.services.subtitle")
 
@@ -69,14 +71,14 @@ def _install_task_import_stubs() -> None:
     subtitle_module.file_to_subtitles = file_to_subtitles
     subtitle_module.create = lambda *args, **kwargs: None
     subtitle_module.correct = lambda *args, **kwargs: None
-    sys.modules.setdefault("app.services.subtitle", subtitle_module)
+    stubs["app.services.subtitle"] = subtitle_module
 
     voice_module = ModuleType("app.services.voice")
     voice_module.create_subtitle = lambda *args, **kwargs: None
     voice_module.get_audio_duration = lambda *args, **kwargs: 1
     voice_module.parse_voice_name = lambda value: value
     voice_module.tts = lambda *args, **kwargs: object()
-    sys.modules.setdefault("app.services.voice", voice_module)
+    stubs["app.services.voice"] = voice_module
 
     upload_post_module = ModuleType("app.services.upload_post")
     upload_post_module.upload_post_service = SimpleNamespace(
@@ -85,16 +87,53 @@ def _install_task_import_stubs() -> None:
         platforms=[],
     )
     upload_post_module.cross_post_video = lambda *args, **kwargs: {}
-    sys.modules.setdefault("app.services.upload_post", upload_post_module)
+    stubs["app.services.upload_post"] = upload_post_module
 
     state_module = ModuleType("app.services.state")
     state_module.state = SimpleNamespace(update_task=lambda *args, **kwargs: None)
-    sys.modules.setdefault("app.services.state", state_module)
+    stubs["app.services.state"] = state_module
+    return stubs
 
 
-_install_task_import_stubs()
+def _load_task_service_with_scoped_stubs() -> ModuleType:
+    """Load the isolated task module without leaking fake service modules."""
+    import app
+    import app.models as models
+    import app.services as services
 
-from app.services import task as task_service
+    stubs = _task_import_stubs()
+    parent_names = {
+        app: ("config",),
+        models: ("schema",),
+        services: ("task", "llm", "material", "twelvelabs", "video", "subtitle", "voice", "upload_post", "state"),
+    }
+    missing = object()
+    parent_attributes = {
+        parent: {name: parent.__dict__.get(name, missing) for name in names}
+        for parent, names in parent_names.items()
+    }
+    try:
+        with patch.dict(sys.modules, stubs, clear=False):
+            previous_task = sys.modules.pop("app.services.task", None)
+            try:
+                task_module = importlib.import_module("app.services.task")
+            finally:
+                if previous_task is not None:
+                    sys.modules["app.services.task"] = previous_task
+                else:
+                    sys.modules.pop("app.services.task", None)
+    finally:
+        for parent, names in parent_names.items():
+            for name in names:
+                original = parent_attributes[parent][name]
+                if original is missing:
+                    parent.__dict__.pop(name, None)
+                else:
+                    setattr(parent, name, original)
+    return task_module
+
+
+task_service = _load_task_service_with_scoped_stubs()
 from app.utils import utils
 
 

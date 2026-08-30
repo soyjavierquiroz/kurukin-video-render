@@ -220,6 +220,48 @@ class AutomationApiTests(unittest.TestCase):
         self.assertEqual(response.json()["status"], "HUMAN_REVIEW_READY")
         self.assertEqual(response.json()["review_url"], "/?content_id=cid_001")
 
+    def test_reconcile_failed_preparation_projects_system_owned_error_message(self):
+        record = automation_api.review_preparation.enqueue(self._identity_payload(), job_root=self.jobs)
+        record.update({
+            "state": "error",
+            "last_error_message": "review failed exit=1: invalid custom audio file: custom audio file must be stored within the current task directory",
+        })
+        path = automation_api.review_preparation.state_path("test-niche", "cid_001", job_root=self.jobs)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
+            automation_api.review_preparation, "enqueue"
+        ) as enqueue, patch.object(
+            automation_api.create_content_job_review.produce_batch, "process_job"
+        ) as production:
+            response = self._reconcile(**self._identity_payload())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ERROR")
+        self.assertEqual(
+            response.json()["error_message"],
+            "Human Review preparation failed: invalid custom audio file: custom audio file must be stored within the current task directory",
+        )
+        enqueue.assert_not_called()
+        production.assert_not_called()
+
+    def test_reconcile_failed_preparation_rejects_identity_mismatch_without_reenqueue(self):
+        _, metadata = self._identity_job()
+        record = automation_api.review_preparation.enqueue(self._identity_payload(), job_root=self.jobs)
+        record.update({"state": "error", "last_error_message": "review failed exit=1: adapter failed"})
+        path = automation_api.review_preparation.state_path("test-niche", "cid_001", job_root=self.jobs)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
+            automation_api.review_preparation, "enqueue"
+        ) as enqueue, patch.object(
+            automation_api.create_content_job_review.produce_batch, "process_job"
+        ) as production:
+            response = self._reconcile(**self._identity_payload(audio_file_id="other-audio"))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "content identity conflict")
+        enqueue.assert_not_called()
+        production.assert_not_called()
+
     def test_reconcile_unapproved_and_identity_conflict_are_safe(self):
         _, metadata = self._identity_job()
         self._identity_plan(metadata)

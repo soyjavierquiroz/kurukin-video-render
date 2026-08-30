@@ -694,6 +694,19 @@ def _safe_log_tail(log_path: Path, *, max_lines: int = 40, max_bytes: int = 8192
     return "\n".join(lines).strip()
 
 
+def _worker_failure_summary(log_path: Path) -> str:
+    """Extract the terminal MPT failure without reflecting task output."""
+    tail = _safe_log_tail(log_path)
+    for line in reversed(tail.splitlines()):
+        match = re.search(r"task failed,.*?stage:\s*[^,]+,\s*error:\s*(.+)$", line, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r"^ERROR:\s*\w+(?:Error|Exception):\s*(.+)$", line)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
 def run_logged(cmd: list[str], log_path: Path, *, cwd: Path = HOST_ROOT, timeout: int | None = None) -> None:
     global _current_process
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -720,6 +733,9 @@ def run_logged(cmd: list[str], log_path: Path, *, cwd: Path = HOST_ROOT, timeout
             stage = _stage_name_from_command(cmd)
             detail = _safe_log_tail(log_path)
             message = f"{stage} failed exit={code}"
+            summary = _worker_failure_summary(log_path)
+            if summary:
+                message += f": {summary}"
             if detail:
                 message += f"\n{detail}"
             raise StageError(message)
