@@ -182,6 +182,13 @@ class TestKurukinJobIntent(unittest.TestCase):
         self.assertFalse(is_safe_local_visual_path("storage/local_videos/.hidden.mp4"))
         self.assertTrue(is_safe_local_visual_path("storage/local_videos/video.mp4"))
 
+    def test_local_visual_picker_rejects_review_and_test_artifacts(self):
+        self.assertFalse(is_safe_local_visual_path(
+            "storage/local_videos/human-review/test-flip-False/001_segment-001_primary_asset-1.mp4"
+        ))
+        self.assertFalse(is_safe_local_visual_path("tests/fixtures/production-looking.mp4"))
+        self.assertTrue(is_safe_local_visual_path("storage/local_assets/approved/production-clip.mp4"))
+
     def test_local_visual_picker_prefers_video_over_image(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

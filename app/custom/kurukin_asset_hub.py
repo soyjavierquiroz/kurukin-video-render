@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
 import os
 from pathlib import Path
 import time
@@ -19,6 +20,7 @@ from app.custom.asset_hub_manifest import (
 
 
 DEFAULT_CREATED_BY = "money-printer-turbo"
+LOG = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_MATERIALIZE_TIMEOUT_SECONDS = 90
 MAX_ATTEMPTS = 3
@@ -327,15 +329,22 @@ class KurukinAssetProvider:
         last_error: Exception | None = None
         attempts = max(1, int(max_attempts))
         for attempt in range(attempts):
+            started = time.monotonic()
+            timeout_seconds = self.timeout if timeout is None else timeout
             try:
                 response = self.session.request(
                     method,
                     self._url(path),
                     headers=self._headers(),
                     json=deepcopy(json_body) if json_body is not None else None,
-                    timeout=self.timeout if timeout is None else timeout,
+                    timeout=timeout_seconds,
                 )
             except (requests.Timeout, requests.ConnectionError) as exc:
+                LOG.warning(
+                    "asset_hub request provider=asset_hub operation=%s attempt=%s/%s timeout_seconds=%s elapsed_ms=%s error_class=%s",
+                    "search" if path.endswith("/assets/search") else path, attempt + 1, attempts,
+                    timeout_seconds, int((time.monotonic() - started) * 1000), type(exc).__name__,
+                )
                 last_error = exc
                 if attempt == attempts - 1:
                     raise KurukinAssetHubUnavailableError("Asset Hub is unavailable after retries") from exc
@@ -343,6 +352,11 @@ class KurukinAssetProvider:
                 continue
 
             status = int(getattr(response, "status_code", 0) or 0)
+            LOG.info(
+                "asset_hub request provider=asset_hub operation=%s attempt=%s/%s timeout_seconds=%s elapsed_ms=%s status=%s",
+                "search" if path.endswith("/assets/search") else path, attempt + 1, attempts,
+                timeout_seconds, int((time.monotonic() - started) * 1000), status,
+            )
             if 200 <= status < 300:
                 try:
                     payload = response.json()
@@ -384,13 +398,17 @@ class KurukinAssetProvider:
         query: str,
         limit: int = 20,
         source_policy: Mapping[str, Any] | None = None,
+        max_attempts: int = MAX_ATTEMPTS,
     ) -> list[dict[str, Any]]:
         payload = {
             "query": _clean_text(query),
             "limit": validate_search_limit(limit),
             "source_policy": normalize_source_policy(source_policy),
         }
-        response = self._request("POST", "/api/assets/search", json_body=payload)
+        response = self._request(
+            "POST", "/api/assets/search", json_body=payload,
+            max_attempts=max_attempts,
+        )
         assets = response.get("assets") or []
         if not isinstance(assets, list):
             raise KurukinAssetHubError("Asset Hub search assets must be a list")

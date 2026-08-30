@@ -23,6 +23,9 @@ ASSET_USAGE_HISTORY_FILE = utils.storage_dir(os.path.join("asset_usage", "extern
 _ASSET_USAGE_RECENT_LIMIT = 200
 _EXTERNAL_ASSET_PROVIDERS = {"pexels", "pixabay", "coverr"}
 _SOURCE_ROTATION = ("pexels", "pixabay", "coverr")
+# Discovery calls must fail independently and promptly.  A provider outage
+# must not turn a multi-provider Human Review into a minutes-long serial wait.
+DISCOVERY_SEARCH_TIMEOUT = (5, 15)
 
 
 def parse_material_sources(source: str) -> tuple[str, ...]:
@@ -561,7 +564,7 @@ def search_videos_pexels(
             headers=headers,
             proxies=config.proxy,
             verify=_get_tls_verify(),
-            timeout=(30, 60),
+            timeout=DISCOVERY_SEARCH_TIMEOUT,
         )
         response = r.json()
         video_items = []
@@ -645,7 +648,7 @@ def search_videos_pixabay(
 
     try:
         r = requests.get(
-            query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=(30, 60)
+            query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=DISCOVERY_SEARCH_TIMEOUT
         )
         status_code = int(getattr(r, "status_code", 200))
         headers = getattr(r, "headers", {}) or {}
@@ -798,7 +801,7 @@ def search_videos_coverr(
             headers=headers,
             proxies=config.proxy,
             verify=_get_tls_verify(),
-            timeout=(30, 60),
+            timeout=DISCOVERY_SEARCH_TIMEOUT,
         )
         response = r.json()
         video_items: List[MaterialInfo] = []

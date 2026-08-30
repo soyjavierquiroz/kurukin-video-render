@@ -18,15 +18,24 @@ from loguru import logger
 from app.config import config
 from app.custom import asset_hub_manifest
 from app.custom import human_review
+from app.custom.kurukin_asset_hub import KurukinAssetHubUnavailableError
 from app.custom.material_acquisition import acquire_selected_materials
 from app.custom.material_discovery import (
     MaterialDiscoveryResult,
     discover_asset_hub_review_reserve_candidates,
     discover_asset_hub_title_fallback_candidates,
     discover_material_candidates,
+    provider_diagnostics_for_review,
 )
-from app.custom.material_selection import select_material_candidates
-from app.custom.material_source_policy import build_discovery_plan, material_source_policy_from_dict
+from app.custom.material_selection import (
+    empty_material_selection_result,
+    select_material_candidates,
+)
+from app.custom.material_source_policy import (
+    PROVIDER_ASSET_HUB,
+    build_discovery_plan,
+    material_source_policy_from_dict,
+)
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
@@ -1024,13 +1033,44 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
 def _select_autonomous_materials(task_id, params, video_terms, audio_duration, video_script: str = ""):
     """Run discovery and ranking without materializing selected assets."""
     policy = material_source_policy_from_dict(params.material_source_policy)
-    discovery = discover_material_candidates(
-        policy=policy,
-        stock_terms=video_terms,
-        asset_hub_terms=params.asset_hub_terms or None,
-        video_aspect=params.video_aspect,
-        minimum_duration=params.video_clip_duration,
+    is_human_review = bool(getattr(params, "human_review", None))
+    # Keep established V1 multi-provider discovery and selection for open
+    # policies (including GENERALES). Human Review applies the common V2
+    # editorial ranking later, after candidates have been normalized.
+    is_asset_hub_only_review = (
+        is_human_review
+        and policy.providers.enabled == (PROVIDER_ASSET_HUB,)
     )
+    if is_asset_hub_only_review:
+        # Review derives cadence from audio/clip duration and discovers its
+        # candidate pool exclusively from the V2 reserve below.
+        discovery = MaterialDiscoveryResult((), (), (), (), {"stock": (), "asset_hub": ()})
+    else:
+        # Human Review retrieval is scene-driven, not driven by the LLM's
+        # broad video terms.  Keep provider implementations untouched; this
+        # only supplies their normal discovery API with provider-local forms.
+        if is_human_review and video_script:
+            segment_count = max(1, int(math.ceil(max(float(audio_duration or 0), params.video_clip_duration) / params.video_clip_duration)))
+            query_maps = human_review.retrieval_queries_for_review_segments(
+                video_script, segment_count, getattr(params, "editorial_profile", None) or {},
+            )
+            stock_terms = tuple(dict.fromkeys(
+                query for item in query_maps for provider in ("pexels", "pixabay", "coverr")
+                for query in item.get(provider, ())
+            ))
+            asset_hub_terms = tuple(dict.fromkeys(
+                query for item in query_maps for query in item.get("asset_hub", ())
+            ))
+        else:
+            stock_terms = video_terms
+            asset_hub_terms = params.asset_hub_terms or None
+        discovery = discover_material_candidates(
+            policy=policy,
+            stock_terms=stock_terms,
+            asset_hub_terms=asset_hub_terms,
+            video_aspect=params.video_aspect,
+            minimum_duration=params.video_clip_duration,
+        )
 
     target_duration = audio_duration
     if target_duration <= 0:
@@ -1038,15 +1078,23 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
             params.video_clip_duration,
             len(video_terms) * params.video_clip_duration,
         )
-    recent_keys = material.recent_external_asset_keys()
-    selection = select_material_candidates(
-        discovery_result=discovery,
-        video_aspect=params.video_aspect,
-        target_duration=target_duration,
-        clip_duration=params.video_clip_duration,
-        recent_dedupe_keys=recent_keys,
+    recent_keys = material.recent_external_asset_keys() if not is_asset_hub_only_review else ()
+    selection = (
+        empty_material_selection_result(
+            video_aspect=params.video_aspect,
+            target_duration=target_duration,
+            clip_duration=params.video_clip_duration,
+        )
+        if is_asset_hub_only_review
+        else select_material_candidates(
+            discovery_result=discovery,
+            video_aspect=params.video_aspect,
+            target_duration=target_duration,
+            clip_duration=params.video_clip_duration,
+            recent_dedupe_keys=recent_keys,
+        )
     )
-    if selection.shortfall > 0:
+    if selection.shortfall > 0 and not is_asset_hub_only_review:
         title_fallback = discover_asset_hub_title_fallback_candidates(
             policy=policy,
             video_aspect=params.video_aspect,
@@ -1073,7 +1121,7 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
     # Human Review requires many more candidates than
     # autonomous rendering. PRIMARY selection is already frozen
     # above; everything added here is suggestions/backups only.
-    if getattr(params, "human_review", None):
+    if is_asset_hub_only_review:
         segment_queries = (
             human_review.visual_queries_for_review_segments(
                 video_script,
@@ -1104,14 +1152,7 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
                 terms=review_terms,
                 video_aspect=params.video_aspect,
                 limit_per_term=100,
-            )
-        )
-
-        title_reserve = (
-            discover_asset_hub_title_fallback_candidates(
-                policy=policy,
-                video_aspect=params.video_aspect,
-                limit=100,
+                queries_are_visual=True,
             )
         )
 
@@ -1128,7 +1169,6 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
                 or ()
             )
             + tuple(semantic_reserve.candidates)
-            + tuple(title_reserve.candidates)
         )
 
         for candidate in candidate_sources:
@@ -1166,9 +1206,6 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
                 + tuple(
                     semantic_reserve.diagnostics
                 )
-                + tuple(
-                    title_reserve.diagnostics
-                )
             ),
             providers_attempted=tuple(
                 dict.fromkeys(
@@ -1182,9 +1219,6 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
                     )
                     + tuple(
                         semantic_reserve.providers_attempted
-                    )
-                    + tuple(
-                        title_reserve.providers_attempted
                     )
                 )
             ),
@@ -1200,9 +1234,6 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
                     )
                     + tuple(
                         semantic_reserve.providers_succeeded
-                    )
-                    + tuple(
-                        title_reserve.providers_succeeded
                     )
                 )
             ),
@@ -1223,6 +1254,21 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
         )
 
     return discovery, selection
+
+
+def _human_review_plan_has_usable_candidates(plan: dict, target_count: int) -> bool:
+    """Reject a review plan that would otherwise complete with no choices."""
+    if target_count <= 0:
+        return True
+    for segment in plan.get("segments", ()) or ():
+        candidates = [segment.get("selected_asset")] + list(segment.get("alternatives", ()) or ())
+        if any(
+            isinstance(candidate, dict)
+            and str(candidate.get("asset_uid") or candidate.get("canonical_id") or candidate.get("url") or "").strip()
+            for candidate in candidates
+        ):
+            return True
+    return False
 
 
 def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) -> str | None:
@@ -1257,9 +1303,14 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
         discovery, selection = _select_autonomous_materials(
             task_id, params, video_terms, audio_duration, video_script
         )
+    except KurukinAssetHubUnavailableError:
+        # The host-owned review preparation record recognizes this as
+        # transient and moves it to retry_wait.  Do not convert it to a
+        # completed task with a missing plan.
+        raise
     except Exception as exc:
         return _mark_task_failed(task_id, "materials", str(exc))
-    if not selection.decisions:
+    if not selection.decisions and not getattr(params, "human_review", None):
         return _mark_task_failed(task_id, "materials", "No usable visual materials found")
 
     review = getattr(params, "human_review", None) or {}
@@ -1291,10 +1342,24 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
         ),
         material_title=str(review.get("material_title") or ""),
         source_policy=str(review.get("source_policy") or ""),
+        provider_diagnostics=provider_diagnostics_for_review(
+            discovery,
+            enabled_providers=policy.providers.enabled,
+            selection=selection,
+        ),
         selection_result=selection,
         discovery_result=discovery,
         output_path=output_path,
     )
+    if not _human_review_plan_has_usable_candidates(
+        plan,
+        int(getattr(selection, "target_count", 0) or 0),
+    ):
+        return _mark_task_failed(
+            task_id,
+            "review",
+            "human review preparation produced no usable candidates",
+        )
     sm.state.update_task(
         task_id,
         state=const.TASK_STATE_COMPLETE,

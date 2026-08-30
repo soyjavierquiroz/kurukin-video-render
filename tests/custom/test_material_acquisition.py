@@ -204,6 +204,25 @@ class TestMaterialAcquisition(unittest.TestCase):
                 )
         wire.assert_not_called()
 
+    def test_approved_missing_asset_fails_closed_with_segment_and_uid(self):
+        selected = MaterialCandidate("asset_hub", "A", "hub:A", "plan")
+        manifest = {
+            "manifest_version": "1.0", "generated_by": "kurukin-asset-hub",
+            "bundle_uid": "bundle", "status": "ready", "scenes": [],
+        }
+        with patch.dict("os.environ", {"ASSET_HUB_MATERIALIZED_ROOT": self.tmp.name}), \
+             patch("app.custom.material_acquisition.utils.storage_dir", self.storage), \
+             patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle", return_value={"asset_hub": {"bundle_uid": "bundle"}}):
+            with self.assertRaisesRegex(
+                MaterialAcquisitionError,
+                "approved asset materialization failed: segment_id=segment-001 asset_uid=A",
+            ):
+                acquire_selected_materials(
+                    selection_result=SimpleNamespace(decisions=(decision(selected),)), task_id="t1",
+                    asset_hub_provider=SimpleNamespace(get_renderer_manifest=lambda _uid: manifest),
+                    approved_plan=self.approved_plan(["A"]),
+                )
+
     def test_503_and_traversal_are_clear(self):
         hub = MaterialCandidate("asset_hub", "uid-a", "hub:a", "cat")
         error = RuntimeError("busy"); error.status_code = 503

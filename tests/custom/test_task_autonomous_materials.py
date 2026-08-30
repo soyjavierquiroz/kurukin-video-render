@@ -8,6 +8,7 @@ if importlib.util.find_spec("openai") is None:
 
 from app.models.schema import MaterialInfo, VideoParams
 from app.services import task
+from app.custom.material_discovery import MaterialDiscoveryResult
 
 
 class TestAutonomousMaterialPreparation(unittest.TestCase):
@@ -60,6 +61,28 @@ class TestAutonomousMaterialPreparation(unittest.TestCase):
         params = VideoParams(video_subject="cat", material_source_policy=self.policy())
         with patch.object(task, "discover_material_candidates", return_value=SimpleNamespace(candidates=())):
             self.assertEqual(task._prepare_autonomous_materials("t1", params, ["cat"], 5), "No usable visual materials found")
+
+    def test_human_review_skips_v1_and_derives_target_count_from_audio(self):
+        params = SimpleNamespace(
+            material_source_policy={
+                "providers": {"enabled": ["asset_hub"]},
+                "asset_hub": {"include": {"generic": True}},
+            },
+            asset_hub_terms=["tema"], video_aspect="9:16", video_clip_duration=5,
+            human_review={"enabled": True}, editorial_profile={},
+        )
+        reserve = MaterialDiscoveryResult((), (), ("asset_hub",), (), {"stock": (), "asset_hub": ("consulta",)})
+        with patch.object(task, "discover_material_candidates") as v1_discover, \
+             patch.object(task, "select_material_candidates") as v1_select, \
+             patch.object(task.human_review, "visual_queries_for_review_segments", return_value=[("consulta",)] * 3), \
+             patch.object(task, "discover_asset_hub_review_reserve_candidates", return_value=reserve) as v2_reserve:
+            discovery, selection = task._select_autonomous_materials("t1", params, ["tema"], 12, "guion")
+        v1_discover.assert_not_called()
+        v1_select.assert_not_called()
+        v2_reserve.assert_called_once()
+        self.assertEqual(selection.target_count, 3)
+        self.assertEqual(selection.decisions, ())
+        self.assertEqual(discovery.candidates, ())
 
     def test_pipeline_skips_discovery_without_policy_and_with_explicit_manifest(self):
         for policy, manifest in ((None, ""), (self.policy(), "/explicit.json")):

@@ -629,6 +629,14 @@ class KurukinAssetHubTests(unittest.TestCase):
         self.assertEqual(provider.get_renderer_manifest("bundle"), {"ok": True})
         self.assertEqual(len(provider.session.calls), 3)
 
+    def test_search_can_use_a_single_attempt_for_human_review_reserve(self):
+        provider = make_provider([requests.Timeout("timeout"), FakeResponse(200, {"assets": []})])
+        with self.assertRaises(KurukinAssetHubUnavailableError):
+            provider.search(
+                query="scene", source_policy={"sources": [{"scope": "generic"}]}, max_attempts=1,
+            )
+        self.assertEqual(len(provider.session.calls), 1)
+
     def test_count_zero_returns_empty_list(self):
         provider = make_provider([FakeResponse(200, {"count": 0, "assets": []})])
 

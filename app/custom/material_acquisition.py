@@ -143,6 +143,16 @@ def _approved_plan_scene_text_by_id(plan: Mapping[str, Any]) -> dict[str, str]:
     return scene_text
 
 
+def _approved_asset_failure(plan: Mapping[str, Any], asset_uids: list[str]) -> MaterialAcquisitionError:
+    """Name frozen assets in a fail-closed materialization error."""
+    scene_ids = _approved_plan_scene_ids_for_uids(plan, asset_uids)
+    details = ", ".join(
+        f"segment_id={scene_id or '<unknown>'} asset_uid={asset_uid}"
+        for scene_id, asset_uid in zip(scene_ids, asset_uids)
+    )
+    return MaterialAcquisitionError(f"approved asset materialization failed: {details}")
+
+
 def _asset_hub_materials(
     decisions: list[Any],
     task_id: str,
@@ -231,6 +241,8 @@ def _asset_hub_materials(
     }
     missing = [asset_uid for asset_uid in selected_uids if asset_uid not in assets_by_uid]
     if missing:
+        if approved_plan is not None:
+            raise _approved_asset_failure(approved_plan, missing)
         raise MaterialAcquisitionError("Asset Hub manifest is missing selected assets")
     materials = [
         MaterialInfo(
@@ -302,6 +314,15 @@ def acquire_selected_materials(*, selection_result: Any, task_id: str,
                 if attempt == 1:
                     print("ASSET HUB MATERIALIZATION WAIT attempt=1/3")
                 time.sleep(_APPROVED_MATERIALIZATION_BACKOFF_SECONDS[attempt - 1])
+            except MaterialAcquisitionError:
+                raise
+            except Exception as exc:
+                if approved_plan is not None:
+                    raise _approved_asset_failure(
+                        approved_plan,
+                        [str(decision.candidate.canonical_id) for decision in hub],
+                    ) from exc
+                raise
     hub_by_key = {decision.candidate.dedupe_key: info for decision, info in zip(hub, hub_infos)}
     result, manifest_items = [], []
     materials_dir.mkdir(parents=True, exist_ok=True)
@@ -319,6 +340,10 @@ def acquire_selected_materials(*, selection_result: Any, task_id: str,
                 candidate, str(materials_dir), task_id=task_id
             )
             if not local_path:
+                if approved_plan is not None:
+                    raise _approved_asset_failure(
+                        approved_plan, [str(getattr(candidate, "canonical_id", ""))]
+                    )
                 raise MaterialAcquisitionError(f"download failed for {provider}:{getattr(candidate, 'canonical_id', '')}")
             info = MaterialInfo(provider=provider, url=local_path, duration=int(float(getattr(candidate, "duration", 0) or 0)),
                                 source_info=_safe({"provider": provider, "asset_id": candidate.canonical_id,

@@ -1,11 +1,12 @@
 import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from app.custom.kurukin_asset_hub import KurukinAssetHubAuthError
+from app.custom.kurukin_asset_hub import KurukinAssetHubAuthError, KurukinAssetHubUnavailableError
 from app.custom.asset_search_v2 import build_visual_queries_v2
 from app.custom.material_discovery import (
     TITLE_PREFERRED_MIN_CANDIDATES,
@@ -13,6 +14,7 @@ from app.custom.material_discovery import (
     discover_asset_hub_title_fallback_candidates,
     discover_asset_hub_review_reserve_candidates,
     discover_material_candidates,
+    provider_diagnostics_for_review,
 )
 from app.custom.material_source_policy import (
     AssetHubCatalogPolicy,
@@ -26,7 +28,9 @@ from app.custom.material_source_policy import (
     PROVIDER_PEXELS,
     PROVIDER_PIXABAY,
 )
-from app.models.schema import MaterialInfo
+from app.custom.material_provider_availability import native_stock_provider_configured
+from app.config import config
+from app.models.schema import MaterialInfo, VideoAspect
 from app.services import material
 
 
@@ -66,12 +70,92 @@ def stock(provider, asset_id, *, filename=None):
 
 
 class TestMaterialDiscovery(unittest.TestCase):
+    def setUp(self):
+        # Discovery wiring tests model configured MPT providers; the explicit
+        # missing-config test below overrides this guard.
+        self._configured = patch(
+            "app.custom.material_discovery.native_stock_provider_configured",
+            return_value=True,
+        )
+        self._configured.start()
+        self.addCleanup(self._configured.stop)
+
     def assertDiverseQueries(self, queries):
         token_sets = [frozenset(query.lower().split()) for query in queries]
         self.assertEqual(len(token_sets), len(set(token_sets)))
         for left_index, left in enumerate(token_sets):
             for right in token_sets[left_index + 1:]:
                 self.assertNotEqual(left, right)
+
+    def _run_generales_native_stock_discovery(self, video_source):
+        """Run Kurukin's real stock discovery path with no cache or network."""
+        configured_keys = {
+            "pexels_api_keys": ["test-pexels-key"],
+            "pixabay_api_keys": ["test-pixabay-key"],
+            "coverr_api_keys": ["test-coverr-key"],
+            "video_source": video_source,
+        }
+        with patch.dict(config.app, configured_keys), \
+             patch(
+                 "app.custom.material_discovery.native_stock_provider_configured",
+                 wraps=native_stock_provider_configured,
+             ), \
+             patch.object(material.material_cache, "load_material_search_cache", return_value=None), \
+             patch.object(material.material_cache, "get_material_search_cache_lock", return_value=nullcontext()), \
+             patch.object(material.material_cache, "save_material_search_cache"), \
+             patch.object(material, "search_videos_pexels", return_value=[stock("pexels", "native-pexels")]) as pexels, \
+             patch.object(material, "search_videos_pixabay", return_value=[stock("pixabay", "native-pixabay")]) as pixabay, \
+             patch.object(material, "search_videos_coverr", return_value=[stock("coverr", "native-coverr")]) as coverr:
+            result = discover_material_candidates(
+                policy=policy(PROVIDER_PEXELS, PROVIDER_PIXABAY, PROVIDER_COVERR),
+                stock_terms=["woman worried at home"],
+            )
+        return result, {"pexels": pexels, "pixabay": pixabay, "coverr": coverr}
+
+    def test_generales_explicitly_dispatches_every_native_mpt_stock_provider(self):
+        result, searches = self._run_generales_native_stock_discovery("pexels")
+
+        for provider, search in searches.items():
+            with self.subTest(provider=provider):
+                search.assert_called_once_with(
+                    search_term="woman worried at home",
+                    minimum_duration=0,
+                    video_aspect=VideoAspect.portrait,
+                )
+        self.assertEqual(
+            {candidate.provider for candidate in result.candidates},
+            {PROVIDER_PEXELS, PROVIDER_PIXABAY, PROVIDER_COVERR},
+        )
+
+    def test_generales_dispatch_is_independent_of_vanilla_video_source(self):
+        called_sets = {}
+        for video_source in ("pexels", "pixabay"):
+            with self.subTest(video_source=video_source):
+                _result, searches = self._run_generales_native_stock_discovery(video_source)
+                called_sets[video_source] = {
+                    provider for provider, search in searches.items() if search.called
+                }
+                self.assertEqual(called_sets[video_source], {
+                    PROVIDER_PEXELS, PROVIDER_PIXABAY, PROVIDER_COVERR,
+                })
+
+        self.assertEqual(called_sets["pexels"], called_sets["pixabay"])
+
+    def test_native_stock_entrypoints_request_provider_specific_key_lists(self):
+        native_searches = (
+            ("pexels_api_keys", material.search_videos_pexels),
+            ("pixabay_api_keys", material.search_videos_pixabay),
+            ("coverr_api_keys", material.search_videos_coverr),
+        )
+        with patch.object(material, "get_api_key", return_value="test-key") as get_api_key, \
+             patch.object(material.requests, "get", side_effect=AssertionError("network disabled")):
+            for _key_name, search in native_searches:
+                search("woman worried at home", 0, VideoAspect.portrait)
+
+        self.assertEqual(
+            [call.args[0] for call in get_api_key.call_args_list],
+            [key_name for key_name, _search in native_searches],
+        )
 
     def test_visual_query_v2_compacts_long_conceptual_scene(self):
         queries = build_visual_queries_v2(
@@ -189,6 +273,19 @@ class TestMaterialDiscovery(unittest.TestCase):
         self.assertEqual([call[0] for call in calls], ["pexels", "pixabay", "coverr"])
         self.assertEqual(hub.calls[0][0], "es")
         self.assertEqual(result.providers_attempted, ("asset_hub", "pexels", "pixabay", "coverr"))
+
+    def test_each_stock_policy_provider_calls_its_native_mpt_entrypoint(self):
+        for provider in (PROVIDER_PEXELS, PROVIDER_PIXABAY, PROVIDER_COVERR):
+            with self.subTest(provider=provider), patch(
+                "app.custom.material_discovery.material.search_videos_for_provider",
+                return_value=[stock(provider, "native-1")],
+            ) as search:
+                result = discover_material_candidates(
+                    policy=policy(provider), stock_terms=["woman worried at home"],
+                )
+
+            search.assert_called_once_with(provider, "woman worried at home", 0, "9:16")
+            self.assertEqual(result.candidates[0].provider, provider)
 
     def test_terms_fallback_and_disabled_hub_is_not_instantiated(self):
         calls = []
@@ -546,6 +643,52 @@ class TestMaterialDiscovery(unittest.TestCase):
 
         self.assertEqual([item.canonical_id for item in result.candidates], ["v"])
 
+    def test_human_review_reserve_caches_equivalent_queries_within_one_job(self):
+        hub = FakeAssetHub({"shared": [{"asset_uid": "v", "orientation": "vertical-9x16"}]})
+        with patch("app.custom.material_discovery._asset_hub_search_queries", return_value=("shared",)):
+            discover_asset_hub_review_reserve_candidates(
+                policy=policy(PROVIDER_ASSET_HUB), terms=["scene one", "scene two"], asset_hub_provider=hub,
+            )
+        self.assertEqual([call[0] for call in hub.calls], ["shared"])
+
+    def test_human_review_reserve_opens_circuit_on_unavailable_provider(self):
+        hub = FakeAssetHub(error=KurukinAssetHubUnavailableError("offline"))
+        with self.assertRaises(KurukinAssetHubUnavailableError):
+            discover_asset_hub_review_reserve_candidates(
+                policy=policy(PROVIDER_ASSET_HUB), terms=["uno", "dos"], asset_hub_provider=hub,
+            )
+        self.assertEqual(len(hub.calls), 1)
+
+    def test_human_review_reserve_does_not_reexpand_v2_visual_queries(self):
+        hub = FakeAssetHub({"mujer triste tristeza": [{"asset_uid": "v", "orientation": "vertical-9x16"}]})
+        result = discover_asset_hub_review_reserve_candidates(
+            policy=policy(PROVIDER_ASSET_HUB),
+            terms=["mujer triste tristeza"],
+            asset_hub_provider=hub,
+            queries_are_visual=True,
+        )
+        self.assertEqual([call[0] for call in hub.calls], ["mujer triste tristeza"])
+        self.assertEqual([item.canonical_id for item in result.candidates], ["v"])
+
+    def test_scale_fixture_reports_human_review_request_budget(self):
+        """10 canonical scenes: old V1 was 3 queries x 3 tries per scene."""
+        terms = [f"visual scene {index}" for index in range(10)]
+        hub = FakeAssetHub({term: [] for term in terms})
+        discover_asset_hub_review_reserve_candidates(
+            policy=policy(PROVIDER_ASSET_HUB), terms=terms,
+            asset_hub_provider=hub, queries_are_visual=True,
+        )
+        report = {
+            "before_request_attempts": len(terms) * 3 * 3,
+            "before_timeout_seconds": len(terms) * 3 * 3 * 15,
+            "after_request_calls": len(hub.calls),
+            # The circuit opens on the first unavailable request.
+            "after_unavailable_timeout_seconds": 15,
+        }
+        self.assertEqual(report["after_request_calls"], 10)
+        self.assertEqual(report["before_request_attempts"], 90)
+        self.assertEqual(report["after_unavailable_timeout_seconds"], 15)
+
     def test_empty_is_success_and_partial_failure_continues(self):
         def search(provider, *_args):
             if provider == "pexels":
@@ -556,6 +699,42 @@ class TestMaterialDiscovery(unittest.TestCase):
         self.assertEqual(result.candidates, ())
         self.assertEqual(result.providers_succeeded, ("pixabay",))
         self.assertNotIn("secret", str(result.diagnostics).lower())
+
+    def test_provider_diagnostics_are_aggregated_and_sanitized(self):
+        def search(provider, *_args):
+            if provider == "pexels":
+                raise RuntimeError("503 api_key=secret")
+            return [stock(provider, provider)]
+        with patch("app.custom.material_discovery.material.search_videos_for_provider", search, create=True):
+            result = discover_material_candidates(
+                policy=policy(PROVIDER_PEXELS, PROVIDER_PIXABAY), stock_terms=["term"]
+            )
+        diagnostics = provider_diagnostics_for_review(
+            result, enabled_providers=(PROVIDER_PEXELS, PROVIDER_PIXABAY)
+        )
+        by_provider = {item["provider"]: item for item in diagnostics}
+        self.assertEqual(by_provider["pexels"]["status"], "error")
+        self.assertTrue(by_provider["pexels"]["attempted"])
+        self.assertNotIn("secret", str(by_provider["pexels"]).lower())
+        self.assertEqual(by_provider["pixabay"]["deduped_count"], 1)
+
+    def test_missing_native_configuration_is_reported_without_calling_mpt(self):
+        with patch("app.custom.material_discovery.native_stock_provider_configured", return_value=False), \
+             patch("app.custom.material_discovery.material.search_videos_for_provider") as search:
+            result = discover_material_candidates(
+                policy=policy(PROVIDER_PEXELS, PROVIDER_PIXABAY, PROVIDER_COVERR),
+                stock_terms=["woman worried at home"],
+            )
+
+        search.assert_not_called()
+        self.assertEqual([item.status for item in result.diagnostics], [
+            "config_missing", "config_missing", "config_missing",
+        ])
+        diagnostics = provider_diagnostics_for_review(
+            result,
+            enabled_providers=(PROVIDER_PEXELS, PROVIDER_PIXABAY, PROVIDER_COVERR),
+        )
+        self.assertEqual({item["status"] for item in diagnostics}, {"config_missing"})
 
     def test_only_provider_failure_and_hub_auth_are_fatal(self):
         with patch("app.custom.material_discovery.material.search_videos_for_provider", side_effect=RuntimeError("503"), create=True):
@@ -569,8 +748,13 @@ class TestMaterialDiscovery(unittest.TestCase):
         with patch("app.custom.material_discovery.KurukinAssetProvider", side_effect=AssertionError("no HTTP")):
             with self.assertRaises(CatalogExpansionRequired):
                 discover_material_candidates(policy=broad, stock_terms=["term"])
-        result = discover_material_candidates(policy=policy(PROVIDER_LOCAL), stock_terms=["term"])
-        self.assertEqual(result.diagnostics[0].status, "pending_adapter")
+        # Keep this independent from any real fixture or local asset in the
+        # workspace.  Discovery delegates only to the allow-listed picker; an
+        # explicit empty response models an empty safe local catalog.
+        with patch("app.custom.material_discovery.pick_local_visual_for_intent", return_value=None) as picker:
+            result = discover_material_candidates(policy=policy(PROVIDER_LOCAL), stock_terms=["term"])
+        picker.assert_called_once_with({"topic": "term", "visual_keywords": ["term"]})
+        self.assertEqual(result.diagnostics[0].status, "empty")
 
 
 if __name__ == "__main__":

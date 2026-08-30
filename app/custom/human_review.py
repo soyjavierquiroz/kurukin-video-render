@@ -25,6 +25,12 @@ from app.custom.asset_search_v2 import (
 )
 from app.custom.material_discovery import MaterialCandidate
 from app.custom.material_selection import MaterialSelectionDecision
+from app.custom.candidate_ranking_v2 import (
+    candidate_identity_keys,
+    rank_candidates_v2,
+    stable_secondary_dedupe,
+)
+from app.custom.scene_visual_intent import build_scene_visual_intent, build_scene_retrieval_queries
 from app.models.schema import MaterialInfo
 from app.utils import utils
 
@@ -287,6 +293,17 @@ def serialize_candidate(candidate: Any, decision: Any | None = None, thumbnail_p
     }
 
 
+def _serialize_v2_ranking(asset: dict[str, Any], ranking: Any | None) -> None:
+    if ranking is None:
+        return
+    asset["ranking_v2"] = {
+        "score": ranking.total_score,
+        "score_components": ranking.score_components,
+        "reason_codes": list(ranking.reason_codes),
+        "penalty_codes": list(ranking.penalty_codes),
+    }
+
+
 def _unique_candidates_by_uid(candidates: list[Any]) -> list[Any]:
     unique = []
     seen = set()
@@ -299,19 +316,23 @@ def _unique_candidates_by_uid(candidates: list[Any]) -> list[Any]:
     return unique
 
 
+def _unique_review_assets(assets: list[Any]) -> list[Any]:
+    """Preserve order while removing duplicate Asset Hub source identities."""
+    return stable_secondary_dedupe(assets)
+
+
 def _ranked_segment_candidates(
     candidate: Any,
     all_candidates: list[Any],
     preferred_terms: list[str] | tuple[str, ...] | None = None,
     editorial_profile: Mapping[str, Any] | None = None,
+    retrieval_queries: Mapping[str, tuple[str, ...]] | None = None,
 ) -> list[Any]:
     """
     Rank candidates for one scene.
 
-    Exact semantic-term matches stay first, but the rest of the
-    Human Review pool is always available as fallback. This avoids
-    starving a scene merely because its own search term returned
-    too few unique assets.
+    Use the segment's own retrieved subset first.  A global fallback is only
+    used on real scarcity; ranking still applies its compatibility gate.
     """
 
     candidate_key = getattr(
@@ -334,6 +355,9 @@ def _ranked_segment_candidates(
         for term in (preferred_terms or ())
         if str(term or "").strip()
     ]
+    for queries in (retrieval_queries or {}).values():
+        preferred.extend(str(query or "").strip() for query in queries if str(query or "").strip())
+    preferred = list(dict.fromkeys(preferred))
 
     preferred_matches = [
         item
@@ -384,12 +408,10 @@ def _ranked_segment_candidates(
         and item not in preferred_matches
     ]
 
-    ranked = _unique_candidates_by_uid(
-        preferred_matches
-        + [candidate]
-        + same_term
-        + remaining
-    )
+    local = _unique_candidates_by_uid(preferred_matches + [candidate] + same_term)
+    # Do not indiscriminately feed global candidates to every segment.  The
+    # caller can use this fallback only when the local subset is scarce.
+    ranked = local if len(local) >= 4 else _unique_candidates_by_uid(local + remaining)
     indexed = list(enumerate(ranked))
     indexed.sort(
         key=lambda item: (
@@ -411,10 +433,19 @@ def _visible_editorial_candidates(
     ]
 
 
-def _select_segment_candidate(ranked_candidates: list[Any], used_selected_asset_uids: set[str]) -> tuple[Any, bool]:
+def _select_segment_candidate(
+    ranked_candidates: list[Any],
+    used_selected_asset_uids: set[str],
+    used_selected_identity_keys: set[str] | None = None,
+) -> tuple[Any, bool]:
     for candidate in ranked_candidates:
         uid = candidate_uid(candidate)
-        if uid and uid not in used_selected_asset_uids:
+        identity_keys = candidate_identity_keys(candidate)
+        if (
+            uid
+            and uid not in used_selected_asset_uids
+            and not (used_selected_identity_keys and any(key in used_selected_identity_keys for key in identity_keys))
+        ):
             return candidate, False
     return None, False
 
@@ -1187,7 +1218,7 @@ def set_segment_backup(
                     f"{authorized_elsewhere}"
                 )
 
-        choices = _unique_assets_by_uid(
+        choices = _unique_review_assets(
             list(segment.get("alternatives") or [])
             + list(segment.get("backup_assets") or [])
             + [segment.get("original_selected_asset")]
@@ -1207,12 +1238,19 @@ def set_segment_backup(
                 f"asset {asset_uid} is not available for {segment_id}"
             )
 
-        backups = _unique_assets_by_uid(
+        backups = _unique_review_assets(
             list(segment.get("backup_assets") or [])
         )
 
         if enabled:
-            backups = _unique_assets_by_uid(backups + [candidate])
+            if any(
+                set(candidate_identity_keys(candidate)) & set(candidate_identity_keys(item))
+                for item in [primary] + backups
+            ):
+                raise ValueError(
+                    f"{asset_uid} duplicates an existing primary or backup source"
+                )
+            backups = _unique_review_assets(backups + [candidate])
         else:
             backups = [
                 item
@@ -1251,7 +1289,7 @@ def reorder_segment_backups(
         if segment.get("segment_id") != segment_id:
             continue
 
-        backups = _unique_assets_by_uid(list(segment.get("backup_assets") or []))
+        backups = _unique_review_assets(list(segment.get("backup_assets") or []))
         by_uid = {_asset_uid_value(asset): asset for asset in backups}
         unknown = [uid for uid in ordered if uid not in by_uid]
         if unknown:
@@ -2097,15 +2135,30 @@ def visual_queries_for_review_segments(
     existing_terms: list[str] | tuple[str, ...] | None = None,
     editorial_profile: Mapping[str, Any] | None = None,
 ) -> list[tuple[str, ...]]:
-    """Build scene-scoped Asset Search V2 queries for Human Review."""
+    """Compatibility API: return Asset Hub's segment-local visual queries."""
     fragments = split_script_for_segments(script_text, segment_count)
     return [
-        build_visual_queries_v2(
-            fragment,
-            existing_terms or (),
-            editorial_profile=editorial_profile,
+        build_scene_retrieval_queries(
+            build_scene_visual_intent(fragment, editorial_profile=editorial_profile),
+            "asset_hub",
         )
         for fragment in fragments
+    ]
+
+
+def retrieval_queries_for_review_segments(
+    script_text: str, segment_count: int, editorial_profile: Mapping[str, Any] | None = None,
+) -> list[dict[str, tuple[str, ...]]]:
+    """Build provider representations from one SceneVisualIntent per scene."""
+    return [
+        {
+            provider: build_scene_retrieval_queries(intent, provider)
+            for provider in ("pexels", "pixabay", "coverr", "asset_hub")
+        }
+        for intent in (
+            build_scene_visual_intent(fragment, editorial_profile=editorial_profile)
+            for fragment in split_script_for_segments(script_text, segment_count)
+        )
     ]
 
 
@@ -2125,6 +2178,7 @@ def build_plan(
     asset_hub_source_policy: Mapping[str, Any] | None = None,
     material_title: str = "",
     source_policy: str = "",
+    provider_diagnostics: list[dict[str, Any]] | None = None,
     selection_result: Any,
     discovery_result: Any,
     output_path: Path,
@@ -2144,17 +2198,12 @@ def build_plan(
     # remains an editorial cadence, but is not a fixed-duration timeline grid.
     editorial_profile = normalize_editorial_profile(editorial_profile)
     script_fragments = split_script_for_segments(script_text, target_segment_count)
-    segment_queries = visual_queries_for_review_segments(
-        script_text,
-        target_segment_count,
-        tuple(getattr(selection_result, "search_terms", ()) or ()),
-        editorial_profile,
-    )
+    segment_query_maps = retrieval_queries_for_review_segments(script_text, target_segment_count, editorial_profile)
     review_inputs = [
         (
             selected_decisions[index] if index < len(selected_decisions) else None,
             script_fragments[index],
-            segment_queries[index] if index < len(segment_queries) else (),
+            segment_query_maps[index] if index < len(segment_query_maps) else {},
         )
         for index in range(target_segment_count)
         if index < len(script_fragments)
@@ -2180,39 +2229,58 @@ def build_plan(
 
     reserved_segments = []
     used_selected_asset_uids: set[str] = set()
+    used_selected_identity_keys: set[str] = set()
+    previous_selected_candidates: list[Any] = []
 
-    for decision, _script_fragment, queries in review_inputs:
+    for decision, script_fragment, query_map in review_inputs:
         original_candidate = getattr(decision, "candidate", None)
 
         ranked_candidates = _ranked_segment_candidates(
             original_candidate,
             all_candidates,
-            queries,
+            tuple(query for values in query_map.values() for query in values),
             editorial_profile,
+            retrieval_queries=query_map,
         )
 
         visible_ranked_candidates = _visible_editorial_candidates(
             ranked_candidates,
             editorial_profile,
         )
+        intent = build_scene_visual_intent(script_fragment, editorial_profile=editorial_profile, visual_style=visual_style)
+        # Discovery stays provider-specific, while all normalized eligible
+        # candidates compete here against the same scene intent.
+        if visible_ranked_candidates:
+            v2_ranked = rank_candidates_v2(intent, visible_ranked_candidates, video_aspect=aspect_ratio, clip_duration=float(getattr(getattr(selection_result, "options", None), "clip_duration", 5) or 5), previous_candidates=previous_selected_candidates)
+            visible_ranked_candidates = stable_secondary_dedupe(
+                [item for item, _ranking in v2_ranked]
+            )
+            ranking_by_uid = {candidate_uid(item): ranking for item, ranking in v2_ranked}
+        else:
+            ranking_by_uid = {}
 
         candidate, forced_repeat = _select_segment_candidate(
             visible_ranked_candidates,
             used_selected_asset_uids,
+            used_selected_identity_keys,
         )
 
         selected_uid = candidate_uid(candidate) if candidate is not None else ""
 
         if selected_uid:
             used_selected_asset_uids.add(selected_uid)
+            used_selected_identity_keys.update(candidate_identity_keys(candidate))
+            previous_selected_candidates.append(candidate)
 
         reserved_segments.append(
             (
                 decision,
-                _script_fragment,
-                queries,
+                script_fragment,
+                query_map,
                 original_candidate,
                 visible_ranked_candidates,
+                intent,
+                ranking_by_uid,
                 candidate,
                 forced_repeat,
             )
@@ -2221,18 +2289,11 @@ def build_plan(
     # ----------------------------------------------------------
     # PASS 2
     #
-    # Allocate suggestions fairly.
-    #
-    # Old behavior filled 3 suggestions for early scenes first,
-    # starving later scenes. V3 uses round-robin:
-    #
-    #   every scene gets suggestion #1 before anyone gets #2;
-    #   every scene gets #2 before anyone gets #3.
-    #
-    # All visible asset_uids remain globally unique.
+    # Allocate up to three segment-local suggestions. PRIMARY identities are
+    # globally reserved; alternatives intentionally are not, because Review
+    # does not materialize one until an operator promotes it.
     # ----------------------------------------------------------
 
-    used_suggestion_asset_uids: set[str] = set()
     assigned_suggestions: list[list[Any]] = [
         []
         for _ in reserved_segments
@@ -2244,9 +2305,11 @@ def build_plan(
         (
             decision,
             script_fragment,
-            queries,
+            query_map,
             original_candidate,
             ranked_candidates,
+            intent,
+            ranking_by_uid,
             candidate,
             forced_repeat,
         ) = reserved
@@ -2264,51 +2327,36 @@ def build_plan(
             if alt_uid == selected_uid:
                 continue
 
-            # No PRIMARY may appear anywhere as suggestion.
-            if alt_uid in used_selected_asset_uids:
-                continue
-
             queue.append(alt)
 
         candidate_queues.append(queue)
 
-    # First give every scene one option, then second, then third.
-    for slot in range(3):
-        for segment_index, queue in enumerate(
-            candidate_queues
-        ):
-            if len(
-                assigned_suggestions[segment_index]
-            ) > slot:
+    alternative_frequency: dict[str, int] = {}
+    for segment_index, queue in enumerate(candidate_queues):
+        local_identities: set[str] = set()
+        _reserved = reserved_segments[segment_index]
+        ranking_by_uid = _reserved[6]
+        # Alternatives remain reusable.  A tiny score adjustment only breaks
+        # near ties, reducing repeated suggestion sets without starving later
+        # scenes of otherwise useful options.
+        queue = sorted(
+            enumerate(queue),
+            key=lambda item: (
+                -((ranking_by_uid.get(candidate_uid(item[1])).total_score if ranking_by_uid.get(candidate_uid(item[1])) else 0.0)
+                  - .015 * alternative_frequency.get(candidate_uid(item[1]), 0)),
+                item[0],
+            ),
+        )
+        for _position, alt in queue:
+            alt_uid = candidate_uid(alt)
+            identity_keys = candidate_identity_keys(alt)
+            if not alt_uid or any(key in local_identities for key in identity_keys):
                 continue
-
-            chosen = None
-
-            for alt in queue:
-                alt_uid = candidate_uid(alt)
-
-                if (
-                    not alt_uid
-                    or alt_uid
-                    in used_suggestion_asset_uids
-                ):
-                    continue
-
-                chosen = alt
+            assigned_suggestions[segment_index].append(alt)
+            local_identities.update(identity_keys)
+            alternative_frequency[alt_uid] = alternative_frequency.get(alt_uid, 0) + 1
+            if len(assigned_suggestions[segment_index]) == 3:
                 break
-
-            if chosen is None:
-                continue
-
-            chosen_uid = candidate_uid(chosen)
-
-            used_suggestion_asset_uids.add(
-                chosen_uid
-            )
-
-            assigned_suggestions[
-                segment_index
-            ].append(chosen)
 
     for index, reserved in enumerate(
         reserved_segments,
@@ -2320,6 +2368,8 @@ def build_plan(
             queries,
             original_candidate,
             ranked_candidates,
+            intent,
+            ranking_by_uid,
             candidate,
             forced_repeat,
         ) = reserved
@@ -2369,6 +2419,7 @@ def build_plan(
                 selected_decision,
                 selected_thumb,
             )
+            _serialize_v2_ranking(selected_asset, ranking_by_uid.get(selected_uid))
 
             selected_asset["preview"] = (
                 selected_preview
@@ -2442,6 +2493,7 @@ def build_plan(
                 None,
                 alt_thumb,
             )
+            _serialize_v2_ranking(payload, ranking_by_uid.get(candidate_uid(alt)))
 
             payload["preview"] = alt_preview
 
@@ -2454,6 +2506,17 @@ def build_plan(
 
             segment_warnings.extend(
                 alt_preview_warnings
+            )
+
+        if candidate is not None and len(ranked_candidates) == 1:
+            segment_warnings.append(
+                {
+                    "type": "candidate_scarcity",
+                    "code": "candidate_scarcity",
+                    "message": "only one eligible unique candidate was available for this scene",
+                    "segment_id": f"segment-{index:03d}",
+                    "candidate_pool_count": 1,
+                }
             )
 
         segment_duration = segment_durations[index - 1]
@@ -2471,10 +2534,13 @@ def build_plan(
                 "script_text": (
                     script_fragment
                 ),
-                "search_terms": [
-                    str(query)
-                    for query in queries
-                ] or [
+                "scene_visual_intent": intent.to_dict(),
+                "candidate_pool_count": len(ranked_candidates),
+                "search_terms": list(dict.fromkeys([
+                    *[str(query) for query in query_map.get("asset_hub", ())],
+                    str(getattr(original_candidate, "search_term", "") or ""),
+                    str(getattr(candidate, "search_term", "") or ""),
+                ])) or [
                     str(
                         getattr(
                             candidate,
@@ -2484,6 +2550,18 @@ def build_plan(
                         or ""
                     )
                 ],
+                "retrieval_queries": {provider: list(values) for provider, values in query_map.items()},
+                "candidate_funnel": {
+                    "providers": {
+                        provider: {
+                            "retrieved": sum(str(getattr(item, "provider", "")) == provider for item in ranked_candidates),
+                            "eligible": sum(str(getattr(item, "provider", "")) == provider for item in visible_ranked_candidates),
+                            "ranked": sum(str(getattr(item, "provider", "")) == provider for item in visible_ranked_candidates if candidate_uid(item) in ranking_by_uid),
+                        }
+                        for provider in sorted({str(getattr(item, "provider", "")) for item in ranked_candidates if str(getattr(item, "provider", ""))})
+                    },
+                    "scarcity_reason": "segment_local_scarcity_global_compatibility_fallback" if len(ranked_candidates) < 4 else "",
+                },
                 "selected_asset": (
                     selected_asset
                 ),
@@ -2526,13 +2604,25 @@ def build_plan(
         "material_title": str(material_title or ""),
         "title_scope": str(material_title or ""),
         "source_policy": str(source_policy or ""),
+        "provider_diagnostics": [dict(item) for item in (provider_diagnostics or [])],
         "review_required": True,
         "review_status": STATUS_PENDING,
+        "visual_search_version": "scene-intent-v2",
+        "visual_ranking_version": "candidate-ranking-v2",
         "created_at": existing.get("created_at") or utc_timestamp(),
         "updated_at": utc_timestamp(),
         "segments": segments,
         "warnings": collect_warnings(segments, aspect_ratio),
     }
+    visible_by_provider: dict[str, int] = {}
+    for segment in segments:
+        for asset in [segment.get("selected_asset")] + list(segment.get("alternatives") or []):
+            if isinstance(asset, Mapping):
+                provider = str(asset.get("provider") or "").strip()
+                if provider:
+                    visible_by_provider[provider] = visible_by_provider.get(provider, 0) + 1
+    for item in plan["provider_diagnostics"]:
+        item["review_visible_count"] = visible_by_provider.get(str(item.get("provider") or ""), 0)
     refresh_plan_coverage(plan)
     write_json_atomic(output_path, plan)
     return plan
@@ -2609,7 +2699,7 @@ def replace_segment_asset(
 
         # A replacement may come from suggestions or an explicitly
         # approved backup.
-        choices = _unique_assets_by_uid(
+        choices = _unique_review_assets(
             [current] + alternatives + backups
         )
 
@@ -2639,14 +2729,18 @@ def replace_segment_asset(
         # A PRIMARY cannot simultaneously be a BACKUP.
         segment["backup_assets"] = [
             item
-            for item in _unique_assets_by_uid(backups)
+            for item in _unique_review_assets(backups)
             if _asset_uid_value(item) != asset_uid
+            and not (
+                set(candidate_identity_keys(item))
+                & set(candidate_identity_keys(replacement_asset))
+            )
         ]
 
         # The new PRIMARY must not remain in SUGGESTED.
         # Put the old PRIMARY back into suggestions so the human can
         # undo/reconsider the choice.
-        suggestion_pool = _unique_assets_by_uid(
+        suggestion_pool = _unique_review_assets(
             [old_primary] + alternatives
         )
 
@@ -2654,6 +2748,10 @@ def replace_segment_asset(
             item
             for item in suggestion_pool
             if _asset_uid_value(item) != asset_uid
+            and not (
+                set(candidate_identity_keys(item))
+                & set(candidate_identity_keys(replacement_asset))
+            )
         ][:3]
 
         segment["feedback"] = {

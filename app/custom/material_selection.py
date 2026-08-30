@@ -235,3 +235,13 @@ def select_material_candidates(*, discovery_result: Any, video_aspect: str, targ
     covered = tuple(dict.fromkeys(str(getattr(d.candidate, "search_term", "") or "") for d in decisions if getattr(d.candidate, "search_term", "")))
     return MaterialSelectionResult(options, tuple(decisions), target, len(decisions), max(0, target-len(decisions)),
                                    recent_fallback, covered, sum(item.effective_duration for item in decisions))
+
+
+def empty_material_selection_result(*, video_aspect: str, target_duration: float,
+                                    clip_duration: float) -> MaterialSelectionResult:
+    """Describe a required scene cadence without discovering candidates."""
+    if clip_duration <= 0:
+        raise ValueError("clip_duration must be positive")
+    options = MaterialSelectionOptions(str(video_aspect), float(target_duration), float(clip_duration))
+    target = max(0, int(ceil(max(0.0, options.target_duration) / options.clip_duration)))
+    return MaterialSelectionResult(options, (), target, 0, target, False, (), 0.0)

@@ -21,6 +21,7 @@ from app.custom.material_source_policy import (
     build_asset_hub_source_policy,
     open_sources_policy,
 )
+from app.custom.material_provider_availability import native_stock_provider_configured
 
 try:  # Supports both ``python scripts/...`` and package imports in tests.
     from scripts.niche_registry import DEFAULT_REGISTRY_PATH, NicheRegistryError, load_niche
@@ -84,7 +85,20 @@ def resolve_asset_profile(
         )
 
     if profile.get("use_current_generic_routing"):
-        return open_sources_policy()
+        # GENERALES retains native MPT support, but must not advertise a stock
+        # provider as enabled until the exact key list its native function
+        # consumes is configured in this runtime.
+        open_policy = open_sources_policy()
+        enabled = tuple(
+            provider
+            for provider in open_policy.providers.enabled
+            if provider not in {"pexels", "pixabay", "coverr"}
+            or native_stock_provider_configured(provider)
+        )
+        return MaterialSourcePolicy(
+            providers=MaterialProviderPolicy(enabled),
+            asset_hub=open_policy.asset_hub,
+        )
 
     return MaterialSourcePolicy(
         providers=MaterialProviderPolicy(profile["providers"]),

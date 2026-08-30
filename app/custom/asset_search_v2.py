@@ -6,6 +6,8 @@ import re
 import unicodedata
 from typing import Any, Mapping, Sequence
 
+from app.custom.scene_visual_intent import SceneVisualIntent, build_scene_visual_intent
+
 
 _STOPWORDS = {
     "a", "al", "algo", "ante", "asi", "aunque", "cada", "como", "con",
@@ -333,13 +335,23 @@ def _hints_are_compatible(
 
 
 def build_visual_queries_v2(
-    scene_text: str,
+    scene_text: str | SceneVisualIntent,
     existing_terms: Sequence[str] | None = None,
     *,
     editorial_profile: Mapping[str, Any] | None = None,
     max_queries: int = 3,
 ) -> tuple[str, ...]:
     """Build compact, diverse lexical visual queries without extra AI calls."""
+    # Keep the old string contract for all existing callers, while allowing
+    # Human Review to pass the structured scene understanding directly.
+    if isinstance(scene_text, SceneVisualIntent):
+        intent = scene_text
+        scene_text = " ".join((*intent.literal_concepts, *intent.emotional_intent, *intent.action, *intent.environment, *intent.relationship_context))
+    else:
+        intent = build_scene_visual_intent(scene_text, editorial_profile=editorial_profile)
+    # Intent concepts supplement the established lexical rules; they never
+    # replace them, preserving current query behavior for historical callers.
+    existing_terms = tuple(existing_terms or ()) + tuple(intent.emotional_intent) + tuple(intent.action) + tuple(intent.environment)
     scene_tokens = _clean_tokens([scene_text])
     if not scene_tokens:
         return ()

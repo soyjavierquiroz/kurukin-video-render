@@ -14,15 +14,22 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 VISUAL_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
 
-DEFAULT_SAFE_VISUAL_DIRS = (
+# These are production asset roots, not a convenient recursive search list.
+# In particular test fixtures and review-generated assets must never become
+# candidates just because they happen to be below the repository root.
+DEFAULT_PRODUCTION_VISUAL_DIRS = (
     Path("storage/local_videos"),
     Path("storage/local_images"),
     Path("storage/job-assets"),
     Path("storage/local_assets"),
     Path("resource/videos"),
     Path("resource/images"),
-    Path("tests/fixtures"),
 )
+
+# Backwards-compatible name for callers that import it.  Its contents are
+# deliberately production-only.
+DEFAULT_SAFE_VISUAL_DIRS = DEFAULT_PRODUCTION_VISUAL_DIRS
+_NON_PRODUCTION_PATH_PARTS = {"tests", "test", "fixtures", "fixture", "tmp", "temp"}
 
 VERTICAL_NAME_HINTS = (
     "vertical",
@@ -90,11 +97,14 @@ def _normalize_for_match(value: Any) -> str:
 
 
 def _allowed_dirs(extra_dirs: list[str] | None = None) -> tuple[Path, ...]:
-    dirs = list(DEFAULT_SAFE_VISUAL_DIRS)
+    dirs = list(DEFAULT_PRODUCTION_VISUAL_DIRS)
     for item in extra_dirs or []:
         text = _clean_text(item)
-        if text:
-            dirs.append(Path(text))
+        candidate = Path(text) if text else None
+        # Callers cannot widen the production boundary.  Retain the argument
+        # only for compatibility with callers that repeat a declared root.
+        if candidate in DEFAULT_PRODUCTION_VISUAL_DIRS and candidate not in dirs:
+            dirs.append(candidate)
     return tuple(dirs)
 
 
@@ -127,6 +137,13 @@ def _safe_relative_visual_path(
     if candidate.is_absolute() or ".." in candidate.parts:
         return ""
     if _has_hidden_part(candidate):
+        return ""
+    normalized_parts = tuple(part.lower() for part in candidate.parts)
+    if any(part in _NON_PRODUCTION_PATH_PARTS or part.startswith("test-") for part in normalized_parts):
+        return ""
+    # Human-review output is a generated review artifact, never a source
+    # library.  This blocks e.g. storage/local_videos/human-review/test-*.
+    if "human-review" in normalized_parts:
         return ""
     if candidate.suffix.lower() not in VISUAL_EXTENSIONS:
         return ""

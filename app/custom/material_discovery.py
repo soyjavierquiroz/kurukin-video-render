@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import re
 from typing import Any, Mapping, Sequence
 
@@ -24,6 +25,10 @@ from app.custom.material_source_policy import (
     build_discovery_plan,
 )
 from app.custom.material_selection import _is_orientation_compatible
+from app.custom.material_provider_availability import (
+    native_stock_config_key,
+    native_stock_provider_configured,
+)
 from app.custom.kurukin_local_visual_picker import pick_local_visual_for_intent
 from app.services import material
 
@@ -77,6 +82,9 @@ class DiscoveryDiagnostic:
     status: str
     message: str
     candidate_count: int | None = None
+    raw_count: int | None = None
+    normalized_count: int | None = None
+    orientation_valid_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,51 @@ class MaterialDiscoveryResult:
     providers_attempted: tuple[str, ...]
     providers_succeeded: tuple[str, ...]
     terms_used: dict[str, tuple[str, ...]]
+
+
+def provider_diagnostics_for_review(
+    result: MaterialDiscoveryResult,
+    *,
+    enabled_providers: Sequence[str],
+    selection: Any = None,
+) -> list[dict[str, Any]]:
+    """Return secret-safe, durable funnel data for a review plan."""
+    diagnostics = tuple(getattr(result, "diagnostics", ()) or ())
+    candidates = tuple(getattr(result, "candidates", ()) or ())
+    decisions = tuple(getattr(selection, "decisions", ()) or ())
+    payload: list[dict[str, Any]] = []
+    for provider in enabled_providers:
+        entries = [item for item in diagnostics if item.provider == provider]
+        failures = [item for item in entries if item.status == "error"]
+        config_missing = [item for item in entries if item.status == "config_missing"]
+        unavailable = [item for item in entries if item.status == "unavailable"]
+        raw = sum(int(item.raw_count or 0) for item in entries)
+        normalized = sum(int(item.normalized_count or 0) for item in entries)
+        orientation_valid = sum(int(item.orientation_valid_count or item.candidate_count or 0) for item in entries)
+        deduped = sum(1 for item in candidates if getattr(item, "provider", "") == provider)
+        selected = sum(1 for item in decisions if getattr(getattr(item, "candidate", None), "provider", "") == provider)
+        status = (
+            "error" if failures else
+            "config_missing" if config_missing else
+            "unavailable" if unavailable else
+            ("success" if deduped else "empty")
+        )
+        problem = (failures or config_missing or unavailable)
+        payload.append({
+            "provider": provider,
+            "attempted": provider in getattr(result, "providers_attempted", ()),
+            "status": status,
+            "adapter_status": "operational" if status not in {"config_missing", "unavailable"} else status,
+            "raw_count": raw,
+            "normalized_count": normalized,
+            "orientation_valid_count": orientation_valid,
+            "deduped_count": deduped,
+            "selected_count": selected,
+            "review_visible_count": 0,
+            "error_class": problem[0].message.split(":", 1)[0] if problem else "",
+            "error": problem[0].message if problem else "",
+        })
+    return payload
 
 
 def _normalize_terms(values: Sequence[str] | None) -> tuple[str, ...]:
@@ -210,6 +263,17 @@ def _orientation(width: int | None, height: int | None) -> str | None:
 
 def _stock_candidate(item: Any, *, provider: str, term: str, rank: int) -> MaterialCandidate | None:
     info = _sanitize_source_info(getattr(item, "source_info", None))
+    # Normalize public stock metadata into the same review/ranking contract as
+    # Asset Hub.  Adapters need not provide every field: unavailable signals
+    # are omitted and the ranking renormalizes over what is present.
+    for field in (
+        "title", "description", "tags", "keywords", "duration", "width", "height",
+        "orientation", "preview", "thumbnail_url", "source_identity", "source_url",
+        "rights_state", "rights", "license", "media_type", "visual_description",
+    ):
+        value = getattr(item, field, None)
+        if value not in (None, ""):
+            info.setdefault(field, value)
     asset_id = None
     for name in ("asset_id", "video_id", "id"):
         value = getattr(item, name, None)
@@ -226,6 +290,7 @@ def _stock_candidate(item: Any, *, provider: str, term: str, rank: int) -> Mater
     height = _safe_number(getattr(item, "height", None), int) or _safe_number(rendition.get("height"), int)
     duration = _safe_number(getattr(item, "duration", None), float)
     canonical_id = f"{provider}:{asset_id}"
+    info.setdefault("provider_asset_id", asset_id)
     return MaterialCandidate(
         provider=provider,
         canonical_id=canonical_id,
@@ -256,6 +321,13 @@ def _asset_hub_candidate(asset: Mapping[str, Any], *, term: str, rank: int) -> M
             "action_description", "contains_people", "people_count",
             "visual_presentation", "visual_presentation_confidence",
             "person_visibility",
+            # Native Asset Hub metadata retained verbatim for review/ranking.
+            "tags", "search_text", "embedding_text", "presentation",
+            "editorial_quality", "quality_score", "vertical_suitability",
+            "horizontal_suitability", "camera_motion", "rights_state", "rights",
+            "production_eligible", "authorized", "provenance_state",
+            "safe_for_subtitles", "safe_for_text_overlay", "provider_asset_id", "source_identity",
+            "source_url", "source_provider", "provider",
         )
         if key in source
     }
@@ -321,8 +393,21 @@ def _asset_hub_found_candidates(
     original_term: str,
     video_aspect: str,
     limit: int = 20,
+    request_attempts: int | None = None,
+    search_cache: dict[tuple[str, str, int], list[dict[str, Any]]] | None = None,
 ) -> list[MaterialCandidate]:
-    assets = provider.search(query=query, source_policy=source_policy, limit=limit)
+    cache_key = (query, json.dumps(source_policy, sort_keys=True), limit)
+    if search_cache is not None and cache_key in search_cache:
+        assets = search_cache[cache_key]
+    elif request_attempts is not None and isinstance(provider, KurukinAssetProvider):
+        assets = provider.search(
+            query=query, source_policy=source_policy, limit=limit,
+            max_attempts=request_attempts,
+        )
+    else:
+        assets = provider.search(query=query, source_policy=source_policy, limit=limit)
+    if search_cache is not None and cache_key not in search_cache:
+        search_cache[cache_key] = assets
     candidates = []
     for index, asset in enumerate(assets):
         if not _asset_hub_is_video_asset(asset):
@@ -398,10 +483,13 @@ def _asset_hub_multi_query_candidates(
     video_aspect: str,
     clip_duration: int | float,
     limit: int = 20,
+    request_attempts: int | None = None,
+    search_cache: dict[tuple[str, str, int], list[dict[str, Any]]] | None = None,
+    queries_are_visual: bool = False,
 ) -> tuple[list[MaterialCandidate], list[DiscoveryDiagnostic]]:
     batches: list[list[MaterialCandidate]] = []
     diagnostics: list[DiscoveryDiagnostic] = []
-    for query in _asset_hub_search_queries(term):
+    for query in ((term,) if queries_are_visual else _asset_hub_search_queries(term)):
         found = _asset_hub_found_candidates(
             provider,
             query=query,
@@ -409,6 +497,8 @@ def _asset_hub_multi_query_candidates(
             original_term=term,
             video_aspect=video_aspect,
             limit=limit,
+            request_attempts=request_attempts,
+            search_cache=search_cache,
         )
         diagnostics.append(DiscoveryDiagnostic(PROVIDER_ASSET_HUB, query, "success", "ok", len(found)))
         batches.append(found)
@@ -431,6 +521,9 @@ def _search_title_preferred_asset_hub(
     video_aspect: str,
     clip_duration: int | float,
     limit: int,
+    request_attempts: int | None = None,
+    search_cache: dict[tuple[str, str, int], list[dict[str, Any]]] | None = None,
+    queries_are_visual: bool = False,
 ) -> tuple[list[MaterialCandidate], list[DiscoveryDiagnostic]]:
     title_found, diagnostics = _asset_hub_multi_query_candidates(
         provider,
@@ -439,6 +532,9 @@ def _search_title_preferred_asset_hub(
         video_aspect=video_aspect,
         clip_duration=clip_duration,
         limit=limit,
+        request_attempts=request_attempts,
+        search_cache=search_cache,
+        queries_are_visual=queries_are_visual,
     )
     if len(title_found) >= TITLE_PREFERRED_MIN_CANDIDATES:
         return title_found, diagnostics
@@ -450,6 +546,9 @@ def _search_title_preferred_asset_hub(
         video_aspect=video_aspect,
         clip_duration=clip_duration,
         limit=limit,
+        request_attempts=request_attempts,
+        search_cache=search_cache,
+        queries_are_visual=queries_are_visual,
     )
     merged = _merge_asset_hub_query_results(
         (title_found, generic_found),
@@ -517,12 +616,21 @@ def discover_material_candidates(
                     source_info=_sanitize_source_info({"source": picked.get("source"), "type": picked.get("type")})))
                 local_count += 1
             diagnostics.append(DiscoveryDiagnostic(
-                provider, None, "success" if local_count else "pending_adapter",
-                "local safe picker searched" if local_count else "local safe picker found no usable visual", local_count))
+                provider, None, "success" if local_count else "empty",
+                "local production picker searched" if local_count else "local production picker found no usable visual",
+                local_count, local_count, local_count, local_count))
             if local_count:
                 succeeded.append(provider)
             continue
         terms = normalized_hub_terms if provider == PROVIDER_ASSET_HUB else normalized_stock_terms
+        if provider != PROVIDER_ASSET_HUB and not native_stock_provider_configured(provider):
+            config_key = native_stock_config_key(provider) or "native provider configuration"
+            diagnostics.append(DiscoveryDiagnostic(
+                provider, None, "config_missing",
+                f"MPT native configuration missing: {config_key}",
+                0, 0, 0, 0,
+            ))
+            continue
         if provider == PROVIDER_ASSET_HUB:
             active_provider = asset_hub_provider or KurukinAssetProvider()
             source_policy = plan["asset_hub"]["source_policy"]
@@ -532,10 +640,11 @@ def discover_material_candidates(
                 if provider != PROVIDER_ASSET_HUB:
                     remote_attempts += 1
                     items = material.search_videos_for_provider(provider, term, minimum_duration, video_aspect)
-                    found = [candidate for index, item in enumerate(items) if (candidate := _stock_candidate(item, provider=provider, term=term, rank=index)) is not None]
+                    raw_count = len(items)
+                    normalized = [candidate for index, item in enumerate(items) if (candidate := _stock_candidate(item, provider=provider, term=term, rank=index)) is not None]
                     found = [
                         candidate
-                        for candidate in found
+                        for candidate in normalized
                         if _is_orientation_compatible(candidate, video_aspect)
                     ]
                 else:
@@ -566,12 +675,14 @@ def discover_material_candidates(
                 if provider == PROVIDER_ASSET_HUB and _is_fatal_asset_hub_error(exc):
                     raise
                 technical_failures += 1
-                diagnostics.append(DiscoveryDiagnostic(provider, term, "failure", _safe_error_message(exc), None))
+                diagnostics.append(DiscoveryDiagnostic(provider, term, "error", _safe_error_message(exc), None))
                 if remote_provider_count == 1:
                     raise MaterialDiscoveryError(f"material provider '{provider}' failed") from exc
                 continue
             if provider != PROVIDER_ASSET_HUB:
-                diagnostics.append(DiscoveryDiagnostic(provider, term, "success", "ok", len(found)))
+                diagnostics.append(DiscoveryDiagnostic(
+                    provider, term, "success" if found else "empty", "ok" if found else "no usable candidates",
+                    len(found), raw_count, len(normalized), len(found)))
             candidates.extend(found)
             if provider not in succeeded:
                 succeeded.append(provider)
@@ -589,6 +700,8 @@ def discover_asset_hub_review_reserve_candidates(
     video_aspect: str = "9:16",
     asset_hub_provider: KurukinAssetProvider | None = None,
     limit_per_term: int = 100,
+    request_attempts: int = 1,
+    queries_are_visual: bool = False,
 ) -> MaterialDiscoveryResult:
     """
     Build a large Human Review reserve pool.
@@ -641,6 +754,9 @@ def discover_asset_hub_review_reserve_candidates(
 
     candidates: list[MaterialCandidate] = []
     diagnostics: list[DiscoveryDiagnostic] = []
+    # Neighbouring V2 scene queries can overlap.  Reuse exact responses only
+    # within this job; no cross-job cache or new service is required.
+    search_cache: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
 
     for term in normalized_terms:
         try:
@@ -654,6 +770,9 @@ def discover_asset_hub_review_reserve_candidates(
                     video_aspect=video_aspect,
                     clip_duration=limit_per_term,
                     limit=limit_per_term,
+                    request_attempts=request_attempts,
+                    search_cache=search_cache,
+                    queries_are_visual=queries_are_visual,
                 )
             else:
                 found, term_diagnostics = _asset_hub_multi_query_candidates(
@@ -663,8 +782,15 @@ def discover_asset_hub_review_reserve_candidates(
                     video_aspect=video_aspect,
                     clip_duration=limit_per_term,
                     limit=limit_per_term,
+                    request_attempts=request_attempts,
+                    search_cache=search_cache,
+                    queries_are_visual=queries_are_visual,
                 )
         except Exception as exc:
+            # Per-job circuit breaker: a failed provider must not be called
+            # again for every remaining scene/query in this execution.
+            if isinstance(exc, KurukinAssetHubUnavailableError):
+                raise
             if _is_fatal_asset_hub_error(exc):
                 raise
 
@@ -672,7 +798,7 @@ def discover_asset_hub_review_reserve_candidates(
                 DiscoveryDiagnostic(
                     PROVIDER_ASSET_HUB,
                     term,
-                    "failure",
+                    "error",
                     _safe_error_message(exc),
                     None,
                 )

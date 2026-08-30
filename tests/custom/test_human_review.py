@@ -5,11 +5,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from app.custom import human_review
-from app.custom.material_discovery import MaterialCandidate
+from app.custom.material_discovery import MaterialCandidate, MaterialDiscoveryResult
 from app.custom.material_selection import MaterialSelectionDecision, MaterialSelectionOptions, MaterialSelectionResult
 from app.models.schema import VideoParams
 from app.models.schema import MaterialInfo
@@ -18,9 +18,25 @@ from scripts import nightly_runner
 from scripts import nightly_preflight
 from scripts import produce_batch
 
-TASK_DEPS_AVAILABLE = importlib.util.find_spec("openai") is not None
-if TASK_DEPS_AVAILABLE:
-    from app.services import task
+def _install_task_import_stubs() -> None:
+    """Stub services unrelated to the human-review task path.
+
+    ``task`` imports the LLM and TTS services eagerly, but these pipeline tests
+    mock those collaborators and never execute them.  The host test environment
+    intentionally does not install their optional SDKs (``openai``/``edge_tts``).
+    """
+    sys.modules.setdefault("app.services.llm", ModuleType("app.services.llm"))
+
+    voice_module = ModuleType("app.services.voice")
+    voice_module.create_subtitle = lambda *args, **kwargs: None
+    voice_module.get_audio_duration = lambda *args, **kwargs: 1
+    voice_module.parse_voice_name = lambda value: value
+    voice_module.tts = lambda *args, **kwargs: object()
+    sys.modules.setdefault("app.services.voice", voice_module)
+
+
+_install_task_import_stubs()
+from app.services import task
 
 
 def candidate(uid, term="term", provider="pexels", url=None, source_info=None, duration=5, width=1080, height=1920, orientation="portrait"):
@@ -129,7 +145,7 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(plan["schema_version"], human_review.SCHEMA_VERSION)
         self.assertEqual(plan["review_status"], human_review.STATUS_PENDING)
         self.assertEqual(plan["segments"][0]["selected_asset"]["asset_uid"], "asset-1")
-        self.assertLessEqual(len(plan["segments"][0]["alternatives"]), 3)
+        self.assertEqual(len(plan["segments"][0]["alternatives"]), 3)
         self.assertTrue(Path(plan["segments"][0]["selected_asset"]["thumbnail_path"]).exists())
         self.assertTrue(plan["segments"][0]["selected_asset"]["flip_horizontal"])
 
@@ -157,6 +173,32 @@ class TestHumanReviewPlan(unittest.TestCase):
 
         for asset in (persisted["selected_asset"], persisted["alternatives"][0], persisted["backup_assets"][0]):
             self.assertEqual(asset["metadata"], metadata)
+
+    def test_v2_ineligible_asset_hub_candidate_is_not_selected_or_suggested(self):
+        rejected = candidate("still-image", provider="asset_hub", source_info={"media_type": "image"})
+        valid = candidate("valid-video", provider="asset_hub", source_info={})
+        plan = human_review.build_plan(
+            batch_id="batch", task_id="task-1", stem="story", audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt", script_text="script", duration=5, aspect_ratio="9:16",
+            visual_style="none", selection_result=selection([rejected]),
+            discovery_result=SimpleNamespace(candidates=(rejected, valid)),
+            output_path=self.root / "production-plan.json",
+        )
+        segment = plan["segments"][0]
+        visible_uids = [segment["selected_asset"]["asset_uid"]] + [item["asset_uid"] for item in segment["alternatives"]]
+        self.assertEqual(segment["selected_asset"]["asset_uid"], "valid-video")
+        self.assertNotIn("still-image", visible_uids)
+
+    def test_v2_minimal_asset_hub_candidate_remains_selectable(self):
+        minimal = candidate("minimal-video", provider="asset_hub", source_info={}, duration=None, width=None, height=None, orientation=None)
+        plan = human_review.build_plan(
+            batch_id="batch", task_id="task-1", stem="story", audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt", script_text="script", duration=5, aspect_ratio="9:16",
+            visual_style="none", selection_result=selection([minimal]),
+            discovery_result=SimpleNamespace(candidates=(minimal,)),
+            output_path=self.root / "minimal-plan.json",
+        )
+        self.assertEqual(plan["segments"][0]["selected_asset"]["asset_uid"], "minimal-video")
 
     def test_build_plan_preserves_material_scope_policy(self):
         selected = candidate("asset-1", provider="asset_hub", source_info={"title": "mi-otra-yo"})
@@ -678,7 +720,7 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(uids, ["asset-a", "asset-b", "asset-c", "asset-d"])
         self.assertEqual(len(uids), len(set(uids)))
 
-    def test_rank_order_is_preserved_except_used_selected_asset(self):
+    def test_alternatives_are_local_and_not_consumed_by_another_segment(self):
         assets = [candidate(uid) for uid in ("asset-a", "asset-b", "asset-c", "asset-d")]
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
 
@@ -701,7 +743,7 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(second["selected_asset"]["asset_uid"], "asset-b")
         self.assertEqual(
             [item["asset_uid"] for item in second["alternatives"]],
-            ["asset-d"],
+            ["asset-a", "asset-c", "asset-d"],
         )
 
     def test_script_fragments_are_contiguous_and_not_full_script(self):
@@ -1191,6 +1233,50 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(plan["segments"][0]["selected_asset"]["asset_uid"], "asset-2")
         self.assertFalse(plan["segments"][0]["selected_asset"]["flip_horizontal"])
 
+    def test_v2_review_hides_secondary_identity_variants_and_keeps_asset_uid(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        primary = candidate(
+            "asset-original", provider="asset_hub", source_info={"provider_asset_id": "shared-source"}
+        )
+        variant = candidate(
+            "asset-variant", provider="asset_hub", source_info={"provider_asset_id": "shared-source"}
+        )
+        distinct = candidate(
+            "asset-distinct", provider="asset_hub", source_info={"provider_asset_id": "other-source"}
+        )
+        plan = human_review.build_plan(
+            batch_id="batch", task_id="task-1", stem="story", audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt", script_text="scene", duration=5, aspect_ratio="9:16",
+            visual_style="none", selection_result=selection([primary]),
+            discovery_result=SimpleNamespace(candidates=(primary, variant, distinct)), output_path=plan_file,
+        )
+
+        segment = plan["segments"][0]
+        visible = [segment["selected_asset"]] + segment["alternatives"]
+        self.assertEqual(segment["selected_asset"]["asset_uid"], "asset-original")
+        self.assertNotIn("asset-variant", [item["asset_uid"] for item in visible])
+        self.assertIn("asset-distinct", [item["asset_uid"] for item in visible])
+        approved = human_review.approve_plan(plan_file, enqueue_nightly=False)
+        self.assertEqual(approved["segments"][0]["selected_asset"]["asset_uid"], "asset-original")
+
+    def test_backup_rejects_secondary_variant_of_primary(self):
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        primary = candidate("asset-original", provider="asset_hub", source_info={"source_url": "https://example.test/source.mp4"})
+        variant = candidate("asset-variant", provider="asset_hub", source_info={"source_url": "https://example.test/source.mp4#preview"})
+        human_review.write_json_atomic(plan_file, {
+            "review_status": human_review.STATUS_PENDING,
+            "segments": [{
+                "segment_id": "segment-001",
+                "selected_asset": human_review.serialize_candidate(primary),
+                "original_selected_asset": human_review.serialize_candidate(primary),
+                "alternatives": [human_review.serialize_candidate(variant)],
+                "backup_assets": [],
+            }],
+        })
+
+        with self.assertRaisesRegex(ValueError, "duplicates an existing primary"):
+            human_review.set_segment_backup(plan_file, "segment-001", "asset-variant", True)
+
     def test_suggested_flip_false_promoted_to_backup_stays_false(self):
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
         human_review.build_plan(
@@ -1557,7 +1643,226 @@ class TestHumanReviewPlan(unittest.TestCase):
 
 
 class TestHumanReviewPipeline(unittest.TestCase):
-    @unittest.skipUnless(TASK_DEPS_AVAILABLE, "task service optional dependencies are not installed")
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_human_review_uses_asset_hub_reserve_when_v1_has_no_decisions(self):
+        policy = {
+            "providers": {"enabled": ["asset_hub"]},
+            "asset_hub": {"include": {"generic": True}},
+        }
+        params = VideoParams(
+            video_subject="culpa al descansar",
+            video_script="Descansar también es necesario.",
+            video_source="asset_hub",
+            video_aspect="9:16",
+            video_clip_duration=5,
+            material_source_policy=policy,
+            asset_hub_terms=["persona descansando"],
+        )
+        plan_file = self.root / "review" / "production-plan.json"
+        object.__setattr__(
+            params,
+            "human_review",
+            {"batch_id": "batch", "stem": "story", "production_plan_path": plan_file.as_posix()},
+        )
+
+        reserve_candidate = candidate(
+            "asset-021", provider="asset_hub", term="persona descansando",
+            duration=5, width=1080, height=1920, orientation="portrait",
+            source_info={
+                "title": "Persona descansando en casa",
+                "primary_theme": "descanso",
+                "primary_topic": "descansar sin culpa",
+                "visual_description": "Una persona descansa tranquilamente en casa.",
+                "action_description": "Descansa en silencio.",
+                "contains_people": True,
+                "person_visibility": "clear",
+                "visual_presentation": "feminine",
+            },
+        )
+        reserve_discovery = MaterialDiscoveryResult(
+            (reserve_candidate,), (), ("asset_hub",), ("asset_hub",),
+            {"stock": (), "asset_hub": ("persona descansando",)},
+        )
+        empty_discovery = MaterialDiscoveryResult((), (), ("asset_hub",), (), {"stock": (), "asset_hub": ()})
+        selections = []
+        real_empty_selection = task.empty_material_selection_result
+
+        def capture_empty_selection(**kwargs):
+            result = real_empty_selection(**kwargs)
+            selections.append(result)
+            return result
+
+        with patch.object(task, "discover_material_candidates") as discover, \
+             patch.object(task, "discover_asset_hub_review_reserve_candidates", return_value=reserve_discovery) as reserve, \
+             patch.object(task, "discover_asset_hub_title_fallback_candidates", return_value=empty_discovery) as title_fallback, \
+             patch.object(task, "select_material_candidates") as select_v1, \
+             patch.object(task, "empty_material_selection_result", side_effect=capture_empty_selection), \
+             patch.object(task.human_review, "ensure_candidate_preview", return_value=({"type": "none", "value": "", "status": "unavailable"}, [])), \
+             patch.object(task.sm.state, "update_task") as update_task, \
+             patch.object(task, "_mark_task_failed") as mark_failed:
+            result = task._prepare_human_review_plan(
+                "task-1", params, params.video_script, ["persona descansando"], "/tmp/audio.mp3", 5,
+            )
+
+        discover.assert_not_called()
+        select_v1.assert_not_called()
+        title_fallback.assert_not_called()
+        self.assertEqual(len(selections), 1)
+        self.assertEqual(selections[0].decisions, ())
+        self.assertEqual(selections[0].target_count, 1)
+        reserve.assert_called_once()
+        self.assertEqual(reserve.call_args.kwargs["limit_per_term"], 100)
+        self.assertEqual(result["review_status"], human_review.STATUS_PENDING)
+        self.assertEqual(len(human_review.read_json(plan_file)["segments"]), 1)
+        plan = human_review.read_json(plan_file)
+        selected_asset = plan["segments"][0]["selected_asset"]
+        self.assertEqual(selected_asset["asset_uid"], "asset-021")
+        self.assertGreater(selected_asset["ranking_v2"]["score"], 0)
+        self.assertEqual(plan["visual_ranking_version"], "candidate-ranking-v2")
+        mark_failed.assert_not_called()
+        update_task.assert_called_once()
+
+    def test_human_review_multi_provider_keeps_v1_discovery(self):
+        params = SimpleNamespace(
+            material_source_policy={
+                "providers": {"enabled": ["asset_hub", "pexels"]},
+                "asset_hub": {"include": {"generic": True}},
+            },
+            asset_hub_terms=["tema"], video_aspect="9:16", video_clip_duration=5,
+            human_review={"enabled": True}, editorial_profile={},
+        )
+        v1 = MaterialDiscoveryResult((candidate("pexels-001"),), (), ("pexels",), ("pexels",), {
+            "stock": ("tema",), "asset_hub": (),
+        })
+        with patch.object(task, "discover_material_candidates", return_value=v1) as discover, \
+             patch.object(task, "discover_asset_hub_review_reserve_candidates") as reserve:
+            discovery, selected = task._select_autonomous_materials("task-1", params, ["tema"], 5, "guion")
+
+        discover.assert_called_once()
+        reserve.assert_not_called()
+        self.assertEqual(discovery.candidates, v1.candidates)
+        self.assertEqual(selected.decisions[0].candidate.canonical_id, "pexels-001")
+
+    def test_generales_multi_provider_review_keeps_v1_candidates_in_plan(self):
+        # This is GENERALES' resolved open policy, not an asset-profile branch.
+        policy = {
+            "providers": {"enabled": ["asset_hub", "pexels", "pixabay", "coverr", "local"]},
+            "asset_hub": {"include": {"generic": True}},
+        }
+        params = VideoParams(
+            video_subject="tema", video_script="Un guion corto.", video_aspect="9:16",
+            video_clip_duration=5, material_source_policy=policy,
+        )
+        plan_file = self.root / "review" / "production-plan.json"
+        object.__setattr__(params, "human_review", {
+            "batch_id": "batch", "stem": "story", "production_plan_path": plan_file.as_posix(),
+        })
+        primary = candidate("pexels-001", provider="pexels")
+        alternative = candidate("pixabay-002", provider="pixabay")
+        v1 = MaterialDiscoveryResult((primary, alternative), (), ("pexels", "pixabay"), ("pexels", "pixabay"), {
+            "stock": ("tema",), "asset_hub": (),
+        })
+
+        with patch.object(task, "discover_material_candidates", return_value=v1) as discover, \
+             patch.object(task, "discover_asset_hub_review_reserve_candidates") as reserve, \
+             patch.object(task.human_review, "ensure_candidate_preview", return_value=({"type": "none", "value": "", "status": "unavailable"}, [])), \
+             patch.object(task.sm.state, "update_task"):
+            result = task._prepare_human_review_plan(
+                "task-1", params, params.video_script, ["tema"], "/tmp/audio.mp3", 5,
+            )
+
+        discover.assert_called_once()
+        reserve.assert_not_called()
+        self.assertEqual(result["review_status"], human_review.STATUS_PENDING)
+        segment = human_review.read_json(plan_file)["segments"][0]
+        self.assertEqual(segment["selected_asset"]["asset_uid"], "pexels-001")
+        self.assertEqual([item["asset_uid"] for item in segment["alternatives"]], ["pixabay-002"])
+        diagnostics = human_review.read_json(plan_file)["provider_diagnostics"]
+        self.assertEqual(
+            [item["provider"] for item in diagnostics],
+            ["asset_hub", "pexels", "pixabay", "coverr", "local"],
+        )
+        self.assertEqual(next(item for item in diagnostics if item["provider"] == "pixabay")["review_visible_count"], 1)
+
+    def test_autonomous_selection_does_not_use_review_reserve(self):
+        params = SimpleNamespace(
+            material_source_policy={"providers": {"enabled": ["pexels"]}},
+            asset_hub_terms=[], video_aspect="9:16", video_clip_duration=5,
+            human_review=False,
+        )
+        v1 = MaterialDiscoveryResult((candidate("pexels-001"),), (), ("pexels",), ("pexels",), {
+            "stock": ("tema",), "asset_hub": (),
+        })
+        with patch.object(task, "discover_material_candidates", return_value=v1) as discover, \
+             patch.object(task, "discover_asset_hub_review_reserve_candidates") as reserve:
+            _discovery, selected = task._select_autonomous_materials("task-1", params, ["tema"], 5)
+
+        discover.assert_called_once()
+        reserve.assert_not_called()
+        self.assertEqual(selected.decisions[0].candidate.canonical_id, "pexels-001")
+
+    def test_human_review_fails_closed_when_ten_segments_have_no_candidates(self):
+        params = VideoParams(
+            video_subject="tema", material_source_policy={"providers": {"enabled": ["pexels"]}},
+        )
+        object.__setattr__(params, "human_review", {"batch_id": "batch", "stem": "story"})
+        empty_selection = MaterialSelectionResult(
+            MaterialSelectionOptions("9:16", 50, 5), (), 10, 0, 10, False, (), 0,
+        )
+        empty_plan = {
+            "review_status": human_review.STATUS_PENDING,
+            "segments": [{"selected_asset": None, "alternatives": []} for _ in range(10)],
+        }
+        failed = {"error": "human review preparation produced no usable candidates"}
+
+        with patch.object(task, "_select_autonomous_materials", return_value=(SimpleNamespace(candidates=()), empty_selection)), \
+             patch.object(task.human_review, "build_plan", return_value=empty_plan), \
+             patch.object(task, "_mark_task_failed", return_value=failed) as mark_failed, \
+             patch.object(task.sm.state, "update_task") as update_task:
+            result = task._prepare_human_review_plan(
+                "task-1", params, "guion", ["tema"], "/tmp/audio.mp3", 50,
+            )
+
+        self.assertEqual(result, failed)
+        mark_failed.assert_called_once_with(
+            "task-1", "review", "human review preparation produced no usable candidates",
+        )
+        update_task.assert_not_called()
+
+    def test_empty_v1_selection_without_human_review(self):
+        params = VideoParams(
+            video_subject="story",
+            video_source="asset_hub",
+            video_aspect="9:16",
+            video_clip_duration=5,
+            material_source_policy={
+                "providers": {"enabled": ["asset_hub"]},
+                "asset_hub": {"include": {"generic": True}},
+            },
+        )
+        object.__setattr__(params, "human_review", False)
+        empty_selection = MaterialSelectionResult(
+            MaterialSelectionOptions("9:16", 5, 5), (), 1, 0, 1, False, (), 0,
+        )
+        failed = {"error": "No usable visual materials found"}
+
+        with patch.object(task, "_select_autonomous_materials", return_value=(SimpleNamespace(candidates=()), empty_selection)), \
+             patch.object(task, "_mark_task_failed", return_value=failed) as mark_failed, \
+             patch.object(task.human_review, "build_plan") as build_plan:
+            result = task._prepare_human_review_plan(
+                "task-1", params, "script", ["term"], "/tmp/audio.mp3", 5,
+            )
+
+        self.assertEqual(result, failed)
+        mark_failed.assert_called_once_with("task-1", "materials", "No usable visual materials found")
+        build_plan.assert_not_called()
+
     def test_stop_at_review_does_not_generate_subtitles_or_video(self):
         params = VideoParams(
             video_subject="story",
@@ -1578,7 +1883,10 @@ class TestHumanReviewPipeline(unittest.TestCase):
             patch.object(task, "save_script_data"), \
             patch.object(task, "generate_audio", return_value=("/tmp/audio.mp3", 5, None)), \
             patch.object(task, "_select_autonomous_materials", return_value=(SimpleNamespace(candidates=(selected,)), selection([selected]))), \
-            patch.object(task.human_review, "build_plan", return_value={"review_status": human_review.STATUS_PENDING}) as build_plan, \
+            patch.object(task.human_review, "build_plan", return_value={
+                "review_status": human_review.STATUS_PENDING,
+                "segments": [{"selected_asset": {"asset_uid": "asset-1"}, "alternatives": []}],
+            }) as build_plan, \
             patch.object(task, "generate_subtitle") as generate_subtitle, \
             patch.object(task, "generate_final_videos") as generate_final_videos, \
             patch.object(task.sm.state, "update_task"):
@@ -1595,6 +1903,42 @@ class TestHumanReviewNightRunner(unittest.TestCase):
         job = {"render_mode": human_review.RENDER_MODE, "production_plan_path": "/tmp/plan.json"}
         self.assertTrue(nightly_runner.is_human_review_batch_job(job))
         self.assertEqual(nightly_runner.validate_job(job)["production_plan_path"], "/tmp/plan.json")
+
+    def test_preflight_valid_human_review_job_returns_empty_warnings(self):
+        job = {
+            "render_mode": human_review.RENDER_MODE,
+            "task_id": "task-1",
+            "production_plan_path": "/tmp/approved-plan.json",
+        }
+        plan = {
+            "review_status": human_review.STATUS_APPROVED,
+            "task_id": "task-1",
+            "audio_path": "/tmp/audio.mp3",
+        }
+        timeline = SimpleNamespace(
+            shortfall=0.0,
+            pieces=(object(),),
+            total_output_duration=5.0,
+        )
+        selected = SimpleNamespace(decisions=(object(),))
+
+        with patch.object(nightly_preflight, "project_path", return_value=Path("/tmp/mock")), \
+             patch.object(nightly_preflight, "require_file"), \
+             patch.object(nightly_preflight, "read_json", return_value=plan), \
+             patch.object(nightly_preflight, "_plan_script_available", return_value=True), \
+             patch.object(
+                 human_review,
+                 "validate_approved_plan_integrity",
+                 return_value={"ok": True, "errors": [], "coverage": {}, "segment_coverage": {}, "stored_coverage": {}},
+             ), \
+             patch.object(human_review, "render_timeline_from_plan", return_value=timeline), \
+             patch.object(human_review, "selection_result_from_plan", return_value=selected):
+            report = nightly_preflight.validate_human_review_job(
+                job,
+                materialize=False,
+            )
+
+        self.assertEqual(report["warnings"], [])
 
 
 class TestProduceBatchHumanReviewFlag(unittest.TestCase):

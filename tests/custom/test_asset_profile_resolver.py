@@ -54,11 +54,11 @@ class AssetProfileResolverTests(unittest.TestCase):
         policy = resolve_asset_profile("test-niche", "MI_OTRA_YO", self.registry(["MI_OTRA_YO"]))
         self.assertFalse(policy.asset_hub.include.generic)
 
-    def test_generales_resolves_with_current_generic_routing(self):
+    def test_generales_resolves_only_runtime_ready_stock_providers(self):
         policy = resolve_asset_profile("test-niche", "GENERALES", self.registry(["GENERALES"]))
         self.assertEqual(
             policy.providers.enabled,
-            (PROVIDER_ASSET_HUB, PROVIDER_PEXELS, PROVIDER_PIXABAY, PROVIDER_COVERR, PROVIDER_LOCAL),
+            (PROVIDER_ASSET_HUB, PROVIDER_LOCAL),
         )
         self.assertTrue(policy.asset_hub.include.generic)
 
