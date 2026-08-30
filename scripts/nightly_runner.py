@@ -172,6 +172,23 @@ def acquire_lock(queue_dir: Path) -> Path:
     try:
         fd = os.open(lock_path, flags, 0o644)
     except FileExistsError as exc:
+        # A runner killed by a reboot or OOM leaves its atomic lock behind.
+        # Reclaim only locks whose recorded local PID is certainly gone; an
+        # unrecognised lock remains protected rather than risking two runners.
+        try:
+            contents = lock_path.read_text(encoding="utf-8")
+            match = re.search(r"^pid=(\d+)$", contents, flags=re.MULTILINE)
+            stale_pid = int(match.group(1)) if match else None
+            if stale_pid is not None:
+                try:
+                    os.kill(stale_pid, 0)
+                except ProcessLookupError:
+                    lock_path.unlink()
+                    return acquire_lock(queue_dir)
+                except PermissionError:
+                    pass
+        except OSError:
+            pass
         raise RunnerError(f"Runner lock already exists: {lock_path}") from exc
 
     try:

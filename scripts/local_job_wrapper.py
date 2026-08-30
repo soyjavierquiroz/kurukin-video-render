@@ -40,10 +40,10 @@ def default_queue_dir(
 
 
 DEFAULT_QUEUE_DIR = default_queue_dir().as_posix()
-DEFAULT_LOCAL_VIDEOS_DIR = "/opt/moneyprinterturbo/storage/local_videos"
-DEFAULT_LOCAL_AUDIOS_DIR = "/opt/moneyprinterturbo/storage/local_audios"
-DEFAULT_LOCAL_SUBTITLES_DIR = "/opt/moneyprinterturbo/storage/local_subtitles"
-DEFAULT_FONTS_DIR = "/opt/moneyprinterturbo/resource/fonts"
+DEFAULT_LOCAL_VIDEOS_DIR = (REPO_ROOT / "storage" / "local_videos").as_posix()
+DEFAULT_LOCAL_AUDIOS_DIR = (REPO_ROOT / "storage" / "local_audios").as_posix()
+DEFAULT_LOCAL_SUBTITLES_DIR = (REPO_ROOT / "storage" / "local_subtitles").as_posix()
+DEFAULT_FONTS_DIR = (REPO_ROOT / "resource" / "fonts").as_posix()
 DEFAULT_ASSET_HUB_JOB_ASSETS_DIR = adapter.DEFAULT_ASSET_HUB_JOB_ASSETS_DIR
 PROJECT_ROOT = adapter.PROJECT_ROOT
 

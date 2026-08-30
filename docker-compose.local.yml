@@ -2,6 +2,7 @@ services:
   webui:
     image: ghcr.io/harry0703/moneyprinterturbo:latest
     container_name: moneyprinterturbo-webui
+    working_dir: /MoneyPrinterTurbo
     ports:
       - "127.0.0.1:18501:8501"
     command:
@@ -38,6 +39,7 @@ services:
   api:
     image: ghcr.io/harry0703/moneyprinterturbo:latest
     container_name: moneyprinterturbo-api
+    working_dir: /MoneyPrinterTurbo
     ports:
       - "127.0.0.1:18080:8080"
     command: ["python3", "main.py"]
