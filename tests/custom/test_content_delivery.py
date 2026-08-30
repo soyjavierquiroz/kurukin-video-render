@@ -17,12 +17,13 @@ class ContentDeliveryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.content_id = "cid_001"
+        self.content_id = "cf_000001"
         self.niche_id = "test-niche"
         self.job = self.root / "storage/content_jobs" / self.niche_id / self.content_id
         self.job.mkdir(parents=True)
         (self.job / "content.json").write_text(json.dumps({
             "content_id": self.content_id, "niche_id": self.niche_id,
+            "title": "La mujer que se siente culpable cuando descansa",
         }), encoding="utf-8")
         self.plan = self.root / "plan.json"
         self.plan.write_text(json.dumps({
@@ -63,10 +64,36 @@ class ContentDeliveryTests(unittest.TestCase):
         self.assertEqual(payload["checksum"], content_delivery.sha256_file(self.video))
         self.assertEqual(json.loads((self.job / "delivery.json").read_text()), payload)
         self.assertEqual(run.call_args_list, [
-            call(["rclone", "copyto", self.video.as_posix(), "deliveries:cid_001.mp4", "--drive-root-folder-id", "folder-1"], check=True, capture_output=True, text=True),
-            call(["rclone", "lsjson", "deliveries:cid_001.mp4", "--stat", "--drive-root-folder-id", "folder-1"], check=True, capture_output=True, text=True),
+            call(["rclone", "copyto", self.video.as_posix(), "deliveries:cf_000001-La mujer que se siente culpable cuando descansa.mp4", "--drive-root-folder-id", "folder-1"], check=True, capture_output=True, text=True),
+            call(["rclone", "lsjson", "deliveries:cf_000001-La mujer que se siente culpable cuando descansa.mp4", "--stat", "--drive-root-folder-id", "folder-1"], check=True, capture_output=True, text=True),
         ])
         self.assertEqual(payload["final_drive_url"], "https://drive.google.com/file/d/drive-file-1/view")
+        self.assertEqual(payload["final_drive_filename"], "cf_000001-La mujer que se siente culpable cuando descansa.mp4")
+
+    def test_sanitize_drive_filename_component_preserves_unicode_and_removes_invalid_characters(self):
+        title = '  Perdón: ¿por qué? / otra \\"historia\\" <áéíóúñÑ> |  '
+        filename = content_delivery.sanitize_drive_filename_component(title)
+        self.assertEqual(filename, "Perdón ¿por qué otra historia áéíóúñÑ")
+        self.assertFalse(any(character in filename for character in '/\\:*?"<>|'))
+
+    def test_sanitize_drive_filename_component_collapses_spaces_and_rejects_empty_results(self):
+        self.assertEqual(
+            content_delivery.sanitize_drive_filename_component("  título   con\t espacios.  "),
+            "título con espacios",
+        )
+        with self.assertRaisesRegex(content_delivery.DeliveryError, "empty"):
+            content_delivery.sanitize_drive_filename_component(" /:*?\\\"<>|.  ")
+
+    def test_finalization_rejects_missing_or_empty_content_title(self):
+        (self.job / "content.json").write_text(json.dumps({
+            "content_id": self.content_id, "niche_id": self.niche_id, "title": "  ",
+        }), encoding="utf-8")
+        with patch.object(content_delivery, "valid_mp4", return_value=True), patch.object(
+            content_delivery.subprocess, "run",
+        ) as run:
+            with self.assertRaisesRegex(content_delivery.DeliveryError, "title"):
+                content_delivery.finalize_production_plan(self.plan)
+        run.assert_not_called()
 
     def test_valid_sidecar_is_idempotent_and_stale_checksum_refinalizes(self):
         payload, _ = self._finalize()
@@ -77,6 +104,22 @@ class ContentDeliveryTests(unittest.TestCase):
         (self.job / "delivery.json").write_text(json.dumps(payload), encoding="utf-8")
         _, run = self._finalize()
         self.assertEqual(run.call_count, 2)
+
+    def test_historical_valid_sidecar_remains_idempotent_without_filename(self):
+        checksum = content_delivery.sha256_file(self.video)
+        historical = {
+            "content_id": self.content_id,
+            "niche_id": self.niche_id,
+            "final_drive_file_id": "legacy-file-1",
+            "final_drive_url": "https://drive.google.com/file/d/legacy-file-1/view",
+            "checksum": checksum,
+        }
+        (self.job / "delivery.json").write_text(json.dumps(historical), encoding="utf-8")
+        with patch.object(content_delivery, "valid_mp4", return_value=True), patch.object(
+            content_delivery.subprocess, "run",
+        ) as run:
+            self.assertEqual(content_delivery.finalize_production_plan(self.plan), historical)
+        run.assert_not_called()
 
     def test_incomplete_report_or_metadata_without_id_fails(self):
         report = self.root / "storage/batch_outputs/batch-1/batch-report.json"
@@ -120,6 +163,54 @@ class ContentDeliveryTests(unittest.TestCase):
             content_delivery.finalize_production_plan(self.plan)
 
     def test_content_identity_metadata_mismatch_fails(self):
+        (self.job / "content.json").write_text(json.dumps({
+            "content_id": self.content_id, "niche_id": "other-niche",
+        }), encoding="utf-8")
+        with self.assertRaises(content_delivery.DeliveryError):
+            content_delivery.finalize_production_plan(self.plan)
+
+    def _write_current_plan(self, **overrides):
+        audio = self.job / "source.mp3"
+        script = self.job / "script.txt"
+        audio.write_bytes(b"audio")
+        script.write_text("script", encoding="utf-8")
+        plan = {
+            "review_status": human_review.STATUS_APPROVED,
+            "batch_id": self.content_id,
+            "task_id": f"batch-content-{self.niche_id}-{self.content_id}-video-1",
+            "audio_path": f"/MoneyPrinterTurbo/storage/content_jobs/{self.niche_id}/{self.content_id}/source.mp3",
+            "script_path": f"/MoneyPrinterTurbo/storage/content_jobs/{self.niche_id}/{self.content_id}/script.txt",
+            "stem": "video-1",
+        }
+        plan.update(overrides)
+        self.plan.write_text(json.dumps(plan), encoding="utf-8")
+        current_video = self.root / "storage/batch_outputs" / self.content_id / "video-1.mp4"
+        current_video.parent.mkdir(parents=True, exist_ok=True)
+        current_video.write_bytes(b"current-video")
+        (current_video.parent / "batch-report.json").write_text(json.dumps({"jobs": {"video-1": {
+            "status": "completed", "batch_final": current_video.as_posix(),
+        }}}), encoding="utf-8")
+
+    def test_current_plan_without_content_job_is_accepted(self):
+        self._write_current_plan()
+        payload, _ = self._finalize()
+        self.assertEqual(payload["content_id"], self.content_id)
+
+    def test_current_plan_rejects_noncanonical_identity_or_sources(self):
+        cases = (
+            {"batch_id": "other"},
+            {"task_id": "batch-other-video-1"},
+            {"audio_path": "/MoneyPrinterTurbo/storage/content_jobs/test-niche/cid_001/other.mp3"},
+            {"script_path": "/tmp/script.txt"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self._write_current_plan(**overrides)
+                with self.assertRaises(content_delivery.DeliveryError):
+                    content_delivery.finalize_production_plan(self.plan)
+
+    def test_current_plan_rejects_inconsistent_content_json(self):
+        self._write_current_plan()
         (self.job / "content.json").write_text(json.dumps({
             "content_id": self.content_id, "niche_id": "other-niche",
         }), encoding="utf-8")

@@ -6,16 +6,22 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import Any
+import unicodedata
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.custom import human_review
 from scripts.content_ingest import SAFE_CONTENT_ID
 from scripts.niche_registry import load_niche
 from scripts.production_registry import sha256_file
+from scripts.create_content_job_review import deterministic_batch_id
 from scripts.produce_batch import REPORT_NAME, sanitize_batch_id, valid_mp4
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_DELIVERY_FIELDS = (
     "content_id", "niche_id", "final_drive_file_id", "final_drive_url", "checksum",
 )
@@ -77,17 +83,64 @@ def read_delivery(path: Path, *, content_id: str | None = None, niche_id: str | 
         raise DeliveryError("delivery identity mismatch")
     if niche_id is not None and result["niche_id"] != niche_id:
         raise DeliveryError("delivery identity mismatch")
+    if "final_drive_filename" in payload:
+        result["final_drive_filename"] = _required_string(
+            payload, "final_drive_filename", "delivery record",
+        )
     return result
 
 
 def _plan_identity(plan: dict[str, Any]) -> tuple[str, str]:
+    """Return the immutable content-job identity proved by a production plan.
+
+    Legacy plans carry a provenance snapshot.  Current automation plans omit
+    that snapshot, so their deterministic batch/task identity and canonical
+    source paths are the proof instead.  Keep malformed legacy provenance
+    distinct from an omitted value: it must not silently become current format.
+    """
     provenance = plan.get("content_job")
-    if not isinstance(provenance, dict):
+    if isinstance(provenance, dict):
+        return (
+            _required_string(provenance, "content_id", "production plan"),
+            _required_string(provenance, "niche_id", "production plan"),
+        )
+    if provenance is not None:
         raise DeliveryError("invalid production plan")
-    return (
-        _required_string(provenance, "content_id", "production plan"),
-        _required_string(provenance, "niche_id", "production plan"),
-    )
+
+    content_id = _required_string(plan, "batch_id", "production plan")
+    if not SAFE_CONTENT_ID.fullmatch(content_id) or content_id in {".", ".."}:
+        raise DeliveryError("invalid content identity")
+    job_root = PROJECT_ROOT / "storage" / "content_jobs"
+    matches: list[tuple[Path, dict[str, Any]]] = []
+    for metadata_path in job_root.glob(f"*/{content_id}/content.json"):
+        metadata = _read_object(metadata_path, "content identity")
+        niche_id = metadata.get("niche_id")
+        if metadata.get("content_id") == content_id and isinstance(niche_id, str) and niche_id:
+            matches.append((metadata_path.parent, metadata))
+    if len(matches) != 1:
+        raise DeliveryError("invalid content identity")
+    job_dir, metadata = matches[0]
+    niche_id = _required_string(metadata, "niche_id", "content identity")
+    try:
+        canonical_batch_id = deterministic_batch_id(niche_id, content_id)
+    except (TypeError, ValueError):
+        raise DeliveryError("invalid production plan") from None
+    task_id = _required_string(plan, "task_id", "production plan")
+    if not task_id.startswith(f"batch-{canonical_batch_id}-"):
+        raise DeliveryError("invalid production plan")
+
+    if job_dir != _resolve_under(job_root, niche_id, content_id, description="content identity"):
+        raise DeliveryError("content identity mismatch")
+    for field, filename in (("audio_path", "source.mp3"), ("script_path", "script.txt")):
+        path = _host_path(_required_string(plan, field, "production plan"))
+        try:
+            resolved = path.resolve(strict=False)
+        except OSError as exc:
+            raise DeliveryError("invalid production plan") from exc
+        expected = _resolve_under(job_dir, filename, description=f"production plan {field}")
+        if resolved != expected:
+            raise DeliveryError("invalid production plan")
+    return content_id, niche_id
 
 
 def _completed_batch_final(plan: dict[str, Any]) -> Path:
@@ -118,6 +171,20 @@ def _completed_batch_final(plan: dict[str, Any]) -> Path:
 
 def _rclone_remote_path(remote: str, name: str) -> str:
     return f"{remote.rstrip(':')}:{name}"
+
+
+def sanitize_drive_filename_component(title: str) -> str:
+    """Return a human-readable Drive filename component derived from ``title``."""
+    if not isinstance(title, str):
+        raise DeliveryError("content title is missing or empty")
+    sanitized = "".join(
+        " " if character in '\\/:*?"<>|' or unicodedata.category(character) == "Cc" else character
+        for character in title
+    )
+    sanitized = re.sub(r"\s+", " ", sanitized).strip().rstrip(". ")
+    if not sanitized:
+        raise DeliveryError("content title is empty after filename sanitization")
+    return sanitized
 
 
 def _run_rclone(*args: str) -> subprocess.CompletedProcess[str]:
@@ -168,8 +235,12 @@ def finalize_production_plan(production_plan_path: str | Path) -> dict[str, str]
         if existing is not None and existing["checksum"] == checksum:
             return existing
 
+    title = metadata.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise DeliveryError("content title is missing or empty")
+    final_drive_filename = f"{content_id}-{sanitize_drive_filename_component(title)}.mp4"
     niche = load_niche(niche_id)
-    remote_path = _rclone_remote_path(str(niche["rclone_remote"]), f"{content_id}.mp4")
+    remote_path = _rclone_remote_path(str(niche["rclone_remote"]), final_drive_filename)
     folder_id = str(niche["final_drive_folder_id"])
     _run_rclone(
         "copyto", local_mp4.as_posix(), remote_path,
@@ -182,6 +253,7 @@ def finalize_production_plan(production_plan_path: str | Path) -> dict[str, str]
         "final_drive_file_id": file_id,
         "final_drive_url": f"https://drive.google.com/file/d/{file_id}/view",
         "checksum": checksum,
+        "final_drive_filename": final_drive_filename,
     }
     human_review.write_json_atomic(delivery_path, payload)
     return payload

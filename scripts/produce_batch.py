@@ -24,7 +24,9 @@ from app.custom import human_review
 from scripts.production_registry import ProductionRegistry, identity as production_identity, sha256_file
 
 CONTAINER_ROOT = Path("/MoneyPrinterTurbo")
-HYPERFRAMES_ROOT = Path("/opt/apps/hyperframes")
+HYPERFRAMES_ROOT = Path(
+    os.environ.get("KURUKIN_HYPERFRAMES_ROOT", "/opt/apps/hyperframes")
+)
 REPORT_NAME = "batch-report.json"
 APPROVAL_CONFIDENCE = 0.90
 PROCESS_TIMEOUT = 90 * 60
@@ -100,6 +102,17 @@ def host_to_container(path: Path) -> str:
     except ValueError:
         return resolved.as_posix()
     return (CONTAINER_ROOT / rel).as_posix()
+
+
+def container_to_host(path: str | Path) -> Path:
+    """Translate only the known project bind mount to this checkout."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        try:
+            return HOST_ROOT / candidate.relative_to(CONTAINER_ROOT)
+        except ValueError:
+            pass
+    return candidate
 
 
 def scan_input(input_dir: Path) -> list[Job]:
@@ -224,6 +237,8 @@ def backfill_completed(*, wanted_fingerprint: str | None = None, emit: bool = Fa
         if not entry:
             if emit:
                 print(f"SKIPPED UNVERIFIABLE {final_mp4.relative_to(HOST_ROOT).as_posix()}")
+            continue
+        if not entry.get("production_plan_path"):
             continue
         plan_path = _host_path(str(entry.get("production_plan_path") or ""))
         plan = read_json(plan_path)
@@ -992,6 +1007,7 @@ def process_job(
     subject_gender: str = "neutral",
     material_title: str = "",
     source_policy: str = "",
+    approved_plan_path: Path | None = None,
 ) -> str:
     task_dir = HOST_ROOT / "storage" / "tasks" / job.task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -1007,9 +1023,18 @@ def process_job(
     batch_final = batch_output_dir / f"{job.stem}.mp4"
     script = job.txt.read_text(encoding="utf-8")
     batch_id = job.batch_id
-    review_plan_path = human_review.plan_path(batch_id, job.stem, HOST_ROOT)
+    # ``--approved-plan`` is the production authority.  Do not recompute its
+    # path from batch/stem: those fields are identifiers, not a locator, and a
+    # same-named review plan may be a different frozen decision.
+    review_plan_path = (
+        container_to_host(approved_plan_path)
+        if approved_plan_path is not None
+        else human_review.plan_path(batch_id, job.stem, HOST_ROOT)
+    )
     existing_review_plan = read_json(review_plan_path)
     approved_review_plan = existing_review_plan.get("review_status") == human_review.STATUS_APPROVED
+    if approved_plan_path is not None and not approved_review_plan:
+        raise StageError(f"production plan is not approved: {review_plan_path}")
     current_visual_style_version = visual_style_version(visual_style)
 
     print(f"[{index}/{total}] {job.stem}")
@@ -1061,7 +1086,15 @@ def process_job(
         existing_completed = registry.find_valid(identity_record["production_fingerprint"], valid_mp4)
     # Same-batch artifacts retain the established stage-by-stage resume path.
     # The registry is for cross-batch reuse, not a replacement for it.
-    if existing_completed is not None and str(existing_completed["batch_id"]) != batch_id:
+    # A global completion is keyed by narration/script recipe, not by the
+    # frozen Human Review asset decisions.  Reusing it for an approved plan
+    # could render media the current operator never selected.  Approved
+    # masters may only resume through their plan-fingerprinted local stage.
+    if (
+        not approved_review_plan
+        and existing_completed is not None
+        and str(existing_completed["batch_id"]) != batch_id
+    ):
         source = Path(existing_completed["final_mp4_path"])
         if not (valid_mp4(batch_final) and same_file_content(source, batch_final)):
             link_or_copy_completed(source, batch_final)
@@ -1487,21 +1520,14 @@ def process_approved_review_plan(
     position: str = "bottom",
     visual_style: str | None = None,
 ) -> str:
-    plan_file = Path(production_plan_path)
-    if plan_file.is_absolute():
-        try:
-            relative_plan = plan_file.relative_to("/MoneyPrinterTurbo")
-        except ValueError:
-            pass
-        else:
-            plan_file = HOST_ROOT / relative_plan
+    plan_file = container_to_host(production_plan_path)
 
     plan = human_review.read_json(plan_file)
     if plan.get("review_status") != human_review.STATUS_APPROVED:
         raise StageError(f"production plan is not approved: {plan_file}")
 
-    audio = Path(str(plan.get("audio_path") or ""))
-    script_path = Path(str(plan.get("script_path") or ""))
+    audio = container_to_host(str(plan.get("audio_path") or ""))
+    script_path = container_to_host(str(plan.get("script_path") or ""))
     if not valid_file(audio):
         raise StageError(f"approved audio missing: {audio}")
     if not script_path.is_file():
@@ -1543,6 +1569,7 @@ def process_approved_review_plan(
         visual_style=plan_visual_style,
         human_review_mode=False,
         material_title=str(plan.get("material_title") or ""),
+        approved_plan_path=plan_file,
     )
 
 

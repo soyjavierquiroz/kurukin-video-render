@@ -378,6 +378,31 @@ def _stage_human_review_timeline(
     return staged, timeline_dir
 
 
+def _validate_approved_materialization(selection: object, acquisition: object) -> None:
+    """Fail before staging/render if materialization drifted from frozen UIDs."""
+    expected = {
+        str(getattr(decision.candidate, "canonical_id", "") or "")
+        for decision in (getattr(selection, "decisions", ()) or ())
+    }
+    expected.discard("")
+    materialized = {
+        str((getattr(info, "source_info", {}) or {}).get("asset_id") or "")
+        for info in (getattr(acquisition, "materials", ()) or ())
+    }
+    materialized.discard("")
+    if materialized != expected:
+        unexpected = sorted(materialized - expected)
+        missing = sorted(expected - materialized)
+        details = []
+        if unexpected:
+            details.append("unapproved asset_uids=" + ", ".join(unexpected))
+        if missing:
+            details.append("missing approved asset_uids=" + ", ".join(missing))
+        raise RuntimeError(
+            "approved renderer manifest integrity failed: " + "; ".join(details)
+        )
+
+
 def run_master(manifest: dict) -> dict:
     from app.custom import human_review
     from app.custom.material_acquisition import acquire_selected_materials
@@ -423,6 +448,7 @@ def run_master(manifest: dict) -> dict:
             task_id=manifest["task_id"],
             approved_plan=plan,
         )
+        _validate_approved_materialization(selection, acquisition)
 
         staged_materials, timeline_dir = (
             _stage_human_review_timeline(

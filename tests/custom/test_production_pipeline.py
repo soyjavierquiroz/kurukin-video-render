@@ -7,8 +7,11 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from scripts import produce_batch
+from scripts import batch_mpt_worker
+from app.models.schema import MaterialInfo
 
 
 SRT = "1\n00:00:00,000 --> 00:00:01,000\nHola mundo\n"
@@ -316,6 +319,114 @@ class ProductionPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(produce_batch.StageError, "approved audio missing"):
             produce_batch.process_approved_review_plan(plan)
 
+    def test_approved_container_audio_and_script_paths_resolve_on_host(self):
+        plan_path = self.root / "production-plan.json"
+        plan = self.approved_plan_payload()
+        plan["audio_path"] = (produce_batch.CONTAINER_ROOT / self.mp3.relative_to(self.root)).as_posix()
+        plan["script_path"] = (produce_batch.CONTAINER_ROOT / self.txt.relative_to(self.root)).as_posix()
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), \
+             patch.object(produce_batch, "process_job", return_value="completed") as process_job:
+            self.assertEqual(produce_batch.process_approved_review_plan(plan_path), "completed")
+
+        job = process_job.call_args.args[0]
+        self.assertEqual(job.mp3, self.mp3)
+        self.assertEqual(job.txt, self.txt)
+
+    def test_approved_host_audio_and_script_paths_still_work(self):
+        plan_path = self.root / "production-plan.json"
+        plan_path.write_text(json.dumps(self.approved_plan_payload()), encoding="utf-8")
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), \
+             patch.object(produce_batch, "process_job", return_value="completed") as process_job:
+            self.assertEqual(produce_batch.process_approved_review_plan(plan_path), "completed")
+
+        job = process_job.call_args.args[0]
+        self.assertEqual(job.mp3, self.mp3)
+        self.assertEqual(job.txt, self.txt)
+
+    def test_production_uses_the_exact_cli_approved_plan_not_batch_stem_lookup(self):
+        """The worker manifest must retain the frozen file selected by the operator."""
+        plan_path = self.root / "operator-approved-plan.json"
+        plan_path.write_text(json.dumps(self.approved_plan_payload()), encoding="utf-8")
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), \
+             patch.object(produce_batch, "process_job", return_value="completed") as process_job:
+            produce_batch.process_approved_review_plan(plan_path)
+
+        self.assertEqual(process_job.call_args.kwargs["approved_plan_path"], plan_path)
+
+    def test_master_uses_current_human_selected_asset_without_discovery(self):
+        """A reviewed replacement wins over original_selected_asset end-to-end."""
+        plan_path = self.root / "operator-approved-plan.json"
+        plan = {
+            "review_status": "approved", "duration": 4.9,
+            "segments": [{
+                "segment_id": "segment-001", "duration": 4.9,
+                "selected_asset": {"asset_uid": "approved-A", "canonical_id": "approved-A",
+                                   "dedupe_key": "approved-A", "provider": "asset_hub",
+                                   "metadata": {"duration": 5}},
+                "original_selected_asset": {"asset_uid": "original-X", "canonical_id": "original-X",
+                                            "provider": "asset_hub", "metadata": {"duration": 5}},
+                "alternatives": [{"asset_uid": "alternative-Z", "provider": "asset_hub"}],
+                "backup_assets": [],
+            }],
+        }
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        source = self.root / "approved-A.mp4"; source.write_bytes(b"asset")
+        task_dir = self.root / "task"; task_dir.mkdir()
+        acquired = SimpleNamespace(materials=(MaterialInfo(
+            provider="asset_hub", url=source.as_posix(), duration=5,
+            source_info={"asset_id": "approved-A"},
+        ),))
+
+        def start(task_id, _params, *, stop_at):
+            self.assertEqual(stop_at, "video")
+            (task_dir / "final-1.mp4").write_bytes(b"rendered")
+            return {"task_id": task_id}
+
+        with patch("app.custom.material_acquisition.acquire_selected_materials", return_value=acquired) as acquire, \
+             patch.object(batch_mpt_worker, "_stage_human_review_timeline", return_value=([], self.root / "timeline")), \
+             patch("app.services.task.start", side_effect=start) as start_task, \
+             patch("app.services.task.generate_terms") as terms, \
+             patch("app.services.task.discover_material_candidates") as discover, \
+             patch("app.services.task.select_material_candidates") as select:
+            result = batch_mpt_worker.run_master({
+                "production_plan_path": plan_path.as_posix(), "task_id": "task-1",
+                "task_dir": task_dir.as_posix(), "stem": "story", "script": "script",
+                "audio_file": (self.root / "audio.mp3").as_posix(),
+            })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([item.candidate.canonical_id for item in acquire.call_args.kwargs["selection_result"].decisions], ["approved-A"])
+        terms.assert_not_called(); discover.assert_not_called(); select.assert_not_called()
+        start_task.assert_called_once()
+
+    def test_master_blocks_materialization_with_unapproved_asset_before_render(self):
+        selection = SimpleNamespace(decisions=(
+            SimpleNamespace(candidate=SimpleNamespace(canonical_id="A")),
+            SimpleNamespace(candidate=SimpleNamespace(canonical_id="B")),
+        ))
+        acquisition = SimpleNamespace(materials=(
+            MaterialInfo(provider="asset_hub", url="/tmp/A.mp4", duration=5, source_info={"asset_id": "A"}),
+            MaterialInfo(provider="asset_hub", url="/tmp/X.mp4", duration=5, source_info={"asset_id": "X"}),
+        ))
+
+        with self.assertRaisesRegex(RuntimeError, "unapproved asset_uids=X"):
+            batch_mpt_worker._validate_approved_materialization(selection, acquisition)
+
+    def test_approved_missing_container_audio_still_raises_stage_error(self):
+        plan_path = self.root / "production-plan.json"
+        plan = self.approved_plan_payload()
+        plan["audio_path"] = "/MoneyPrinterTurbo/storage/content_jobs/cf_000002/source.mp3"
+        plan["script_path"] = (produce_batch.CONTAINER_ROOT / self.txt.relative_to(self.root)).as_posix()
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), \
+             self.assertRaisesRegex(produce_batch.StageError, "approved audio missing"):
+            produce_batch.process_approved_review_plan(plan_path)
+
     def test_approved_cached_coverage_cannot_hide_missing_asset_durations(self):
         plan_path = self.root / "production-plan.json"
         plan = self.approved_plan_payload(duration=None)
@@ -617,6 +728,29 @@ class GlobalProductionRegistryTests(unittest.TestCase):
             registry.upsert(record, corrupt, "old", 1.0)
             self.assertIsNone(registry.find_valid(record["production_fingerprint"], produce_batch.valid_mp4))
             self.assertIsNone(registry.find_valid(record["production_fingerprint"], produce_batch.valid_mp4))
+
+    def test_backfill_skips_completed_output_without_production_plan_path(self):
+        output_dir = self.root / "storage" / "batch_outputs" / "completed-batch"
+        output_dir.mkdir(parents=True)
+        final_mp4 = output_dir / f"{self.title}.mp4"
+        final_mp4.write_bytes(b"valid")
+        produce_batch.write_json_atomic(output_dir / produce_batch.REPORT_NAME, {
+            "batch_id": "completed-batch",
+            "jobs": {
+                self.title: {
+                    "status": "completed",
+                    "batch_final": final_mp4.as_posix(),
+                    "production_plan_path": None,
+                },
+            },
+        })
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), \
+             patch.object(produce_batch, "valid_mp4", return_value=True), \
+             patch.object(produce_batch, "production_registry") as registry:
+            produce_batch.backfill_completed()
+
+        registry.return_value.upsert.assert_not_called()
 
 
 if __name__ == "__main__":
