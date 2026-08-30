@@ -27,6 +27,10 @@ ACTIVE = {"pending", "running", "retry_wait"}
 RETRY_DELAYS = (5, 15, 30)
 
 
+class ReviewPreparationRetryError(ValueError):
+    """The requested explicit retry is not permitted for this durable state."""
+
+
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -118,16 +122,40 @@ def enqueue(payload: dict[str, Any], *, job_root: Path = content_ingest.DEFAULT_
 
 
 def rearm(path: Path) -> dict[str, Any]:
-    """Explicitly requeue a terminal request; never duplicates a command."""
+    """Explicitly requeue one terminal failure, retaining its evidence.
+
+    ``attempt`` is reserved here so the retry is observable durably before the
+    dispatcher claims it.  ``run_record`` consumes that reservation rather
+    than incrementing a second time.
+    """
     with path.open("r+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             record = _read(handle)
-            if record.get("state") != "error":
+            state = record.get("state")
+            if state in ACTIVE:
                 return record
-            record.update({"state": "pending", "attempt": 0, "started_at": None,
+            if state != "error":
+                raise ReviewPreparationRetryError("review preparation retry requires terminal error")
+            history = record.get("attempt_history")
+            if history is None:
+                history = []
+            if not isinstance(history, list):
+                raise ValueError("review preparation history is invalid")
+            history.append({
+                "attempt": int(record.get("attempt", 0)),
+                "state": "error",
+                "started_at": record.get("started_at"),
+                "finished_at": record.get("finished_at"),
+                "last_error_class": record.get("last_error_class"),
+                "last_error_message": record.get("last_error_message"),
+                "retry_requested_at": now(),
+            })
+            record.update({"state": "pending", "attempt": int(record.get("attempt", 0)) + 1,
+                           "attempt_history": history, "started_at": None,
                            "finished_at": None, "next_retry_at": None,
-                           "last_error_class": None, "last_error_message": None})
+                           "last_error_class": None, "last_error_message": None,
+                           "attempt_reserved": True})
             record.pop("pid", None); record.pop("boot_id", None)
             _write(handle, record)
             return record
@@ -167,7 +195,10 @@ def run_record(path: Path, *, boot_id: str, pid: int, clock: Callable[[], dt.dat
             record = _read(handle)
             if not due(record, clock):
                 return {"content_id": str(record.get("content_id", "unknown")), "action": "ignored"}
-            record.update({"state": "running", "attempt": int(record.get("attempt", 0)) + 1,
+            attempt = int(record.get("attempt", 0))
+            if not record.pop("attempt_reserved", False):
+                attempt += 1
+            record.update({"state": "running", "attempt": attempt,
                            "started_at": now(), "boot_id": boot_id, "pid": pid, "next_retry_at": None})
             _write(handle, record)
         finally:

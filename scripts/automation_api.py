@@ -855,9 +855,26 @@ def retry_review_preparation(content_id: str, payload: NicheRequest) -> dict[str
     if not path.is_file():
         raise HTTPException(status_code=404, detail="review preparation not found")
     try:
+        existing = _read_object(path)
+        identity = {
+            "content_id": content_id,
+            "niche_id": payload.niche_id,
+        }
+        if any(existing.get(field) != value for field, value in identity.items()):
+            raise HTTPException(status_code=409, detail="content identity conflict")
+        found = _content_job_for(content_id)
+        if found is not None:
+            _, metadata = found
+            fields = ("content_id", "niche_id", "audio_file_id", "script_file_id", "asset_profile")
+            if any(metadata.get(field) != existing.get(field) for field in fields):
+                raise HTTPException(status_code=409, detail="content identity conflict")
         record = review_preparation.rearm(path)
+    except review_preparation.ReviewPreparationRetryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except (OSError, ValueError) as exc:
         LOG.error("review retry failed content_id=%r stage=rearm exception_class=%s message=%s", content_id, type(exc).__name__, review_preparation._sanitized_message(exc))
         raise HTTPException(status_code=500, detail="unable to retry review preparation")
     return {"ok": True, "content_id": content_id, "niche_id": payload.niche_id,
-            "status": review_preparation.public_state(record)}
+            "status": review_preparation.public_state(record), "error_message": None}

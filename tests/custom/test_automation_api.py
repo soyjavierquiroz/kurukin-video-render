@@ -244,6 +244,67 @@ class AutomationApiTests(unittest.TestCase):
         enqueue.assert_not_called()
         production.assert_not_called()
 
+    def _failed_preparation(self, *, attempt=3, **overrides):
+        record = automation_api.review_preparation.enqueue(self._identity_payload(), job_root=self.jobs)
+        record.update({
+            "state": "error", "attempt": attempt,
+            "started_at": "2026-08-28T00:00:00+00:00",
+            "finished_at": "2026-08-28T00:01:00+00:00",
+            "last_error_class": "ContentJobReviewError",
+            "last_error_message": "review failed exit=1: retained diagnostic",
+        })
+        record.update(overrides)
+        path = automation_api.review_preparation.state_path("test-niche", "cid_001", job_root=self.jobs)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path, record
+
+    def test_explicit_review_retry_rearms_error_with_new_attempt_and_retained_evidence(self):
+        path, original = self._failed_preparation()
+        with patch.object(automation_api, "_validate_enabled_niche"), patch.object(
+            automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs,
+        ), patch.object(automation_api, "schedule_content") as schedule, patch.object(
+            human_review, "enqueue_approved_plan"
+        ) as nightly:
+            response = self.client.post("/v1/content/cid_001/review/retry", json={"niche_id": "test-niche"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "PREPARING_REVIEW")
+        self.assertIsNone(response.json()["error_message"])
+        current = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(current["state"], "pending")
+        self.assertEqual(current["attempt"], original["attempt"] + 1)
+        self.assertEqual(current["attempt_history"][-1]["last_error_message"], original["last_error_message"])
+        self.assertEqual(current["attempt_history"][-1]["finished_at"], original["finished_at"])
+        schedule.assert_not_called()
+        nightly.assert_not_called()
+        self.assertFalse((self.root / "storage/nightly_jobs/pending").exists())
+
+    def test_explicit_review_retry_is_idempotent_while_preparing(self):
+        path, _ = self._failed_preparation()
+        with patch.object(automation_api, "_validate_enabled_niche"), patch.object(
+            automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs,
+        ):
+            first = self.client.post("/v1/content/cid_001/review/retry", json={"niche_id": "test-niche"})
+            after_first = json.loads(path.read_text(encoding="utf-8"))
+            second = self.client.post("/v1/content/cid_001/review/retry", json={"niche_id": "test-niche"})
+            running = dict(after_first)
+            running["state"] = "running"
+            path.write_text(json.dumps(running), encoding="utf-8")
+            while_running = self.client.post("/v1/content/cid_001/review/retry", json={"niche_id": "test-niche"})
+        self.assertEqual(first.json()["status"], "PREPARING_REVIEW")
+        self.assertEqual(second.json()["status"], "PREPARING_REVIEW")
+        self.assertEqual(while_running.json()["status"], "PREPARING_REVIEW")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), running)
+
+    def test_explicit_review_retry_rejects_identity_mismatch(self):
+        path, original = self._failed_preparation(content_id="different-id")
+        with patch.object(automation_api, "_validate_enabled_niche"), patch.object(
+            automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs,
+        ):
+            response = self.client.post("/v1/content/cid_001/review/retry", json={"niche_id": "test-niche"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "content identity conflict")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), original)
+
     def test_reconcile_failed_preparation_rejects_identity_mismatch_without_reenqueue(self):
         _, metadata = self._identity_job()
         record = automation_api.review_preparation.enqueue(self._identity_payload(), job_root=self.jobs)
