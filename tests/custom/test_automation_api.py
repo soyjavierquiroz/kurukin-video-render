@@ -432,6 +432,87 @@ class AutomationApiTests(unittest.TestCase):
         process.assert_not_called()
         approve.assert_not_called()
 
+    def test_existing_legacy_review_reuses_explicit_effective_defaults(self):
+        job, metadata = self._identity_job()
+        metadata["mpt_defaults"] = {"video_aspect": "9:16", "video_clip_duration": 5}
+        job.joinpath("content.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self._identity_plan(metadata, legacy_batch_id=True)
+        with patch.object(automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs), patch.object(
+            automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root
+        ), patch.object(automation_api.content_ingest, "validate_request"), patch.object(
+            automation_api.content_ingest, "ingest_content"
+        ) as ingest, patch.object(
+            automation_api.review_preparation, "enqueue"
+        ) as enqueue:
+            response = self.client.post("/v1/content/review", json=self._identity_payload())
+        self.assertEqual(response.status_code, 200)
+        ingest.assert_not_called()
+        enqueue.assert_not_called()
+
+    def test_existing_legacy_review_requires_preparation_for_changed_visual_semantics(self):
+        job, metadata = self._identity_job()
+        metadata["mpt_defaults"] = {"video_aspect": "16:9"}
+        job.joinpath("content.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self._identity_plan(metadata, legacy_batch_id=True)
+        with patch.object(automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs), patch.object(
+            automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root
+        ), patch.object(automation_api.content_ingest, "validate_request"), patch.object(
+            automation_api.content_ingest, "ingest_content"
+        ) as ingest, patch.object(
+            automation_api.create_content_job_review, "create_content_job_review"
+        ) as review, patch.object(
+            automation_api.review_preparation, "enqueue", return_value={"state": "pending"}
+        ) as enqueue:
+            response = self.client.post("/v1/content/review", json=self._identity_payload())
+        self.assertEqual(response.status_code, 202)
+        ingest.assert_not_called()
+        review.assert_not_called()
+        enqueue.assert_called_once()
+
+    def test_existing_legacy_review_requires_preparation_for_changed_clip_duration(self):
+        job, metadata = self._identity_job()
+        metadata["mpt_defaults"] = {"video_clip_duration": 7}
+        job.joinpath("content.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self._identity_plan(metadata, legacy_batch_id=True)
+        with patch.object(automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs), patch.object(
+            automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root
+        ), patch.object(automation_api.content_ingest, "validate_request"), patch.object(
+            automation_api.review_preparation, "enqueue", return_value={"state": "pending"}
+        ) as enqueue:
+            response = self.client.post("/v1/content/review", json=self._identity_payload())
+        self.assertEqual(response.status_code, 202)
+        enqueue.assert_called_once()
+
+    def test_existing_legacy_review_ignores_bgm_only_defaults_change(self):
+        job, metadata = self._identity_job()
+        metadata["mpt_defaults"] = {"bgm": {"mode": "RANDOM", "volume": .2}}
+        job.joinpath("content.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self._identity_plan(metadata, legacy_batch_id=True)
+        with patch.object(automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs), patch.object(
+            automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root
+        ), patch.object(automation_api.content_ingest, "validate_request"), patch.object(
+            automation_api.review_preparation, "enqueue"
+        ) as enqueue:
+            response = self.client.post("/v1/content/review", json=self._identity_payload())
+        self.assertEqual(response.status_code, 200)
+        enqueue.assert_not_called()
+
+    def test_existing_legacy_review_ignores_render_only_defaults_change(self):
+        job, metadata = self._identity_job()
+        metadata["mpt_defaults"] = {
+            "video_resolution": "720p", "video_transition_mode": "FadeIn",
+        }
+        job.joinpath("content.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self._identity_plan(metadata, legacy_batch_id=True)
+        with patch.object(automation_api.content_ingest, "DEFAULT_JOB_ROOT", self.jobs), patch.object(
+            automation_api.create_content_job_review.produce_batch, "HOST_ROOT", self.root
+        ), patch.object(automation_api.content_ingest, "validate_request"), patch.object(
+            automation_api.review_preparation, "enqueue"
+        ) as enqueue:
+            response = self.client.post("/v1/content/review", json=self._identity_payload())
+        self.assertEqual(response.status_code, 200)
+        enqueue.assert_not_called()
+
     def test_provenance_accepts_legacy_and_current_formats_but_rejects_partial_identity(self):
         _, metadata = self._identity_job()
         legacy_path = self._identity_plan(metadata)

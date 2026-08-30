@@ -410,12 +410,13 @@ def run_master(manifest: dict) -> dict:
     from app.services import task
 
     production_plan_path = str(manifest.get("production_plan_path") or "")
+    from app.custom.mpt_defaults import mpt_video_params, resolve_effective_mpt_settings
+    mpt_settings = resolve_effective_mpt_settings(manifest.get("effective_mpt_settings"))
     params = VideoParams(
         video_subject=manifest["stem"],
         video_script=manifest["script"],
-        video_aspect="9:16",
+        **mpt_video_params(mpt_settings),
         video_concat_mode="sequential",
-        video_clip_duration=5,
         match_materials_to_script=True,
         video_count=1,
         video_source="pexels",
@@ -425,9 +426,6 @@ def run_master(manifest: dict) -> dict:
         voice_name="",
         voice_volume=1.0,
         voice_rate=1.0,
-        bgm_type="",
-        bgm_file="",
-        bgm_volume=0,
         subtitle_enabled=False,
         subtitle_correction_enabled=False,
         subtitle_optimization_enabled=False,
@@ -488,12 +486,13 @@ def run_review(manifest: dict) -> dict:
     from app.models.schema import VideoParams
     from app.services import task
 
+    from app.custom.mpt_defaults import mpt_video_params, resolve_effective_mpt_settings
+    mpt_settings = resolve_effective_mpt_settings(manifest.get("effective_mpt_settings"))
     params = VideoParams(
         video_subject=manifest["stem"],
         video_script=manifest["script"],
-        video_aspect="9:16",
+        **mpt_video_params(mpt_settings),
         video_concat_mode="sequential",
-        video_clip_duration=5,
         match_materials_to_script=True,
         video_count=1,
         video_source="pexels",
@@ -503,9 +502,6 @@ def run_review(manifest: dict) -> dict:
         voice_name="",
         voice_volume=1.0,
         voice_rate=1.0,
-        bgm_type="",
-        bgm_file="",
-        bgm_volume=0,
         subtitle_enabled=False,
         subtitle_correction_enabled=False,
         subtitle_optimization_enabled=False,
@@ -523,6 +519,8 @@ def run_review(manifest: dict) -> dict:
             "editorial_profile": manifest.get("editorial_profile") or {},
             "material_title": manifest.get("material_title") or "",
             "source_policy": manifest.get("source_policy") or "",
+            "mpt_defaults": manifest.get("mpt_defaults"),
+            "effective_mpt_settings": mpt_settings,
         },
     )
     result = task.start(manifest["task_id"], params, stop_at="review")

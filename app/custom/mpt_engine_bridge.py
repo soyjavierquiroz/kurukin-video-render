@@ -93,6 +93,21 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    """Parse job booleans without treating textual ``false`` as truthy."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     return deepcopy(value) if isinstance(value, dict) else {}
 
@@ -377,8 +392,8 @@ def _base_mpt_params(job: dict[str, Any]) -> dict[str, Any]:
         "voice_rate": float(job.get("voice_rate") or 1.0),
         "bgm_type": _first_clean_text(job.get("bgm_type"), "random"),
         "bgm_file": _clean_text(job.get("bgm_file")),
-        "bgm_volume": float(job.get("bgm_volume") or 0.2),
-        "subtitle_enabled": bool(job.get("subtitle_enabled", True)),
+        "bgm_volume": float(0.2 if job.get("bgm_volume") is None else job.get("bgm_volume")),
+        "subtitle_enabled": _coerce_bool(job.get("subtitle_enabled"), default=True),
         "subtitle_provider": _clean_text(job.get("subtitle_provider")),
         "subtitle_correction_enabled": bool(
             job.get("subtitle_correction_enabled", True)
@@ -567,7 +582,7 @@ def build_mpt_aroll_broll_task_spec(kurukin_job: dict[str, Any]) -> dict[str, An
     mpt_params["subtitle_enabled"] = (
         _clean_text(subtitles.get("source")) not in {"", "none"}
         if subtitles
-        else bool(mpt_params.get("subtitle_enabled", True))
+        else _coerce_bool(mpt_params.get("subtitle_enabled"), default=True)
     )
     mpt_params["custom_subtitle_file"] = _first_clean_text(
         subtitles.get("custom_srt_path"),

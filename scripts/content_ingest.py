@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.custom.material_source_policy import PROVIDER_ASSET_HUB, build_asset_hub_source_policy
+from app.custom.mpt_defaults import resolve_effective_mpt_settings
 
 try:  # Supports both ``python scripts/...`` and package imports in tests.
     from scripts.asset_profile_resolver import AssetProfileError, resolve_asset_profile
@@ -250,6 +251,8 @@ def ingest_content(
             "audio_duration_seconds": duration,
             "ingested_at": datetime.now(timezone.utc).isoformat(),
             "resolved_asset_policy": asset_policy_summary(policy),
+            "mpt_defaults": niche.get("mpt_defaults"),
+            "effective_mpt_settings": resolve_effective_mpt_settings(niche.get("mpt_defaults")),
         }
         temporary = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.partial")
         try:
@@ -281,6 +284,11 @@ def _remove_incomplete_ingest_artifacts(job_dir: Path) -> None:
             shutil.rmtree(child, ignore_errors=True)
         else:
             child.unlink(missing_ok=True)
+    try:
+        job_dir.rmdir()
+    except OSError:
+        # A durable review-preparation command intentionally keeps the directory.
+        pass
 
 
 def build_parser() -> argparse.ArgumentParser:

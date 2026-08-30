@@ -76,6 +76,12 @@ def _validate_niche(niche_id: str, niche: Any) -> dict[str, Any]:
         raise NicheRegistryError(
             f"niche '{niche_id}' default asset profile must be in allowed asset profiles"
         )
+    if "mpt_defaults" in niche:
+        from app.custom.mpt_defaults import MptDefaultsError, resolve_effective_mpt_settings
+        try:
+            resolve_effective_mpt_settings(niche["mpt_defaults"])
+        except MptDefaultsError as exc:
+            raise NicheRegistryError(f"niche '{niche_id}' {exc}") from exc
     return niche
 
 

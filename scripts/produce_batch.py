@@ -746,6 +746,8 @@ def make_manifest(
     subject_gender: str = "neutral",
     material_title: str = "",
     source_policy: str = "",
+    mpt_defaults: dict[str, Any] | None = None,
+    effective_mpt_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "batch_id": sanitize_batch_id(job.mp3.parent),
@@ -761,6 +763,8 @@ def make_manifest(
         "editorial_profile": {"subject_gender": subject_gender},
         "material_title": material_title.strip(),
         "source_policy": source_policy.strip(),
+        "mpt_defaults": mpt_defaults,
+        "effective_mpt_settings": effective_mpt_settings or {},
     }
     if production_plan_path is not None:
         payload["production_plan_path"] = host_to_container(production_plan_path)
@@ -777,6 +781,8 @@ def write_manifest(
     subject_gender: str = "neutral",
     material_title: str = "",
     source_policy: str = "",
+    mpt_defaults: dict[str, Any] | None = None,
+    effective_mpt_settings: dict[str, Any] | None = None,
 ) -> Path:
     manifest_path = task_dir / "batch-manifest.json"
     write_json_atomic(
@@ -790,6 +796,8 @@ def write_manifest(
             subject_gender=subject_gender,
             material_title=material_title,
             source_policy=source_policy,
+            mpt_defaults=mpt_defaults,
+            effective_mpt_settings=effective_mpt_settings,
         ),
     )
     return manifest_path
@@ -1008,6 +1016,8 @@ def process_job(
     material_title: str = "",
     source_policy: str = "",
     approved_plan_path: Path | None = None,
+    mpt_defaults: dict[str, Any] | None = None,
+    effective_mpt_settings: dict[str, Any] | None = None,
 ) -> str:
     task_dir = HOST_ROOT / "storage" / "tasks" / job.task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -1032,6 +1042,8 @@ def process_job(
         else human_review.plan_path(batch_id, job.stem, HOST_ROOT)
     )
     existing_review_plan = read_json(review_plan_path)
+    mpt_defaults = mpt_defaults if mpt_defaults is not None else existing_review_plan.get("mpt_defaults")
+    effective_mpt_settings = effective_mpt_settings or existing_review_plan.get("effective_mpt_settings") or {}
     approved_review_plan = existing_review_plan.get("review_status") == human_review.STATUS_APPROVED
     if approved_plan_path is not None and not approved_review_plan:
         raise StageError(f"production plan is not approved: {review_plan_path}")
@@ -1043,6 +1055,8 @@ def process_job(
             job, task_dir, script, production_plan_path=review_plan_path,
             visual_style=visual_style, subject_gender=subject_gender,
             material_title=material_title, source_policy=source_policy,
+            mpt_defaults=mpt_defaults,
+            effective_mpt_settings=effective_mpt_settings,
         )
         existing_plan = existing_review_plan
         if existing_plan.get("review_status") == human_review.STATUS_APPROVED:
@@ -1118,6 +1132,8 @@ def process_job(
         subject_gender=subject_gender,
         material_title=material_title,
         source_policy=source_policy,
+        mpt_defaults=mpt_defaults,
+        effective_mpt_settings=effective_mpt_settings,
     )
 
     current_master_fingerprint = (
@@ -1570,6 +1586,8 @@ def process_approved_review_plan(
         human_review_mode=False,
         material_title=str(plan.get("material_title") or ""),
         approved_plan_path=plan_file,
+        mpt_defaults=plan.get("mpt_defaults"),
+        effective_mpt_settings=plan.get("effective_mpt_settings"),
     )
 
 

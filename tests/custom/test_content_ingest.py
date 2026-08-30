@@ -80,6 +80,20 @@ class ContentIngestTests(unittest.TestCase):
             },
         })
 
+    def test_metadata_carries_resolved_mpt_defaults(self):
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        registry["niches"]["test-niche"]["mpt_defaults"] = {
+            "version": 1, "video_aspect": "16:9", "video_clip_duration": 7,
+            "bgm": {"mode": "RANDOM", "volume": .12},
+        }
+        self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
+        metadata = ingest_content(**self.args())
+        self.assertEqual(metadata["effective_mpt_settings"]["video_aspect"], "16:9")
+        self.assertEqual(metadata["effective_mpt_settings"]["video_clip_duration"], 7)
+        self.assertEqual(metadata["effective_mpt_settings"]["bgm"], {
+            "mode": "RANDOM", "volume": .12, "file_id": "", "prompt": "",
+        })
+
     def test_existing_content_id_with_different_drive_ids_fails(self):
         ingest_content(**self.args())
         with self.assertRaisesRegex(ContentIngestError, "different source Drive IDs"):

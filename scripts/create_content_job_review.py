@@ -9,6 +9,7 @@ existing Human Review pipeline.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import re
@@ -30,6 +31,7 @@ from scripts import produce_batch
 from scripts.asset_profile_resolver import AssetProfileError, resolve_asset_profile
 from scripts.content_ingest import asset_policy_summary
 from scripts.niche_registry import DEFAULT_REGISTRY_PATH, NicheRegistryError, load_niche
+from app.custom.mpt_defaults import resolve_effective_mpt_settings
 
 
 class ContentJobReviewError(ValueError):
@@ -126,7 +128,53 @@ def content_job_provenance(metadata: dict[str, Any], policy: Any) -> dict[str, A
         "resolved_asset_policy": asset_policy_summary(policy),
         "audio_sha256": metadata["audio_sha256"],
         "script_sha256": metadata["script_sha256"],
+        "mpt_defaults": deepcopy(metadata.get("mpt_defaults")),
+        "effective_mpt_settings": metadata.get("effective_mpt_settings") or resolve_effective_mpt_settings(metadata.get("mpt_defaults")),
     }
+
+
+_REVIEW_SEMANTIC_MPT_FIELDS = ("video_aspect", "video_clip_duration")
+
+
+def _review_semantic_mpt_settings(
+    *, effective_mpt_settings: Any = None, mpt_defaults: Any = None,
+) -> dict[str, Any] | None:
+    """Return only settings that change the Human Review visual timeline.
+
+    A plan made before MPT defaults has the same semantics as the resolved
+    baseline.  BGM, resolution, and transitions are production concerns: they
+    do not alter the candidates or segmentation a reviewer is approving.
+    """
+    source = effective_mpt_settings if effective_mpt_settings is not None else mpt_defaults
+    if source is not None and not isinstance(source, dict):
+        return None
+    # Deliberately exclude BGM before validation: a render-only stale BGM
+    # reference must not invalidate an otherwise reusable visual review.
+    visual_defaults = {
+        field: source[field]
+        for field in ("version", *_REVIEW_SEMANTIC_MPT_FIELDS)
+        if source is not None and field in source
+    }
+    try:
+        resolved = resolve_effective_mpt_settings(visual_defaults)
+    except (TypeError, ValueError):
+        return None
+    return {field: resolved[field] for field in _REVIEW_SEMANTIC_MPT_FIELDS}
+
+
+def _review_mpt_settings_match(
+    existing: dict[str, Any], requested: dict[str, Any],
+) -> bool:
+    """Compare resolved review semantics, treating absent legacy settings as defaults."""
+    expected = _review_semantic_mpt_settings(
+        effective_mpt_settings=requested.get("effective_mpt_settings"),
+        mpt_defaults=requested.get("mpt_defaults"),
+    )
+    actual = _review_semantic_mpt_settings(
+        effective_mpt_settings=existing.get("effective_mpt_settings"),
+        mpt_defaults=existing.get("mpt_defaults"),
+    )
+    return expected is not None and actual == expected
 
 
 def plan_identity_matches_content_job(
@@ -147,7 +195,13 @@ def plan_identity_matches_content_job(
             "niche_id", "asset_profile", "audio_sha256", "script_sha256",
             "resolved_asset_policy",
         )
-        return all(provenance.get(field) == metadata.get(field) for field in fields)
+        existing_settings = dict(provenance)
+        for field in ("mpt_defaults", "effective_mpt_settings"):
+            existing_settings.setdefault(field, plan.get(field))
+        return (
+            all(provenance.get(field) == metadata.get(field) for field in fields)
+            and _review_mpt_settings_match(existing_settings, metadata)
+        )
 
     # Only an omitted/null content_job denotes the current format.  Other
     # malformed legacy provenance must not silently fall through to it.
@@ -177,6 +231,7 @@ def plan_identity_matches_content_job(
     return (
         has_canonical_suffix(plan.get("audio_path"), "source.mp3")
         and has_canonical_suffix(plan.get("script_path"), "script.txt")
+        and _review_mpt_settings_match(plan, metadata)
     )
 
 
@@ -235,6 +290,7 @@ def _validate_existing_plan(
     script: Path,
     policy: Any,
     provenance: dict[str, Any],
+    metadata: dict[str, Any],
 ) -> str:
     plan = human_review.read_json(plan_path)
     _existing_plan_matches_content_job(
@@ -243,7 +299,7 @@ def _validate_existing_plan(
     )
     existing_provenance = plan.get("content_job")
     if existing_provenance is not None:
-        if existing_provenance != provenance:
+        if not plan_identity_matches_content_job(plan, metadata, str(metadata.get("content_id", ""))):
             raise ContentJobReviewError(f"existing review plan content_job provenance differs: {plan_path}")
         return "already_exists"
 
@@ -281,10 +337,11 @@ def create_content_job_review(
         raise ContentJobReviewError("review plan path escapes the review queue") from exc
 
     provenance = content_job_provenance(metadata, policy)
+    effective_mpt_settings = resolve_effective_mpt_settings(metadata.get("mpt_defaults"))
     if plan_path.exists():
         result = _validate_existing_plan(
             plan_path, batch_id=batch_id, stem=stem, audio=audio, script=script,
-            policy=policy, provenance=provenance,
+            policy=policy, provenance=provenance, metadata=metadata,
         )
         return result, plan_path
 
@@ -298,6 +355,7 @@ def create_content_job_review(
         job, index=1, total=1, batch_output_dir=batch_output_dir, report=report,
         report_path=report_path, preset="editorial-gold", position="bottom",
         human_review_mode=True, material_title=material_title, source_policy=source_policy,
+        mpt_defaults=metadata.get("mpt_defaults"), effective_mpt_settings=effective_mpt_settings,
     )
     if status != human_review.STATUS_PENDING or not plan_path.is_file():
         raise ContentJobReviewError("existing Human Review generator did not create a pending plan")
@@ -309,6 +367,9 @@ def create_content_job_review(
     ):
         raise ContentJobReviewError("generated review plan identity differs from content job")
     plan["content_job"] = provenance
+    plan["mpt_defaults"] = deepcopy(metadata.get("mpt_defaults"))
+    plan["effective_mpt_settings"] = effective_mpt_settings
+    plan["aspect_ratio"] = effective_mpt_settings["video_aspect"]
     human_review.write_json_atomic(plan_path, plan)
     return "created", plan_path
 

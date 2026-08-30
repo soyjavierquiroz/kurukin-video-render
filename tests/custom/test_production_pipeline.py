@@ -40,6 +40,60 @@ class ProductionPipelineTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_manifest_carries_effective_mpt_settings(self):
+        settings = {"version": 1, "video_aspect": "16:9", "video_clip_duration": 7,
+                    "video_resolution": "720p", "video_transition_mode": None,
+                    "bgm": {"mode": "NONE", "volume": 0, "file_id": "", "prompt": ""}}
+        manifest = produce_batch.make_manifest(self.job, self.task_dir, "Hola", effective_mpt_settings=settings)
+        self.assertEqual(manifest["effective_mpt_settings"], settings)
+
+    def test_manifest_carries_raw_mpt_defaults(self):
+        defaults = {"version": 1, "bgm": {"mode": "RANDOM", "volume": .12}}
+        manifest = produce_batch.make_manifest(self.job, self.task_dir, "Hola", mpt_defaults=defaults)
+        self.assertEqual(manifest["mpt_defaults"], defaults)
+
+    def test_review_and_master_share_effective_clip_duration(self):
+        plan_path = self.root / "production-plan.json"
+        settings = {"version": 1, "video_aspect": "16:9", "video_clip_duration": 7,
+                    "video_resolution": "", "video_transition_mode": None,
+                    "bgm": {"mode": "NONE", "volume": 0, "file_id": "", "prompt": ""}}
+        manifest = {
+            "batch_id": "batch", "task_id": "task", "task_dir": self.task_dir.as_posix(),
+            "stem": "story", "script": "Hola", "audio_file": self.mp3.as_posix(),
+            "text_file": self.txt.as_posix(), "production_plan_path": plan_path.as_posix(),
+            "effective_mpt_settings": settings,
+        }
+
+        def start(_task_id, params, *, stop_at):
+            self.assertEqual(stop_at, "review")
+            self.assertEqual(params.video_aspect.value, "16:9")
+            self.assertEqual(params.video_clip_duration, 7)
+            plan_path.write_text("{}", encoding="utf-8")
+            return {}
+
+        with patch("app.services.task.start", side_effect=start):
+            batch_mpt_worker.run_review(manifest)
+
+    def test_worker_without_defaults_keeps_no_bgm_baseline(self):
+        manifest = {
+            "batch_id": "batch", "task_id": "task", "task_dir": self.task_dir.as_posix(),
+            "stem": "story", "script": "Hola", "audio_file": self.mp3.as_posix(),
+            "text_file": self.txt.as_posix(), "production_plan_path": (self.root / "plan.json").as_posix(),
+        }
+
+        def start(_task_id, params, *, stop_at):
+            self.assertEqual(stop_at, "review")
+            self.assertEqual(params.bgm_type, "")
+            self.assertEqual(params.bgm_file, "")
+            self.assertEqual(params.bgm_volume, 0)
+            self.assertEqual(params.video_aspect.value, "9:16")
+            self.assertEqual(params.video_clip_duration, 5)
+            (self.root / "plan.json").write_text("{}", encoding="utf-8")
+            return {}
+
+        with patch("app.services.task.start", side_effect=start):
+            batch_mpt_worker.run_review(manifest)
+
     def artifact(self, name: str, content: bytes = b"valid") -> Path:
         path = self.task_dir / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -383,6 +437,14 @@ class ProductionPipelineTests(unittest.TestCase):
 
         def start(task_id, _params, *, stop_at):
             self.assertEqual(stop_at, "video")
+            self.assertEqual(_params.video_aspect, "16:9")
+            self.assertEqual(_params.video_resolution, "720p")
+            self.assertEqual(_params.video_clip_duration, 7)
+            self.assertEqual(_params.video_transition_mode.value, "FadeIn")
+            self.assertEqual(_params.bgm_type, "random")
+            self.assertEqual(_params.bgm_volume, .12)
+            self.assertFalse(_params.subtitle_enabled)
+            self.assertEqual(_params.custom_audio_file, (self.root / "audio.mp3").as_posix())
             (task_dir / "final-1.mp4").write_bytes(b"rendered")
             return {"task_id": task_id}
 
@@ -396,6 +458,11 @@ class ProductionPipelineTests(unittest.TestCase):
                 "production_plan_path": plan_path.as_posix(), "task_id": "task-1",
                 "task_dir": task_dir.as_posix(), "stem": "story", "script": "script",
                 "audio_file": (self.root / "audio.mp3").as_posix(),
+                "effective_mpt_settings": {
+                    "version": 1, "bgm": {"mode": "RANDOM", "volume": .12},
+                    "video_aspect": "16:9", "video_resolution": "720p",
+                    "video_clip_duration": 7, "video_transition_mode": "FadeIn",
+                },
             })
 
         self.assertTrue(result["ok"])

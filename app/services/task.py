@@ -1485,7 +1485,7 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
         script_path=str(review.get("script_path") or ""),
         script_text=video_script,
         duration=float(audio_duration or 0),
-        aspect_ratio=str(params.video_aspect),
+        aspect_ratio=str(getattr(params.video_aspect, "value", params.video_aspect)),
         visual_style=str(review.get("visual_style") or "none"),
         editorial_profile=(
             getattr(params, "editorial_profile", None)
@@ -1508,6 +1508,10 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
         discovery_result=discovery,
         output_path=output_path,
     )
+    # Diagnostic provenance only; material selection remains governed by the
+    # approved policy and the effective aspect already present on params.
+    plan["mpt_defaults"] = review.get("mpt_defaults")
+    plan["effective_mpt_settings"] = review.get("effective_mpt_settings")
     if not _human_review_plan_has_usable_candidates(
         plan,
         int(getattr(selection, "target_count", 0) or 0),

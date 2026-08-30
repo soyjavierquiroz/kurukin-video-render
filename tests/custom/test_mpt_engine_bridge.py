@@ -150,6 +150,14 @@ class TestMptEngineBridge(unittest.TestCase):
         self.assertEqual(spec["mpt_params"]["video_resolution"], "720p")
         self.assertEqual(validate_mpt_task_spec(spec), [])
 
+    def test_generic_bridge_preserves_explicit_zero_bgm_volume(self):
+        spec = build_mpt_video_task_from_kurukin_job({"video_subject": "x", "bgm_volume": 0})
+        self.assertEqual(spec["mpt_params"]["bgm_volume"], 0.0)
+
+    def test_generic_bridge_parses_string_false_subtitle(self):
+        spec = build_mpt_video_task_from_kurukin_job({"video_subject": "x", "subtitle_enabled": "false"})
+        self.assertIs(spec["mpt_params"]["subtitle_enabled"], False)
+
     def test_normalize_mpt_video_params_drops_kurukin_extensions(self):
         with mock.patch.dict(
             sys.modules,
