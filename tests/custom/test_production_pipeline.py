@@ -428,6 +428,8 @@ class ProductionPipelineTests(unittest.TestCase):
             }],
         }
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        audio_source = self.root / "audio.mp3"
+        audio_source.write_bytes(b"audio")
         source = self.root / "approved-A.mp4"; source.write_bytes(b"asset")
         task_dir = self.root / "task"; task_dir.mkdir()
         acquired = SimpleNamespace(materials=(MaterialInfo(
@@ -444,7 +446,10 @@ class ProductionPipelineTests(unittest.TestCase):
             self.assertEqual(_params.bgm_type, "random")
             self.assertEqual(_params.bgm_volume, .12)
             self.assertFalse(_params.subtitle_enabled)
-            self.assertEqual(_params.custom_audio_file, (self.root / "audio.mp3").as_posix())
+            self.assertEqual(_params.custom_audio_file, (task_dir / "custom-audio.mp3").as_posix())
+            self.assertTrue((task_dir / "custom-audio.mp3").is_file())
+            self.assertTrue((task_dir / "custom-audio.mp3").stat().st_size > 0)
+            self.assertEqual((task_dir / "custom-audio.mp3").read_bytes(), audio_source.read_bytes())
             (task_dir / "final-1.mp4").write_bytes(b"rendered")
             return {"task_id": task_id}
 
@@ -457,7 +462,7 @@ class ProductionPipelineTests(unittest.TestCase):
             result = batch_mpt_worker.run_master({
                 "production_plan_path": plan_path.as_posix(), "task_id": "task-1",
                 "task_dir": task_dir.as_posix(), "stem": "story", "script": "script",
-                "audio_file": (self.root / "audio.mp3").as_posix(),
+                "audio_file": audio_source.as_posix(),
                 "effective_mpt_settings": {
                     "version": 1, "bgm": {"mode": "RANDOM", "volume": .12},
                     "video_aspect": "16:9", "video_resolution": "720p",

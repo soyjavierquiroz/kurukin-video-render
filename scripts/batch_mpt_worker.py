@@ -38,6 +38,24 @@ def _safe_ffmpeg_stderr_tail(stderr: str, *, limit: int = 2000) -> str:
     return _FFMPEG_SECRET.sub(r"\1=<redacted>", str(stderr or ""))[-limit:]
 
 
+def _task_local_custom_audio(manifest: dict) -> str:
+    """Materialize the trusted batch audio inside the MPT-owned task directory.
+
+    MPT v1.3.5 deliberately rejects arbitrary server paths supplied as custom
+    audio.  The batch manifest's canonical audio is host-controlled, so copy it
+    to a fixed task-local name before passing it through the regular MPT API.
+    """
+    source = Path(str(manifest["audio_file"])).resolve()
+    task_dir = Path(str(manifest["task_dir"])).resolve()
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise RuntimeError(f"canonical batch audio is missing or empty: {source}")
+    task_dir.mkdir(parents=True, exist_ok=True)
+    destination = task_dir / f"custom-audio{source.suffix.lower() or '.mp3'}"
+    if source != destination:
+        shutil.copy2(source, destination)
+    return destination.as_posix()
+
+
 
 def _material_source_policy(manifest: dict) -> dict:
     from app.custom.material_source_policy import (
@@ -412,6 +430,7 @@ def run_master(manifest: dict) -> dict:
     production_plan_path = str(manifest.get("production_plan_path") or "")
     from app.custom.mpt_defaults import mpt_video_params, resolve_effective_mpt_settings
     mpt_settings = resolve_effective_mpt_settings(manifest.get("effective_mpt_settings"))
+    custom_audio_file = _task_local_custom_audio(manifest)
     params = VideoParams(
         video_subject=manifest["stem"],
         video_script=manifest["script"],
@@ -422,7 +441,7 @@ def run_master(manifest: dict) -> dict:
         video_source="pexels",
         material_source_policy=_material_source_policy(manifest),
         editorial_profile=manifest.get("editorial_profile") or {},
-        custom_audio_file=manifest["audio_file"],
+        custom_audio_file=custom_audio_file,
         voice_name="",
         voice_volume=1.0,
         voice_rate=1.0,
@@ -488,6 +507,7 @@ def run_review(manifest: dict) -> dict:
 
     from app.custom.mpt_defaults import mpt_video_params, resolve_effective_mpt_settings
     mpt_settings = resolve_effective_mpt_settings(manifest.get("effective_mpt_settings"))
+    custom_audio_file = _task_local_custom_audio(manifest)
     params = VideoParams(
         video_subject=manifest["stem"],
         video_script=manifest["script"],
@@ -498,7 +518,7 @@ def run_review(manifest: dict) -> dict:
         video_source="pexels",
         material_source_policy=_material_source_policy(manifest),
         editorial_profile=manifest.get("editorial_profile") or {},
-        custom_audio_file=manifest["audio_file"],
+        custom_audio_file=custom_audio_file,
         voice_name="",
         voice_volume=1.0,
         voice_rate=1.0,

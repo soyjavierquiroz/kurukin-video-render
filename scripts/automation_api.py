@@ -693,6 +693,24 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
         return _sheet_projection(content_id, payload.niche_id, "DRAFT", run_mode)
     try:
         found = _content_job_for(content_id)
+        # ERROR is terminal input from the control loop.  Reconciliation may
+        # project an existing durable failure, but it must never turn that row
+        # into a new review-preparation attempt.
+        if requested_status == "ERROR":
+            metadata = found[1] if found is not None else None
+            if metadata is not None and metadata.get("niche_id") != payload.niche_id:
+                raise HTTPException(status_code=409, detail="content identity conflict")
+            preparation = _review_preparation_record(payload.niche_id, content_id)
+            if preparation is not None and preparation.get("state") == "error":
+                _require_matching_preparation_identity(content_id, payload, metadata, preparation)
+                return _sheet_projection(
+                    content_id, payload.niche_id, "ERROR", run_mode,
+                    error_message=review_preparation.sheet_error_message(preparation),
+                )
+            return _sheet_projection(
+                content_id, payload.niche_id, "ERROR", run_mode,
+                error_message="No durable error diagnostic is available for this terminal content state",
+            )
         if found is None:
             preparation = _review_preparation_record(payload.niche_id, content_id)
             if preparation is not None and preparation.get("state") == "error":
