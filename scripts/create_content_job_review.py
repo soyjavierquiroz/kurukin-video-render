@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.custom import human_review
+from app.custom.video_terms import normalize_video_terms
 from app.custom.material_source_policy import (
     PROVIDER_ASSET_HUB,
     build_asset_hub_source_policy,
@@ -32,7 +33,6 @@ from scripts.asset_profile_resolver import AssetProfileError, resolve_asset_prof
 from scripts.content_ingest import asset_policy_summary
 from scripts.niche_registry import DEFAULT_REGISTRY_PATH, NicheRegistryError, load_niche
 from app.custom.mpt_defaults import resolve_effective_mpt_settings
-from app.services.task import normalize_video_terms
 
 
 class ContentJobReviewError(ValueError):

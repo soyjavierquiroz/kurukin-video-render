@@ -7,6 +7,7 @@ if importlib.util.find_spec("openai") is None:
     raise unittest.SkipTest("task service optional dependencies are not installed")
 
 from app.models.schema import MaterialInfo, VideoParams
+from app.custom.video_terms import normalize_video_terms
 from app.services import task
 from app.custom.material_discovery import MaterialDiscoveryResult
 
@@ -32,7 +33,8 @@ class TestAutonomousMaterialPreparation(unittest.TestCase):
                 generate.assert_called_once()
 
     def test_normalize_video_terms_uses_native_comma_contract_exactly(self):
-        self.assertEqual(task.normalize_video_terms(" café ,barista，night shift "), ["café", "barista", "night shift"])
+        self.assertIs(task.normalize_video_terms, normalize_video_terms)
+        self.assertEqual(normalize_video_terms(" café ,barista，night shift "), ["café", "barista", "night shift"])
 
     def test_operator_terms_seed_stock_discovery_for_human_review(self):
         params = SimpleNamespace(

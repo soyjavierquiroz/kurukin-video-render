@@ -1,7 +1,6 @@
 import json
 import math
 import os
-import re
 import shutil
 import socket
 import threading
@@ -18,6 +17,7 @@ from loguru import logger
 from app.config import config
 from app.custom import asset_hub_manifest
 from app.custom import human_review
+from app.custom.video_terms import normalize_video_terms
 from app.custom.kurukin_asset_hub import KurukinAssetHubUnavailableError
 from app.custom.material_acquisition import acquire_selected_materials
 from app.custom.material_discovery import (
@@ -562,19 +562,6 @@ def generate_script(task_id, params):
         return None
 
     return video_script
-
-
-def normalize_video_terms(video_terms):
-    """Apply the native ``VideoParams.video_terms`` parsing contract.
-
-    Keeping this alongside ``generate_terms`` makes upstream callers use the
-    exact same comma/Chinese-comma and list handling as the MPT task path.
-    """
-    if isinstance(video_terms, str):
-        return [term.strip() for term in re.split(r"[,，]", video_terms)]
-    if isinstance(video_terms, list):
-        return [term.strip() for term in video_terms]
-    raise ValueError("video_terms must be a string or a list of strings.")
 
 
 def generate_terms(task_id, params, video_script):
