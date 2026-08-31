@@ -448,6 +448,7 @@ def run_master(manifest: dict) -> dict:
         subtitle_enabled=False,
         subtitle_correction_enabled=False,
         subtitle_optimization_enabled=False,
+        video_terms=manifest.get("video_terms") or None,
     )
     if production_plan_path:
         plan = human_review.read_json(Path(production_plan_path))
@@ -525,6 +526,9 @@ def run_review(manifest: dict) -> dict:
         subtitle_enabled=False,
         subtitle_correction_enabled=False,
         subtitle_optimization_enabled=False,
+        # Blank/missing deliberately remains None so native generate_terms()
+        # follows its established automatic branch.
+        video_terms=manifest.get("video_terms") or None,
     )
     object.__setattr__(
         params,
@@ -541,6 +545,8 @@ def run_review(manifest: dict) -> dict:
             "source_policy": manifest.get("source_policy") or "",
             "mpt_defaults": manifest.get("mpt_defaults"),
             "effective_mpt_settings": mpt_settings,
+            "video_terms_source": "operator" if manifest.get("video_terms") else "generated",
+            "video_terms_raw": manifest.get("video_terms") if manifest.get("video_terms") else None,
         },
     )
     result = task.start(manifest["task_id"], params, stop_at="review")

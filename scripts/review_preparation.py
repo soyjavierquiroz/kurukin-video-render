@@ -55,7 +55,7 @@ def _read(handle: Any) -> dict[str, Any]:
 
 def _identity(payload: dict[str, Any]) -> dict[str, Any]:
     """Immutable source identity; editorial title changes do not duplicate work."""
-    return {key: payload[key] for key in ("content_id", "niche_id", "audio_file_id", "script_file_id", "asset_profile")}
+    return {key: payload.get(key) for key in ("content_id", "niche_id", "audio_file_id", "script_file_id", "asset_profile", "video_terms")}
 
 
 def _inputs(payload: dict[str, Any]) -> dict[str, Any]:
@@ -108,7 +108,24 @@ def enqueue(payload: dict[str, Any], *, job_root: Path = content_ingest.DEFAULT_
                 handle.seek(0)
                 existing = _read(handle)
                 if _identity(existing) != _identity(payload):
-                    raise content_ingest.ContentIngestError("content_id already exists with different review preparation identity")
+                    old_identity = _identity(existing)
+                    new_identity = _identity(payload)
+                    # Terms are an operator-owned visual retrieval input, not
+                    # immutable Drive identity.  A deliberate Sheet edit must
+                    # request fresh review preparation; all other identity
+                    # conflicts remain fail-closed.
+                    if (
+                        {key: value for key, value in old_identity.items() if key != "video_terms"}
+                        != {key: value for key, value in new_identity.items() if key != "video_terms"}
+                    ):
+                        raise content_ingest.ContentIngestError("content_id already exists with different review preparation identity")
+                    existing.update({
+                        **_inputs(payload), "state": "pending", "attempt": 0,
+                        "started_at": None, "finished_at": None, "next_retry_at": None,
+                        "last_error_class": None, "last_error_message": None,
+                    })
+                    existing.pop("pid", None); existing.pop("boot_id", None)
+                    _write(handle, existing)
                 return existing
             record = {
                 **_inputs(payload), "state": "pending", "attempt": 0,

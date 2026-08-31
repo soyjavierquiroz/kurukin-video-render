@@ -44,6 +44,14 @@ class AsyncReviewPreparationTests(unittest.TestCase):
         self.assertEqual(len(list(self.jobs.glob("*/*/review-preparation.json"))), 1)
         ingest.assert_not_called(); create.assert_not_called()
 
+    def test_changed_video_terms_requeues_preparation_but_same_terms_are_idempotent(self) -> None:
+        original = {**self.payload, "video_terms": "café"}
+        first = review_preparation.enqueue(original, job_root=self.jobs)
+        same = review_preparation.enqueue(original, job_root=self.jobs)
+        changed = review_preparation.enqueue({**original, "video_terms": "barista"}, job_root=self.jobs)
+        self.assertEqual((first["state"], same["state"]), ("pending", "pending"))
+        self.assertEqual((changed["state"], changed["video_terms"], changed["attempt"]), ("pending", "barista", 0))
+
     def test_runner_success_marks_completed(self) -> None:
         review_preparation.enqueue(self.payload, job_root=self.jobs)
         plan = self.root / "plan.json"; plan.write_text(json.dumps(self._canonical_plan()), encoding="utf-8")

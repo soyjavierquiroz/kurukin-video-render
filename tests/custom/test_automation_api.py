@@ -220,6 +220,21 @@ class AutomationApiTests(unittest.TestCase):
         self.assertEqual(response.json()["status"], "HUMAN_REVIEW_READY")
         self.assertEqual(response.json()["review_url"], "/?content_id=cid_001")
 
+    def test_reconcile_changed_video_terms_requeues_pending_review(self):
+        _, metadata = self._identity_job()
+        self._current_plan(metadata)
+        jobs_root, host_root = self._schedule_context()
+        with patch.object(automation_api, "_validate_enabled_niche"), jobs_root, host_root, patch.object(
+            automation_api.content_ingest, "validate_request"
+        ):
+            response = self._reconcile(**self._identity_payload(video_terms="café, barista"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "PREPARING_REVIEW")
+        record = json.loads(automation_api.review_preparation.state_path(
+            "test-niche", "cid_001", job_root=self.jobs
+        ).read_text())
+        self.assertEqual(record["video_terms"], "café, barista")
+
     def test_reconcile_failed_preparation_projects_system_owned_error_message(self):
         record = automation_api.review_preparation.enqueue(self._identity_payload(), job_root=self.jobs)
         record.update({

@@ -42,6 +42,7 @@ class ReviewRequest(BaseModel):
     audio_file_id: str = Field(min_length=1)
     script_file_id: str = Field(min_length=1)
     asset_profile: str = Field(min_length=1)
+    video_terms: str | None = None
 
     class Config:
         extra = "forbid"
@@ -64,6 +65,7 @@ class ReconcileRequest(BaseModel):
     audio_file_id: str | None = None
     script_file_id: str | None = None
     asset_profile: str | None = None
+    video_terms: str | None = None
     cleanup_approved: bool | None = None
 
     class Config:
@@ -423,7 +425,13 @@ def _require_review_fields(content_id: str, payload: ReconcileRequest) -> Review
         niche_id=payload.niche_id, content_id=content_id, title=payload.title,
         hook_title=payload.hook_title, audio_file_id=payload.audio_file_id,
         script_file_id=payload.script_file_id, asset_profile=payload.asset_profile,
+        video_terms=payload.video_terms,
     )
+
+
+def _operator_video_terms(value: str | None) -> str | None:
+    """Normalize the Sheet's optional operator input for durable comparison."""
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _require_matching_preparation_identity(
@@ -487,6 +495,11 @@ def _existing_idempotent_review(payload: ReviewRequest) -> bool:
             raise content_ingest.ContentIngestError(
                 f"content_id already exists with different {field}; refusing to overwrite content identity"
             )
+    # ``video_terms`` is deliberately mutable operator retrieval input.  A
+    # change must enter the normal durable preparation path, rather than
+    # treating an old pending review as reusable.
+    if metadata.get("video_terms") != _operator_video_terms(payload.video_terms):
+        return False
 
     plan_path = _plan_for(job_dir, metadata)
     if plan_path is None:
@@ -758,6 +771,23 @@ def reconcile_content(content_id: str, payload: ReconcileRequest) -> dict[str, A
             plan = _read_object(plan_path) if plan_path else None
             if plan is None:
                 return _sheet_projection(content_id, payload.niche_id, "PREPARING_REVIEW", run_mode)
+
+        # A Sheet edit to this operator-owned input invalidates preparation
+        # only while its review plan is still pending.  Approved selections
+        # retain their authority and production states are never altered here.
+        if (
+            plan.get("review_status") == human_review.STATUS_PENDING
+            and metadata.get("video_terms") != _operator_video_terms(payload.video_terms)
+        ):
+            review = _require_review_fields(content_id, payload)
+            create_review(review)
+            preparation = _review_preparation_record(payload.niche_id, content_id)
+            return _sheet_projection(
+                content_id, payload.niche_id,
+                review_preparation.public_state(preparation) if preparation else "PREPARING_REVIEW",
+                run_mode,
+                error_message=review_preparation.sheet_error_message(preparation) if preparation else None,
+            )
 
         state = _production_state(job_dir, plan_path, create_content_job_review.produce_batch.HOST_ROOT, plan)
         if state == "error":

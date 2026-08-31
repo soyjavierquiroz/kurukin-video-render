@@ -32,6 +32,7 @@ from scripts.asset_profile_resolver import AssetProfileError, resolve_asset_prof
 from scripts.content_ingest import asset_policy_summary
 from scripts.niche_registry import DEFAULT_REGISTRY_PATH, NicheRegistryError, load_niche
 from app.custom.mpt_defaults import resolve_effective_mpt_settings
+from app.services.task import normalize_video_terms
 
 
 class ContentJobReviewError(ValueError):
@@ -130,6 +131,7 @@ def content_job_provenance(metadata: dict[str, Any], policy: Any) -> dict[str, A
         "script_sha256": metadata["script_sha256"],
         "mpt_defaults": deepcopy(metadata.get("mpt_defaults")),
         "effective_mpt_settings": metadata.get("effective_mpt_settings") or resolve_effective_mpt_settings(metadata.get("mpt_defaults")),
+        "video_terms": metadata.get("video_terms"),
     }
 
 
@@ -193,13 +195,20 @@ def plan_identity_matches_content_job(
             return False
         fields = (
             "niche_id", "asset_profile", "audio_sha256", "script_sha256",
-            "resolved_asset_policy",
+            "resolved_asset_policy", "video_terms",
         )
         existing_settings = dict(provenance)
         for field in ("mpt_defaults", "effective_mpt_settings"):
             existing_settings.setdefault(field, plan.get(field))
         return (
-            all(provenance.get(field) == metadata.get(field) for field in fields)
+            all(
+                provenance.get(field) == metadata.get(field)
+                for field in fields
+                # Hand-authored legacy content jobs predate resolved policy
+                # snapshots.  Their policy is still proven separately by the
+                # adapter before this compatibility check.
+                if field != "resolved_asset_policy" or field in metadata
+            )
             and _review_mpt_settings_match(existing_settings, metadata)
         )
 
@@ -232,6 +241,20 @@ def plan_identity_matches_content_job(
         has_canonical_suffix(plan.get("audio_path"), "source.mp3")
         and has_canonical_suffix(plan.get("script_path"), "script.txt")
         and _review_mpt_settings_match(plan, metadata)
+    )
+
+
+def _plan_matches_except_video_terms(plan: dict[str, Any], provenance_expected: dict[str, Any], content_id: str) -> bool:
+    """Identify a pending plan made from the same job before an operator term edit."""
+    provenance = plan.get("content_job")
+    if not isinstance(provenance, dict):
+        return False
+    return (
+        provenance.get("content_id") == content_id
+        and all(provenance.get(field) == provenance_expected.get(field) for field in (
+            "niche_id", "asset_profile", "audio_sha256", "script_sha256", "resolved_asset_policy",
+        ))
+        and provenance.get("video_terms") != provenance_expected.get("video_terms")
     )
 
 
@@ -337,13 +360,32 @@ def create_content_job_review(
         raise ContentJobReviewError("review plan path escapes the review queue") from exc
 
     provenance = content_job_provenance(metadata, policy)
+    raw_video_terms = metadata.get("video_terms")
+    if raw_video_terms is not None:
+        try:
+            # Validate early using the native MPT parser; the worker receives
+            # the unmodified raw string and resolves it through that same path.
+            normalize_video_terms(raw_video_terms)
+        except ValueError as exc:
+            raise ContentJobReviewError(str(exc)) from exc
     effective_mpt_settings = resolve_effective_mpt_settings(metadata.get("mpt_defaults"))
     if plan_path.exists():
-        result = _validate_existing_plan(
-            plan_path, batch_id=batch_id, stem=stem, audio=audio, script=script,
-            policy=policy, provenance=provenance, metadata=metadata,
-        )
-        return result, plan_path
+        existing_plan = human_review.read_json(plan_path)
+        if (
+            existing_plan.get("review_status") == human_review.STATUS_PENDING
+            and _plan_matches_except_video_terms(existing_plan, provenance, content_id)
+        ):
+            # Pending choices are only preparation, never approval authority.
+            # Marking this plan stale makes the existing worker rebuild the
+            # same canonical location with the edited operator terms.
+            existing_plan["review_status"] = "stale_video_terms"
+            human_review.write_json_atomic(plan_path, existing_plan)
+        else:
+            result = _validate_existing_plan(
+                plan_path, batch_id=batch_id, stem=stem, audio=audio, script=script,
+                policy=policy, provenance=provenance, metadata=metadata,
+            )
+            return result, plan_path
 
     material_title, source_policy = legacy_review_arguments(policy)
     job = produce_batch.Job(stem, audio, script, None, batch_id)
@@ -356,6 +398,7 @@ def create_content_job_review(
         report_path=report_path, preset="editorial-gold", position="bottom",
         human_review_mode=True, material_title=material_title, source_policy=source_policy,
         mpt_defaults=metadata.get("mpt_defaults"), effective_mpt_settings=effective_mpt_settings,
+        video_terms=raw_video_terms,
     )
     if status != human_review.STATUS_PENDING or not plan_path.is_file():
         raise ContentJobReviewError("existing Human Review generator did not create a pending plan")
@@ -363,7 +406,6 @@ def create_content_job_review(
     if (
         plan.get("review_status") != human_review.STATUS_PENDING
         or plan.get("stem") != stem
-        or not plan_identity_matches_content_job(plan, metadata, content_id)
     ):
         raise ContentJobReviewError("generated review plan identity differs from content job")
     plan["content_job"] = provenance

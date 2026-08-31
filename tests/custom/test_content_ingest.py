@@ -68,6 +68,15 @@ class ContentIngestTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual((self.root / "jobs" / "test-niche").glob("cf_000001").__next__().name, "cf_000001")
 
+    def test_operator_video_terms_are_persisted_and_blank_clears_them(self):
+        first = ingest_content(**self.args(video_terms="kitchen, barista"))
+        self.assertEqual(first["video_terms"], "kitchen, barista")
+
+        second = ingest_content(**self.args(video_terms="   ", download_file=lambda *_: self.fail("must not download")))
+        self.assertNotIn("video_terms", second)
+        persisted = json.loads((self.root / "jobs" / "test-niche" / "cf_000001" / "content.json").read_text())
+        self.assertNotIn("video_terms", persisted)
+
     def test_metadata_uses_resolved_asset_policy_not_legacy_name(self):
         metadata = ingest_content(**self.args())
         self.assertIn("resolved_asset_policy", metadata)

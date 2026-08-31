@@ -21,6 +21,49 @@ class TestAutonomousMaterialPreparation(unittest.TestCase):
             "asset_hub": {"include": {"titles": ["mi-otra-yo"]}},
         }
 
+    def test_video_terms_omitted_or_blank_use_native_generated_fallback(self):
+        for supplied, params in (
+            ("omitted", VideoParams(video_subject="cat", match_materials_to_script=True)),
+            ("blank", VideoParams(video_subject="cat", video_terms="", match_materials_to_script=True)),
+        ):
+            with self.subTest(supplied=supplied):
+                with patch.object(task.llm, "generate_terms", return_value=["generated cat"]) as generate:
+                    self.assertEqual(task.generate_terms("t1", params, "script"), ["generated cat"])
+                generate.assert_called_once()
+
+    def test_normalize_video_terms_uses_native_comma_contract_exactly(self):
+        self.assertEqual(task.normalize_video_terms(" café ,barista，night shift "), ["café", "barista", "night shift"])
+
+    def test_operator_terms_seed_stock_discovery_for_human_review(self):
+        params = SimpleNamespace(
+            material_source_policy=self.policy(), asset_hub_terms=[], video_aspect="9:16",
+            video_clip_duration=5, human_review={"video_terms_source": "operator"}, editorial_profile={},
+        )
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        terms = ["coffee shop", "barista hands"]
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            task._select_autonomous_materials("t1", params, terms, 10, "a script that must not replace terms")
+        self.assertEqual(discover.call_args.kwargs["stock_terms"], terms)
+
+    def test_human_review_plan_records_operator_video_terms_provenance(self):
+        params = SimpleNamespace(
+            material_source_policy=self.policy(), video_aspect="9:16", editorial_profile={},
+            human_review={"video_terms_source": "operator", "video_terms_raw": "café, barista"},
+        )
+        selection = SimpleNamespace(decisions=(), target_count=0)
+        plan = {"segments": []}
+        with patch.object(task, "_select_autonomous_materials", return_value=(SimpleNamespace(), selection)), \
+             patch.object(task, "build_discovery_plan", return_value={}), \
+             patch.object(task.human_review, "build_plan", return_value=plan), \
+             patch.object(task.sm.state, "update_task"):
+            task._prepare_human_review_plan("t1", params, "script", ["café", "barista"], "audio.mp3", 10)
+        self.assertEqual(plan["video_terms_source"], "operator")
+        self.assertEqual(plan["video_terms_raw"], "café, barista")
+        self.assertEqual(plan["video_terms_resolved"], ["café", "barista"])
+
     def test_policy_runs_discover_select_acquire_and_uses_audio_duration(self):
         params = VideoParams(video_subject="cat", material_source_policy=self.policy(), asset_hub_terms=["hub cat"])
         discovery = SimpleNamespace(candidates=(SimpleNamespace(),))

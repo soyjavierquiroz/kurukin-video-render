@@ -764,6 +764,7 @@ def make_manifest(
     source_policy: str = "",
     mpt_defaults: dict[str, Any] | None = None,
     effective_mpt_settings: dict[str, Any] | None = None,
+    video_terms: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "batch_id": sanitize_batch_id(job.mp3.parent),
@@ -781,6 +782,7 @@ def make_manifest(
         "source_policy": source_policy.strip(),
         "mpt_defaults": mpt_defaults,
         "effective_mpt_settings": effective_mpt_settings or {},
+        "video_terms": video_terms,
     }
     if production_plan_path is not None:
         payload["production_plan_path"] = host_to_container(production_plan_path)
@@ -799,6 +801,7 @@ def write_manifest(
     source_policy: str = "",
     mpt_defaults: dict[str, Any] | None = None,
     effective_mpt_settings: dict[str, Any] | None = None,
+    video_terms: str | None = None,
 ) -> Path:
     manifest_path = task_dir / "batch-manifest.json"
     write_json_atomic(
@@ -814,6 +817,7 @@ def write_manifest(
             source_policy=source_policy,
             mpt_defaults=mpt_defaults,
             effective_mpt_settings=effective_mpt_settings,
+            video_terms=video_terms,
         ),
     )
     return manifest_path
@@ -1034,6 +1038,7 @@ def process_job(
     approved_plan_path: Path | None = None,
     mpt_defaults: dict[str, Any] | None = None,
     effective_mpt_settings: dict[str, Any] | None = None,
+    video_terms: str | None = None,
 ) -> str:
     task_dir = HOST_ROOT / "storage" / "tasks" / job.task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -1073,6 +1078,7 @@ def process_job(
             material_title=material_title, source_policy=source_policy,
             mpt_defaults=mpt_defaults,
             effective_mpt_settings=effective_mpt_settings,
+            video_terms=video_terms,
         )
         existing_plan = existing_review_plan
         if existing_plan.get("review_status") == human_review.STATUS_APPROVED:

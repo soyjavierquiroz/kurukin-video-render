@@ -192,6 +192,7 @@ def ingest_content(
     audio_file_id: str,
     script_file_id: str,
     asset_profile: str,
+    video_terms: str | None = None,
     registry_path: Path = DEFAULT_REGISTRY_PATH,
     job_root: Path = DEFAULT_JOB_ROOT,
     download_file: Callable[[str, str, Path], None] = download_by_file_id,
@@ -235,6 +236,17 @@ def ingest_content(
                 raise ContentIngestError(
                     "existing content job inputs differ from content.json; refusing to overwrite provenance"
                 )
+            # This is the one operator-owned mutable input.  It is not a
+            # system projection; a Sheet edit intentionally replaces it.
+            normalized_input = video_terms if isinstance(video_terms, str) and video_terms.strip() else None
+            if metadata.get("video_terms") != normalized_input:
+                if normalized_input is None:
+                    metadata.pop("video_terms", None)
+                else:
+                    metadata["video_terms"] = normalized_input
+                temporary = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.partial")
+                temporary.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                os.replace(temporary, metadata_path)
             return metadata
 
         metadata = {
@@ -254,6 +266,8 @@ def ingest_content(
             "mpt_defaults": niche.get("mpt_defaults"),
             "effective_mpt_settings": resolve_effective_mpt_settings(niche.get("mpt_defaults")),
         }
+        if isinstance(video_terms, str) and video_terms.strip():
+            metadata["video_terms"] = video_terms
         temporary = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.partial")
         try:
             temporary.write_text(

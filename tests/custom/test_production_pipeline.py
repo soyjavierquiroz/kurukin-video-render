@@ -52,6 +52,22 @@ class ProductionPipelineTests(unittest.TestCase):
         manifest = produce_batch.make_manifest(self.job, self.task_dir, "Hola", mpt_defaults=defaults)
         self.assertEqual(manifest["mpt_defaults"], defaults)
 
+    def test_manifest_and_review_provenance_preserve_operator_video_terms(self):
+        manifest = produce_batch.make_manifest(self.job, self.task_dir, "Hola", video_terms="café, barista")
+        self.assertEqual(manifest["video_terms"], "café, barista")
+        manifest.update({"production_plan_path": (self.root / "plan.json").as_posix()})
+
+        def start(_task_id, params, *, stop_at):
+            self.assertEqual(stop_at, "review")
+            self.assertEqual(params.video_terms, "café, barista")
+            self.assertEqual(params.human_review["video_terms_source"], "operator")
+            self.assertEqual(params.human_review["video_terms_raw"], "café, barista")
+            (self.root / "plan.json").write_text("{}", encoding="utf-8")
+            return {}
+
+        with patch("app.services.task.start", side_effect=start):
+            batch_mpt_worker.run_review(manifest)
+
     def test_review_and_master_share_effective_clip_duration(self):
         plan_path = self.root / "production-plan.json"
         settings = {"version": 1, "video_aspect": "16:9", "video_clip_duration": 7,

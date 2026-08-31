@@ -32,7 +32,7 @@ class ContentJobHumanReviewTests(unittest.TestCase):
             "default_asset_profile": profiles[0], "allowed_asset_profiles": profiles,
         }}}), encoding="utf-8")
 
-    def _job(self, *, title="A title", profile="MI_OTRA_YO"):
+    def _job(self, *, title="A title", profile="MI_OTRA_YO", video_terms=None):
         path = self.root / "jobs" / "test-niche" / "cid_001"
         path.mkdir(parents=True)
         audio, script = path / "source.mp3", path / "script.txt"
@@ -41,6 +41,8 @@ class ContentJobHumanReviewTests(unittest.TestCase):
         data = {"content_id": "cid_001", "niche_id": "test-niche", "title": title,
                 "asset_profile": profile, "audio_sha256": hashlib.sha256(b"audio").hexdigest(),
                 "script_sha256": hashlib.sha256(b"script").hexdigest()}
+        if video_terms is not None:
+            data["video_terms"] = video_terms
         (path / "content.json").write_text(json.dumps(data), encoding="utf-8")
         return path, data
 
@@ -122,6 +124,24 @@ class ContentJobHumanReviewTests(unittest.TestCase):
             result, repeated = adapter.create_content_job_review(job, registry_path=self.registry)
         self.assertEqual((result, repeated), ("already_exists", plan))
         process.assert_not_called()
+
+    def test_operator_video_terms_are_provenanced_and_same_terms_reuse_plan(self):
+        job, _ = self._job(video_terms="café, barista")
+        (_, plan), _ = self._create(job)
+        self.assertEqual(human_review.read_json(plan)["content_job"]["video_terms"], "café, barista")
+        with patch.object(produce_batch, "HOST_ROOT", self.root), patch.object(produce_batch, "process_job") as process:
+            self.assertEqual(adapter.create_content_job_review(job, registry_path=self.registry)[0], "already_exists")
+        process.assert_not_called()
+
+    def test_changed_operator_video_terms_marks_pending_plan_stale_and_rebuilds(self):
+        job, data = self._job(video_terms="café")
+        (_, plan), _ = self._create(job)
+        data["video_terms"] = "barista"
+        (job / "content.json").write_text(json.dumps(data), encoding="utf-8")
+        (result, rebuilt), process = self._create(job)
+        self.assertEqual((result, rebuilt), ("created", plan))
+        self.assertEqual(human_review.read_json(plan)["content_job"]["video_terms"], "barista")
+        self.assertEqual(process.call_args.kwargs["video_terms"], "barista")
 
     def test_pending_plan_missing_provenance_is_safely_backfilled_only(self):
         job, data = self._job()

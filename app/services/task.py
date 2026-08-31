@@ -564,6 +564,19 @@ def generate_script(task_id, params):
     return video_script
 
 
+def normalize_video_terms(video_terms):
+    """Apply the native ``VideoParams.video_terms`` parsing contract.
+
+    Keeping this alongside ``generate_terms`` makes upstream callers use the
+    exact same comma/Chinese-comma and list handling as the MPT task path.
+    """
+    if isinstance(video_terms, str):
+        return [term.strip() for term in re.split(r"[,，]", video_terms)]
+    if isinstance(video_terms, list):
+        return [term.strip() for term in video_terms]
+    raise ValueError("video_terms must be a string or a list of strings.")
+
+
 def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
@@ -578,12 +591,7 @@ def generate_terms(task_id, params, video_script):
             match_script_order=params.match_materials_to_script,
         )
     else:
-        if isinstance(video_terms, str):
-            video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
-        elif isinstance(video_terms, list):
-            video_terms = [term.strip() for term in video_terms]
-        else:
-            raise ValueError("video_terms must be a string or a list of strings.")
+        video_terms = normalize_video_terms(video_terms)
 
         logger.debug(f"video terms: {utils.to_json(video_terms)}")
 
@@ -1206,7 +1214,11 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
         # Human Review retrieval is scene-driven, not driven by the LLM's
         # broad video terms.  Keep provider implementations untouched; this
         # only supplies their normal discovery API with provider-local forms.
-        if is_human_review and video_script:
+        operator_video_terms = bool(
+            is_human_review
+            and (getattr(params, "human_review", None) or {}).get("video_terms_source") == "operator"
+        )
+        if is_human_review and video_script and not operator_video_terms:
             segment_count = max(1, int(math.ceil(max(float(audio_duration or 0), params.video_clip_duration) / params.video_clip_duration)))
             query_maps = human_review.retrieval_queries_for_review_segments(
                 video_script, segment_count, getattr(params, "editorial_profile", None) or {},
@@ -1512,6 +1524,12 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
     # approved policy and the effective aspect already present on params.
     plan["mpt_defaults"] = review.get("mpt_defaults")
     plan["effective_mpt_settings"] = review.get("effective_mpt_settings")
+    plan["video_terms_source"] = (
+        "operator" if review.get("video_terms_source") == "operator" else "generated"
+    )
+    if plan["video_terms_source"] == "operator":
+        plan["video_terms_raw"] = review.get("video_terms_raw")
+    plan["video_terms_resolved"] = list(video_terms)
     if not _human_review_plan_has_usable_candidates(
         plan,
         int(getattr(selection, "target_count", 0) or 0),
