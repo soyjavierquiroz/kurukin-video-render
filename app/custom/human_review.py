@@ -613,6 +613,24 @@ def _authorized_asset_location(
     return None
 
 
+def authorized_asset_location(
+    plan: Mapping[str, Any],
+    asset_uid: str,
+    *,
+    exclude_segment_id: str = "",
+) -> str | None:
+    """Return the other segment that already authorizes ``asset_uid``.
+
+    Alternatives do not authorize an asset; only a PRIMARY or BACKUP does.
+    Keep Review UI actions on this same authorization rule.
+    """
+    return _authorized_asset_location(
+        plan,
+        asset_uid,
+        exclude_segment_id=exclude_segment_id,
+    )
+
+
 def _usable_asset_duration(
     asset: Mapping[str, Any] | None,
     segment_duration: float,
@@ -1206,7 +1224,7 @@ def set_segment_backup(
             )
 
         if enabled:
-            authorized_elsewhere = _authorized_asset_location(
+            authorized_elsewhere = authorized_asset_location(
                 plan,
                 asset_uid,
                 exclude_segment_id=segment_id,
@@ -2289,9 +2307,11 @@ def build_plan(
     # ----------------------------------------------------------
     # PASS 2
     #
-    # Allocate up to three segment-local suggestions. PRIMARY identities are
-    # globally reserved; alternatives intentionally are not, because Review
-    # does not materialize one until an operator promotes it.
+    # Allocate up to three segment-local suggestions. Once all PRIMARYs have
+    # been finalized, their UIDs are globally authorized. Prefer candidates
+    # outside that set so displayed suggestions are promotable whenever the
+    # retrieval pool permits it. Suggestions themselves remain reusable until
+    # an operator promotes one.
     # ----------------------------------------------------------
 
     assigned_suggestions: list[list[Any]] = [
@@ -2331,6 +2351,12 @@ def build_plan(
 
         candidate_queues.append(queue)
 
+    authorized_primary_uids = {
+        candidate_uid(reserved[7])
+        for reserved in reserved_segments
+        if reserved[7] is not None and candidate_uid(reserved[7])
+    }
+
     alternative_frequency: dict[str, int] = {}
     for segment_index, queue in enumerate(candidate_queues):
         local_identities: set[str] = set()
@@ -2347,7 +2373,18 @@ def build_plan(
                 item[0],
             ),
         )
-        for _position, alt in queue:
+        # Preserve the existing editorial/frequency order inside each group,
+        # while always exhausting promotable candidates before a scarcity
+        # fallback already authorized by another segment.
+        promotable_queue = [
+            item for item in queue
+            if candidate_uid(item[1]) not in authorized_primary_uids
+        ]
+        blocked_queue = [
+            item for item in queue
+            if candidate_uid(item[1]) in authorized_primary_uids
+        ]
+        for _position, alt in promotable_queue + blocked_queue:
             alt_uid = candidate_uid(alt)
             identity_keys = candidate_identity_keys(alt)
             if not alt_uid or any(key in local_identities for key in identity_keys):
@@ -2667,7 +2704,7 @@ def replace_segment_asset(
     if plan.get("review_status") == STATUS_APPROVED:
         raise ValueError("approved production plans are frozen")
 
-    authorized_elsewhere = _authorized_asset_location(
+    authorized_elsewhere = authorized_asset_location(
         plan,
         asset_uid,
         exclude_segment_id=segment_id,

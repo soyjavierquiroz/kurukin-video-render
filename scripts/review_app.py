@@ -105,6 +105,19 @@ def filter_plans_for_content_id(plans: list[Path], content_id: str | None) -> li
     return [selected_plan] if selected_plan is not None else []
 
 
+def alternative_authorized_elsewhere(
+    plan: Mapping[str, object],
+    segment_id: str,
+    asset_uid: str,
+) -> str | None:
+    """Use the canonical Review authorization rule for an alternative."""
+    return human_review.authorized_asset_location(
+        plan,
+        asset_uid,
+        exclude_segment_id=segment_id,
+    )
+
+
 def query_content_id() -> str | None:
     """Read the optional Streamlit deep-link parameter across supported APIs."""
     params = getattr(st, "query_params", None)
@@ -608,7 +621,14 @@ def main() -> None:
                 )
                 show_asset_metadata(alternative)
 
-                if st.button(
+                authorized_elsewhere = alternative_authorized_elsewhere(
+                    plan,
+                    segment_id,
+                    uid,
+                )
+                if authorized_elsewhere:
+                    st.caption(f"USED IN {authorized_elsewhere}")
+                elif st.button(
                     "MAKE PRIMARY",
                     key=(
                         f"replace-"

@@ -1,6 +1,7 @@
 import unittest
 
 from scripts.review_app import (
+    alternative_authorized_elsewhere,
     plan_content_id,
     should_enqueue_nightly,
 )
@@ -76,6 +77,21 @@ class ReviewAppContentLookupTests(unittest.TestCase):
         )
         self.assertTrue(
             should_enqueue_nightly(plan),
+        )
+
+    def test_blocked_alternative_has_no_primary_action_location(self):
+        plan = {
+            "segments": [
+                {"segment_id": "segment-001", "selected_asset": {"asset_uid": "asset-a"}},
+                {"segment_id": "segment-002", "selected_asset": {"asset_uid": "asset-b"}},
+            ],
+        }
+        self.assertEqual(
+            alternative_authorized_elsewhere(plan, "segment-001", "asset-b"),
+            "segment-002",
+        )
+        self.assertIsNone(
+            alternative_authorized_elsewhere(plan, "segment-001", "asset-c"),
         )
 
 

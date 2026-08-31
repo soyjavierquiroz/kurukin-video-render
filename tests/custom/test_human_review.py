@@ -743,8 +743,51 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(second["selected_asset"]["asset_uid"], "asset-b")
         self.assertEqual(
             [item["asset_uid"] for item in second["alternatives"]],
-            ["asset-a", "asset-c", "asset-d"],
+            ["asset-c", "asset-d", "asset-a"],
         )
+
+    def test_alternatives_prefer_assets_not_authorized_by_other_primaries(self):
+        assets = [candidate(uid) for uid in ("asset-a", "asset-b", "asset-c", "asset-d", "asset-e")]
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        plan = human_review.build_plan(
+            batch_id="batch", task_id="task-1", stem="story", audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt", script_text="Uno. Dos.", duration=10,
+            aspect_ratio="9:16", visual_style="none",
+            selection_result=selection([assets[0], assets[0]]),
+            discovery_result=SimpleNamespace(candidates=tuple(assets)), output_path=plan_file,
+        )
+
+        primary_uids = {
+            segment["selected_asset"]["asset_uid"]
+            for segment in plan["segments"]
+        }
+        self.assertEqual(primary_uids, {"asset-a", "asset-b"})
+        for segment in plan["segments"]:
+            alternative_uids = [item["asset_uid"] for item in segment["alternatives"]]
+            self.assertEqual(alternative_uids, ["asset-c", "asset-d", "asset-e"])
+            self.assertTrue(all(
+                human_review.authorized_asset_location(
+                    plan, uid, exclude_segment_id=segment["segment_id"],
+                ) is None
+                for uid in alternative_uids
+            ))
+
+    def test_scarce_blocked_alternative_cannot_be_promoted(self):
+        assets = [candidate(uid) for uid in ("asset-a", "asset-b", "asset-c")]
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+        plan = human_review.build_plan(
+            batch_id="batch", task_id="task-1", stem="story", audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt", script_text="Uno. Dos.", duration=10,
+            aspect_ratio="9:16", visual_style="none",
+            selection_result=selection([assets[0], assets[0]]),
+            discovery_result=SimpleNamespace(candidates=tuple(assets)), output_path=plan_file,
+        )
+
+        first = plan["segments"][0]
+        self.assertIn("asset-b", [item["asset_uid"] for item in first["alternatives"]])
+        with self.assertRaisesRegex(ValueError, "already authorized in segment-002"):
+            human_review.replace_segment_asset(plan_file, "segment-001", "asset-b")
 
     def test_script_fragments_are_contiguous_and_not_full_script(self):
         script = "Uno dos tres. Cuatro cinco seis. Siete ocho nueve. Diez once doce."
