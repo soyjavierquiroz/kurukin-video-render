@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+import subprocess
 
 from scripts.content_ingest import (
     ContentIngestError,
@@ -153,6 +154,20 @@ class ContentIngestTests(unittest.TestCase):
         ])
         self.assertEqual(run.call_args.args[0][4], "drive-file-id")
         self.assertFalse(list(self.root.glob(".source.mp3.*.partial")))
+
+    def test_rclone_auth_failure_is_sanitized_and_identifies_source_kind(self):
+        target = self.root / "source.mp3"
+        failure = subprocess.CalledProcessError(
+            1, ["rclone"], stderr="invalid_grant: couldn't fetch token=secret-value"
+        )
+        with patch("scripts.content_ingest.subprocess.run", side_effect=failure):
+            with self.assertRaisesRegex(
+                ContentIngestError,
+                "^Source audio could not be downloaded from Drive: authentication failed$",
+            ) as raised:
+                download_by_file_id("test-remote", "drive-file-id", target)
+        self.assertNotIn("secret-value", str(raised.exception))
+        self.assertNotIn("drive-file-id", str(raised.exception))
 
     def test_ffprobe_duration_is_parsed(self):
         audio = self.root / "source.mp3"

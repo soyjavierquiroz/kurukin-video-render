@@ -146,9 +146,36 @@ def download_by_file_id(rclone_remote: str, file_id: str, target: Path) -> None:
             raise ContentIngestError(f"rclone did not produce {target.name}")
         os.replace(temporary, target)
     except subprocess.CalledProcessError as exc:
-        raise ContentIngestError(f"rclone download failed for Drive file ID: {file_id}") from exc
+        raise ContentIngestError(_rclone_download_error(target, exc.stderr)) from exc
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _rclone_download_error(target: Path, stderr: Any) -> str:
+    """Return a concise, secret-free source-download diagnostic.
+
+    Rclone/Google errors can include request URLs and credential refresh
+    details.  Durable preparation state is visible to the Sheet, so retain
+    only a stable failure class and never the Drive ID or stderr itself.
+    """
+    name = "Source audio" if target.name == "source.mp3" else (
+        "Source script" if target.name == "script.txt" else "Source file"
+    )
+    detail = str(stderr or "").lower()
+    if any(marker in detail for marker in (
+        "invalid_grant", "couldn't fetch token", "could not fetch token",
+        "unauthorized", "authentication", "oauth",
+    )):
+        reason = "authentication failed"
+    elif any(marker in detail for marker in ("permission denied", "forbidden", "insufficient permissions")):
+        reason = "permission denied"
+    elif any(marker in detail for marker in ("not found", "404", "does not exist")):
+        reason = "file not found or inaccessible"
+    elif "shortcut" in detail:
+        reason = "object is a shortcut and cannot be downloaded as a source file"
+    else:
+        reason = "download failed"
+    return f"{name} could not be downloaded from Drive: {reason}"
 
 
 def asset_policy_summary(policy: Any) -> dict[str, Any]:
