@@ -69,6 +69,37 @@ class ContentIngestTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual((self.root / "jobs" / "test-niche").glob("cf_000001").__next__().name, "cf_000001")
 
+    def test_each_explicit_asset_profile_is_persisted_without_cross_content_leakage(self):
+        cases = (
+            ("cf_000101", "GENERALES"),
+            ("cf_000102", "MI_OTRA_YO"),
+            ("cf_000103", "GENERALES"),
+        )
+
+        for content_id, asset_profile in cases:
+            metadata = ingest_content(**self.args(
+                content_id=content_id,
+                asset_profile=asset_profile,
+            ))
+            self.assertEqual(metadata["asset_profile"], asset_profile)
+            persisted = json.loads(
+                (self.root / "jobs" / "test-niche" / content_id / "content.json").read_text()
+            )
+            self.assertEqual(persisted["asset_profile"], asset_profile)
+
+        self.assertEqual(
+            ingest_content(**self.args(
+                content_id="cf_000101",
+                asset_profile="GENERALES",
+                download_file=lambda *_: self.fail("must not download"),
+            ))["asset_profile"],
+            "GENERALES",
+        )
+
+    def test_blank_asset_profile_is_rejected_explicitly(self):
+        with self.assertRaisesRegex(ContentIngestError, "asset_profile must be a non-empty string"):
+            ingest_content(**self.args(asset_profile="   "))
+
     def test_operator_video_terms_are_persisted_and_blank_clears_them(self):
         first = ingest_content(**self.args(video_terms="kitchen, barista"))
         self.assertEqual(first["video_terms"], "kitchen, barista")
