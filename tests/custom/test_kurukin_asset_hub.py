@@ -113,6 +113,7 @@ class KurukinAssetHubTests(unittest.TestCase):
             provider.session.calls[0]["json"]["source_policy"],
             {"sources": [{"scope": "title", "title": "mi-otra-yo"}]},
         )
+        self.assertNotIn("sources", provider.session.calls[0]["json"])
 
     def test_search_title_plus_generic_preserves_or_sources(self):
         provider = make_provider([FakeResponse(200, {"assets": []})])
@@ -132,6 +133,7 @@ class KurukinAssetHubTests(unittest.TestCase):
             provider.session.calls[0]["json"]["source_policy"]["sources"],
             [{"scope": "title", "title": "mi-otra-yo"}, {"scope": "generic"}],
         )
+        self.assertNotIn("sources", provider.session.calls[0]["json"])
 
     def test_search_brand_grandiosa_mujer(self):
         provider = make_provider([FakeResponse(200, {"assets": []})])

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from app.custom.material_source_policy import (
     PROVIDER_ASSET_HUB,
@@ -55,7 +56,13 @@ class AssetProfileResolverTests(unittest.TestCase):
         self.assertFalse(policy.asset_hub.include.generic)
 
     def test_generales_resolves_only_runtime_ready_stock_providers(self):
-        policy = resolve_asset_profile("test-niche", "GENERALES", self.registry(["GENERALES"]))
+        with patch(
+            "scripts.asset_profile_resolver.native_stock_provider_configured",
+            return_value=False,
+        ):
+            policy = resolve_asset_profile(
+                "test-niche", "GENERALES", self.registry(["GENERALES"])
+            )
         self.assertEqual(
             policy.providers.enabled,
             (PROVIDER_ASSET_HUB, PROVIDER_LOCAL),
