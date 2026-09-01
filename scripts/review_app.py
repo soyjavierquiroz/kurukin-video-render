@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.custom import human_review
+from scripts import content_ingest, review_preparation
 
 
 def _clean_text(value: object) -> str:
@@ -47,16 +48,81 @@ def should_enqueue_nightly(plan: Mapping[str, object]) -> bool:
     return not _is_content_job_plan(plan)
 
 
-def discover_plans(status: str = human_review.STATUS_PENDING) -> list[Path]:
+def discover_plan_files() -> list[Path]:
+    """Return all readable plans, including retained diagnostic plans."""
     root = human_review.review_root(PROJECT_ROOT)
-    plans = sorted(root.glob("*/*/production-plan.json"))
+    return sorted(root.glob("*/*/production-plan.json"))
+
+
+def content_job_niche_id(plan: Mapping[str, object]) -> str | None:
+    """Return the content-job niche identity embedded in a review plan."""
+    content_job = plan.get("content_job")
+    if isinstance(content_job, Mapping):
+        niche_id = _clean_text(content_job.get("niche_id"))
+        if niche_id:
+            return niche_id
+
+    content_id = plan_content_id(plan)
+    for key in ("audio_path", "script_path"):
+        parts = Path(_clean_text(plan.get(key))).as_posix().split("/")
+        try:
+            index = parts.index("content_jobs")
+            if parts[index + 2] == content_id:
+                return parts[index + 1] or None
+        except (ValueError, IndexError):
+            continue
+    return None
+
+
+def review_public_state(plan: Mapping[str, object]) -> tuple[str, str | None]:
+    """Use durable preparation state as the authority for content-job review.
+
+    Legacy batch plans have no content-job state machine and retain their
+    established pending-review behavior.
+    """
+    if not _is_content_job_plan(plan):
+        return "HUMAN_REVIEW_READY", None
+    content_id = plan_content_id(plan)
+    niche_id = content_job_niche_id(plan)
+    if not content_id or not niche_id:
+        return "PREPARING_REVIEW", None
+    path = review_preparation.state_path(
+        niche_id, content_id, job_root=content_ingest.DEFAULT_JOB_ROOT,
+    )
+    try:
+        record = human_review.read_json(path)
+    except (OSError, ValueError):
+        return "PREPARING_REVIEW", None
+    if not isinstance(record, Mapping):
+        return "PREPARING_REVIEW", None
+    if (
+        record.get("content_id") != content_id
+        or record.get("niche_id") != niche_id
+    ):
+        return "PREPARING_REVIEW", None
+    return (
+        review_preparation.public_state(record),
+        review_preparation.sheet_error_message(record),
+    )
+
+
+def is_actionable_review(plan: Mapping[str, object]) -> bool:
+    """Whether this plan may expose editor controls to a human reviewer."""
+    return (
+        plan.get("review_status") == human_review.STATUS_PENDING
+        and review_public_state(plan)[0] == "HUMAN_REVIEW_READY"
+    )
+
+
+def discover_plans(status: str = human_review.STATUS_PENDING) -> list[Path]:
+    """Return only plans whose canonical public state permits review."""
     result = []
-    for plan_file in plans:
+    for plan_file in discover_plan_files():
         try:
             plan = human_review.read_json(plan_file)
         except Exception:
             continue
-        if plan.get("review_status") == status:
+        if plan.get("review_status") == status and is_actionable_review(plan):
             result.append(plan_file)
     return result
 
@@ -246,16 +312,34 @@ def main() -> None:
     st.set_page_config(page_title="Human Review", layout="wide")
     st.title("Human Review")
 
-    plans = discover_plans()
-    if not plans:
-        st.info("No pending review jobs.")
-        return
-
     content_id = query_content_id()
     if content_id is not None:
-        plans = filter_plans_for_content_id(plans, content_id)
+        diagnostic_plans = []
+        for path in discover_plan_files():
+            try:
+                candidate = human_review.read_json(path)
+            except Exception:
+                continue
+            if candidate.get("review_status") == human_review.STATUS_PENDING:
+                diagnostic_plans.append(path)
+        plans = filter_plans_for_content_id(diagnostic_plans, content_id)
         if not plans:
             st.error(f"No pending review was found for content_id={content_id!r}.")
+            return
+        selected_plan = human_review.read_json(plans[0])
+        public_state, safe_error_message = review_public_state(selected_plan)
+        if public_state == "ERROR":
+            st.error("Review is unavailable because preparation failed.")
+            if safe_error_message:
+                st.caption(safe_error_message)
+            return
+        if public_state != "HUMAN_REVIEW_READY":
+            st.info("Review is still being prepared and is not ready yet.")
+            return
+    else:
+        plans = discover_plans()
+        if not plans:
+            st.info("No pending review jobs.")
             return
 
     labels = []
