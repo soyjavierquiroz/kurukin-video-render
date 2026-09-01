@@ -11,6 +11,7 @@ with patch.dict(sys.modules, {"streamlit": SimpleNamespace()}):
     from scripts import review_app
 alternative_authorized_elsewhere = review_app.alternative_authorized_elsewhere
 is_actionable_review = review_app.is_actionable_review
+non_previewable_primary_segments = review_app.non_previewable_primary_segments
 plan_content_id = review_app.plan_content_id
 review_public_state = review_app.review_public_state
 should_enqueue_nightly = review_app.should_enqueue_nightly
@@ -149,6 +150,7 @@ class _Streamlit:
     def write(self, *_args): pass
     def warning(self, *_args): pass
     def success(self, *_args): pass
+    def image(self, *_args, **_kwargs): pass
     def rerun(self): pass
     def error(self, value): self.errors.append(value)
     def info(self, value): self.infos.append(value)
@@ -199,6 +201,119 @@ class ReviewAppReadinessGateTests(unittest.TestCase):
              patch.object(review_app, "st", fake):
             review_app.main()
         return fake
+
+    @staticmethod
+    def _asset(uid, *, previewable=True):
+        return {
+            "asset_uid": uid,
+            "provider": "test",
+            "metadata": {"duration": 2.0},
+            "preview": (
+                {"status": "available", "type": "url", "value": "https://example.test/preview.jpg"}
+                if previewable
+                else {"status": "unavailable", "type": "none", "value": ""}
+            ),
+        }
+
+    def _write_ready_segment_plan(
+        self,
+        *,
+        previewable=True,
+        blocked=False,
+        primary_previewable=True,
+    ):
+        alternative = self._asset("alternative", previewable=previewable)
+        alternative["review_previewable"] = previewable
+        selected_uid = "selected"
+        segments = [{
+            "segment_id": "segment-001",
+            "duration": 1.0,
+            "script_text": "A reviewable scene.",
+            "selected_asset": self._asset(selected_uid, previewable=primary_previewable),
+            "alternatives": [alternative],
+            "backup_assets": [],
+            "coverage": {
+                "target_duration": 1.0,
+                "covered_duration": 1.0,
+                "missing_duration": 0.0,
+            },
+        }]
+        if blocked:
+            segments.append({
+                "segment_id": "segment-002",
+                "duration": 1.0,
+                "script_text": "The authorized scene.",
+                "selected_asset": self._asset("alternative"),
+                "alternatives": [],
+                "backup_assets": [],
+                "coverage": {
+                    "target_duration": 1.0,
+                    "covered_duration": 1.0,
+                    "missing_duration": 0.0,
+                },
+            })
+        self.plan["segments"] = segments
+        self.plan_file.write_text(json.dumps(self.plan), encoding="utf-8")
+        self._write_state("completed")
+
+    def test_non_previewable_scarcity_alternative_has_no_primary_action(self):
+        self._write_ready_segment_plan(previewable=False)
+
+        ui = self._run_main()
+
+        self.assertNotIn("MAKE PRIMARY", ui.buttons)
+        self.assertIn("NO PREVIEW AVAILABLE", ui.captions)
+
+    def test_alternative_uses_persisted_canonical_previewability(self):
+        self._write_ready_segment_plan(previewable=True)
+        stored = json.loads(self.plan_file.read_text(encoding="utf-8"))
+        stored["segments"][0]["alternatives"][0]["review_previewable"] = False
+        self.plan_file.write_text(json.dumps(stored), encoding="utf-8")
+
+        ui = self._run_main()
+
+        self.assertNotIn("MAKE PRIMARY", ui.buttons)
+        self.assertIn("NO PREVIEW AVAILABLE", ui.captions)
+
+    def test_previewable_alternative_keeps_primary_action(self):
+        self._write_ready_segment_plan(previewable=True)
+        stored = json.loads(self.plan_file.read_text(encoding="utf-8"))
+        # Existing ready plans did not persist the field; the UI falls back
+        # to Human Review's canonical helper for those plans only.
+        stored["segments"][0]["alternatives"][0].pop("review_previewable")
+        self.plan_file.write_text(json.dumps(stored), encoding="utf-8")
+
+        ui = self._run_main()
+
+        self.assertIn("MAKE PRIMARY", ui.buttons)
+
+    def test_blocked_alternative_keeps_existing_non_actionable_reason(self):
+        self._write_ready_segment_plan(previewable=True, blocked=True)
+
+        ui = self._run_main()
+
+        self.assertNotIn("MAKE PRIMARY", ui.buttons)
+        self.assertIn("USED IN segment-002", ui.captions)
+
+    def test_non_previewable_blocked_alternative_is_non_actionable(self):
+        self._write_ready_segment_plan(previewable=False, blocked=True)
+
+        ui = self._run_main()
+
+        self.assertNotIn("MAKE PRIMARY", ui.buttons)
+        self.assertIn("NO PREVIEW AVAILABLE", ui.captions)
+
+    def test_non_previewable_primary_cannot_be_blindly_approved(self):
+        self._write_ready_segment_plan(primary_previewable=False)
+
+        ui = self._run_main()
+
+        self.assertEqual(
+            non_previewable_primary_segments(self.plan),
+            ["segment-001"],
+        )
+        self.assertNotIn("APPROVE JOB", ui.buttons)
+        self.assertIn("NO PREVIEW AVAILABLE", ui.captions)
 
     def test_error_plan_is_non_actionable_and_shows_safe_message(self):
         self.plan_file.write_text(json.dumps(self.plan), encoding="utf-8")

@@ -300,6 +300,60 @@ class TestHumanReviewPlan(unittest.TestCase):
             ["positive-a", "positive-b"],
         )
 
+    def test_previewable_alternatives_fill_visible_slots_before_unavailable_candidates(self):
+        selected = candidate("selected", source_info={"visual_description": "worried woman resting alone at home"})
+        unavailable = candidate("unavailable")
+        previewable = [
+            candidate(f"previewable-{index}", source_info={"thumbnail_url": f"https://img.example/{index}.jpg"})
+            for index in range(1, 4)
+        ]
+        with patch("app.custom.human_review.requests.get", return_value=FakeImageResponse()), \
+             patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Escena simple.", duration=5,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([selected]),
+                discovery_result=SimpleNamespace(candidates=tuple([selected, unavailable, *previewable])),
+                output_path=self.root / "previewable-slots.json",
+            )
+
+        alternatives = plan["segments"][0]["alternatives"]
+        self.assertEqual([item["asset_uid"] for item in alternatives], [item.canonical_id for item in previewable])
+        self.assertTrue(all(human_review.review_previewable(item["preview"]) for item in alternatives))
+
+    def test_unavailable_scarcity_alternative_is_retained_but_not_review_previewable(self):
+        selected = candidate("selected")
+        unavailable = candidate("unavailable")
+        with patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Escena simple.", duration=5,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([selected]),
+                discovery_result=SimpleNamespace(candidates=(selected, unavailable)),
+                output_path=self.root / "preview-scarcity.json",
+            )
+
+        alternative = plan["segments"][0]["alternatives"][0]
+        self.assertEqual(alternative["asset_uid"], "unavailable")
+        self.assertFalse(human_review.review_previewable(alternative["preview"]))
+        self.assertFalse(alternative["review_previewable"])
+        self.assertEqual(plan["segments"][0]["warnings"][0]["code"], "preview_unavailable")
+
+    def test_visible_alternatives_keep_v2_positive_editorial_order(self):
+        selected = candidate("selected", source_info={"visual_description": "worried woman resting alone at home"})
+        unknown = candidate("asset-unknown", source_info={"editorial_quality": 100, "contains_people": True})
+        positive = candidate("positive", source_info={"visual_description": "worried woman resting alone at home"})
+        with patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Una mujer siente culpa al descansar en casa.", duration=5,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([selected]),
+                discovery_result=SimpleNamespace(candidates=(selected, unknown, positive)),
+                output_path=self.root / "editorial-order.json",
+            )
+
+        self.assertEqual([item["asset_uid"] for item in plan["segments"][0]["alternatives"]], ["positive", "asset-unknown"])
+
     def test_scene_queries_prefer_scene_derived_asset_over_old_hint(self):
         old_hint = candidate("old-hint", term="niña sola")
         scene_asset = candidate("scene-asset", term="persona culpa agotamiento")

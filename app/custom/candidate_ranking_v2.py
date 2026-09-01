@@ -126,16 +126,21 @@ def stable_secondary_dedupe(candidates: Iterable[Any]) -> list[Any]:
         seen.update(keys)
         unique.append(candidate)
     return unique
-def _text(candidate: Any) -> str:
+def _text(candidate: Any, *, include_search_term: bool = True) -> str:
     data = _metadata(candidate)
     values: list[Any] = []
     # Providers expose different subsets of this contract. Absence is kept
     # unavailable rather than converted into a negative score.
-    for key in ("title", "description", "keywords", "filename", "tags", "visual_description", "action_description", "search_text", "embedding_text", "primary_theme", "primary_topic", "presentation", "visual_presentation"):
+    for key in ("title", "description", "keywords", "filename", "tags", "visual_description", "action_description", "search_text", "embedding_text", "primary_theme", "primary_topic", "presentation", "visual_presentation", "source_page"):
         value = data.get(key)
         values.extend(value) if isinstance(value, (list, tuple, set)) else values.append(value)
-    for key in ("title", "description", "filename", "search_term"):
+    # A retrieval query is useful for the legacy relevance score, but not for
+    # the later editorial-evidence bucket.  Provider source-page slugs are
+    # retained above because they are asset-specific provenance.
+    for key in ("title", "description", "filename"):
         values.append(_candidate_value(candidate, key))
+    if include_search_term:
+        values.append(_candidate_value(candidate, "search_term"))
     return " ".join(text for value in values if (text := _usable_text(value)))
 
 
@@ -168,6 +173,16 @@ def _negative_categories(intent: SceneVisualIntent, text: str) -> set[str]:
 
 def has_strong_scene_intent(intent: SceneVisualIntent) -> bool:
     return bool(intent.emotional_intent or intent.relationship_context or intent.action)
+
+
+def candidate_editorial_evidence(intent: SceneVisualIntent, candidate: Any) -> float:
+    """Evidence from asset metadata, excluding the provider retrieval query."""
+    text = _text(candidate, include_search_term=False)
+    values = (
+        _match((*intent.literal_concepts, *intent.action, *intent.environment, *intent.relationship_context), text),
+        _match((*intent.emotional_intent, *intent.character_state, *intent.cinematic_mood), text),
+    )
+    return max((value or 0.0) for value in values)
 def _clamp(value: float) -> float: return round(max(0.0, min(1.0, value)), 4)
 
 

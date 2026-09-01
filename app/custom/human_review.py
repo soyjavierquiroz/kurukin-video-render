@@ -26,7 +26,9 @@ from app.custom.asset_search_v2 import (
 from app.custom.material_discovery import MaterialCandidate
 from app.custom.material_selection import MaterialSelectionDecision
 from app.custom.candidate_ranking_v2 import (
+    candidate_editorial_evidence,
     candidate_identity_keys,
+    has_strong_scene_intent,
     rank_candidates_v2,
     stable_secondary_dedupe,
 )
@@ -2027,6 +2029,22 @@ def ensure_candidate_preview(candidate: Any, thumbnails_dir: Path) -> tuple[dict
     )
 
 
+def review_previewable(preview: Mapping[str, Any] | None) -> bool:
+    """Whether Human Review has a usable representation for an asset.
+
+    This is intentionally based on the normalized result of
+    ``ensure_candidate_preview`` rather than the presence of any one optional
+    provider metadata field.
+    """
+    if not isinstance(preview, Mapping):
+        return False
+    return (
+        str(preview.get("status") or "") == "available"
+        and str(preview.get("type") or "") in {"local", "url"}
+        and bool(str(preview.get("value") or "").strip())
+    )
+
+
 def ensure_thumbnail(candidate: Any, thumbnails_dir: Path) -> tuple[str, str]:
     preview, _warnings = ensure_candidate_preview(candidate, thumbnails_dir)
     if preview.get("type") == "local":
@@ -2357,6 +2375,13 @@ def build_plan(
     ]
 
     candidate_queues: list[list[Any]] = []
+    preview_cache: dict[str, tuple[dict[str, str], list[dict[str, str]]]] = {}
+
+    def cached_preview(item: Any) -> tuple[dict[str, str], list[dict[str, str]]]:
+        uid = candidate_uid(item)
+        if uid not in preview_cache:
+            preview_cache[uid] = ensure_candidate_preview(item, thumbnails_dir)
+        return preview_cache[uid]
 
     for reserved in reserved_segments:
         (
@@ -2394,25 +2419,37 @@ def build_plan(
         if reserved[7] is not None and candidate_uid(reserved[7])
     }
 
-    alternative_frequency: dict[str, int] = {}
     for segment_index, queue in enumerate(candidate_queues):
         local_identities: set[str] = set()
-        _reserved = reserved_segments[segment_index]
-        ranking_by_uid = _reserved[6]
-        # Alternatives remain reusable.  A tiny score adjustment only breaks
-        # near ties, reducing repeated suggestion sets without starving later
-        # scenes of otherwise useful options.
+        # ``ranked_candidates`` is already V2's editorial order.  Do not
+        # re-sort it by the aggregate score here: that would let a technically
+        # strong UNKNOWN or an explicit contradiction leapfrog a positive
+        # editorial match after allocation.
+        intent = reserved_segments[segment_index][5]
+        ranking_by_uid = reserved_segments[segment_index][6]
         queue = sorted(
             enumerate(queue),
             key=lambda item: (
-                -((ranking_by_uid.get(candidate_uid(item[1])).total_score if ranking_by_uid.get(candidate_uid(item[1])) else 0.0)
-                  - .015 * alternative_frequency.get(candidate_uid(item[1]), 0)),
+                1 if "explicit_narrative_contradiction" in (ranking_by_uid.get(candidate_uid(item[1])).penalty_codes if ranking_by_uid.get(candidate_uid(item[1])) else ()) else 0,
+                1 if has_strong_scene_intent(intent) and candidate_editorial_evidence(intent, item[1]) == 0 else 0,
                 item[0],
             ),
         )
-        # Preserve the existing editorial/frequency order inside each group,
-        # while always exhausting promotable candidates before a scarcity
-        # fallback already authorized by another segment.
+        # Previewability is a Human Review contract, not an optional provider
+        # metadata check.  Fill normal slots with inspectable assets first;
+        # retain genuinely unavailable assets only for honest scarcity.
+        previewable_queue = [
+            item for item in queue
+            if review_previewable(cached_preview(item[1])[0])
+        ]
+        unavailable_queue = [
+            item for item in queue
+            if not review_previewable(cached_preview(item[1])[0])
+        ]
+        queue = previewable_queue + unavailable_queue
+        # Always exhaust promotable candidates before a scarcity fallback
+        # already authorized by another segment.  Suggestions remain reusable
+        # unless an operator promotes one.
         promotable_queue = [
             item for item in queue
             if candidate_uid(item[1]) not in authorized_primary_uids
@@ -2428,7 +2465,6 @@ def build_plan(
                 continue
             assigned_suggestions[segment_index].append(alt)
             local_identities.update(identity_keys)
-            alternative_frequency[alt_uid] = alternative_frequency.get(alt_uid, 0) + 1
             if len(assigned_suggestions[segment_index]) == 3:
                 break
 
@@ -2537,12 +2573,7 @@ def build_plan(
         for alt in assigned_suggestions[
             index - 1
         ]:
-            alt_preview, alt_preview_warnings = (
-                ensure_candidate_preview(
-                    alt,
-                    thumbnails_dir,
-                )
-            )
+            alt_preview, alt_preview_warnings = cached_preview(alt)
 
             alt_thumb = (
                 alt_preview.get("value")
@@ -2570,6 +2601,7 @@ def build_plan(
             _serialize_v2_ranking(payload, ranking_by_uid.get(candidate_uid(alt)))
 
             payload["preview"] = alt_preview
+            payload["review_previewable"] = review_previewable(alt_preview)
 
             if alt_thumb_url:
                 payload[

@@ -231,6 +231,25 @@ class TestVisualRankingV2(unittest.TestCase):
         self.assertEqual(ranked[0][0].canonical_id, "pexels:match")
         self.assertNotIn("explicit_narrative_contradiction", ranked[1][1].penalty_codes)
 
+    def test_asset_specific_source_page_is_editorial_evidence_not_retrieval_query(self):
+        intent = build_scene_visual_intent("una mujer busca reconciliarse después de un conflicto")
+        object_clip = MaterialCandidate(
+            "pexels", "pexels:object", "pexels:object", "woman reconciliation",
+            width=1080, height=1920, duration=10,
+            source_info={"source_page": "https://www.pexels.com/video/skateboards-leaning-on-the-wall-1/"},
+        )
+        relationship = MaterialCandidate(
+            "pexels", "pexels:relationship", "pexels:relationship", "woman reconciliation",
+            width=720, height=1280, duration=5,
+            source_info={"source_page": "https://www.pexels.com/video/woman-embracing-her-sister-2/"},
+        )
+
+        ranked = rank_candidates_v2(intent, [object_clip, relationship], video_aspect="9:16", clip_duration=5)
+
+        self.assertEqual(ranked[0][0].canonical_id, "pexels:relationship")
+        self.assertEqual(ranked[1][0].canonical_id, "pexels:object")
+        self.assertNotIn("explicit_narrative_contradiction", ranked[1][1].penalty_codes)
+
     def test_provider_is_not_a_preference_in_a_common_ranking(self):
         intent = build_scene_visual_intent("reconciliación después de un conflicto familiar")
         pool = [

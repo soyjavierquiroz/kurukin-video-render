@@ -184,6 +184,29 @@ def alternative_authorized_elsewhere(
     )
 
 
+def alternative_review_previewable(alternative: Mapping[str, object]) -> bool:
+    """Read the persisted canonical decision, with a legacy-plan fallback."""
+    decision = alternative.get("review_previewable")
+    if isinstance(decision, bool):
+        return decision
+    return human_review.review_previewable(alternative.get("preview"))
+
+
+def non_previewable_primary_segments(plan: Mapping[str, object]) -> list[str]:
+    """Return PRIMARY segments that cannot be inspected in Human Review.
+
+    This deliberately delegates the decision to Human Review's canonical
+    preview helper; the UI must not infer it from provider-specific fields.
+    """
+    return [
+        str(segment.get("segment_id") or "")
+        for segment in plan.get("segments") or []
+        if isinstance(segment, Mapping)
+        and isinstance(segment.get("selected_asset"), Mapping)
+        and not human_review.review_previewable(segment["selected_asset"].get("preview"))
+    ]
+
+
 def query_content_id() -> str | None:
     """Read the optional Streamlit deep-link parameter across supported APIs."""
     params = getattr(st, "query_params", None)
@@ -710,7 +733,12 @@ def main() -> None:
                     segment_id,
                     uid,
                 )
-                if authorized_elsewhere:
+                # This is the canonical decision persisted while the review
+                # plan was prepared.  A retained scarcity candidate may be
+                # useful provenance, but cannot be promoted blind.
+                if not alternative_review_previewable(alternative):
+                    st.caption("NO PREVIEW AVAILABLE")
+                elif authorized_elsewhere:
                     st.caption(f"USED IN {authorized_elsewhere}")
                 elif st.button(
                     "MAKE PRIMARY",
@@ -826,9 +854,12 @@ def main() -> None:
         )
 
     approve, reject = st.columns(2)
+    unavailable_primary_segments = non_previewable_primary_segments(plan)
 
     with approve:
-        if st.button(
+        if unavailable_primary_segments:
+            st.caption("NO PREVIEW AVAILABLE")
+        elif st.button(
             "APPROVE JOB",
             type="primary",
         ):
