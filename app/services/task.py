@@ -1208,7 +1208,10 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
         if is_human_review and video_script and not operator_video_terms:
             segment_count = max(1, int(math.ceil(max(float(audio_duration or 0), params.video_clip_duration) / params.video_clip_duration)))
             query_maps = human_review.retrieval_queries_for_review_segments(
-                video_script, segment_count, getattr(params, "editorial_profile", None) or {},
+                video_script,
+                segment_count,
+                getattr(params, "editorial_profile", None) or {},
+                video_terms,
             )
             stock_terms = tuple(dict.fromkeys(
                 query for item in query_maps for provider in ("pexels", "pixabay", "coverr")
@@ -1227,6 +1230,11 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
             video_aspect=params.video_aspect,
             minimum_duration=params.video_clip_duration,
         )
+        if any(
+            item.provider == PROVIDER_ASSET_HUB and item.status == "unavailable"
+            for item in getattr(discovery, "diagnostics", ())
+        ):
+            logger.warning("Asset Hub unavailable; continuing with stock providers")
 
     target_duration = audio_duration
     if target_duration <= 0:

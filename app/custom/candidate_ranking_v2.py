@@ -301,10 +301,11 @@ def rank_candidate(intent: SceneVisualIntent, candidate: Any, *, video_aspect: s
 
 def rank_candidates_v2(intent: SceneVisualIntent, candidates: Iterable[Any], *, video_aspect: str, clip_duration: float, previous_candidates: Iterable[Any] = ()) -> list[tuple[Any, CandidateRanking]]:
     indexed = [(index, candidate, rank_candidate(intent, candidate, video_aspect=video_aspect, clip_duration=clip_duration, previous_candidates=previous_candidates)) for index, candidate in enumerate(candidates) if evaluate_candidate_eligibility(candidate).eligible]
-    # With no described editorial evidence, keep discovery order instead of
-    # letting a partially available technical field silently rewrite V1's
-    # deterministic fallback. Once a candidate matches scene intent, the
-    # complete weighted score decides across every provider.
+    # Preserve UNKNOWN as eligible, but never let a technically rich unknown
+    # (including metadata-empty Asset Hub records) leapfrog positive scene
+    # evidence.  Discovery order remains the tie-break within the unknown
+    # bucket, which keeps genuine scarcity possible without fabricating a
+    # match.
     def sort_key(item: tuple[int, Any, CandidateRanking]) -> tuple[int, int, float, int]:
         ranking = item[2]
         editorial_evidence = max(
@@ -314,7 +315,9 @@ def rank_candidates_v2(intent: SceneVisualIntent, candidates: Iterable[Any], *, 
         contradiction = "explicit_narrative_contradiction" in ranking.penalty_codes
         # A rich but narratively-empty candidate cannot overtake a candidate
         # with actual scene evidence merely through technical/cinematic data.
-        weak_narrative = has_strong_scene_intent(intent) and editorial_evidence == 0 and bool(_text(item[1]))
-        return (1 if contradiction else 0, 1 if weak_narrative else 0, -ranking.total_score if editorial_evidence > 0 else 0.0, item[0])
+        # This intentionally includes an empty metadata record: it is UNKNOWN,
+        # not a contradiction, but it is still pure zero editorial evidence.
+        pure_unknown = has_strong_scene_intent(intent) and editorial_evidence == 0
+        return (1 if contradiction else 0, 1 if pure_unknown else 0, -ranking.total_score if editorial_evidence > 0 else 0.0, item[0])
     indexed.sort(key=sort_key)
     return [(candidate, ranking) for _index, candidate, ranking in indexed]

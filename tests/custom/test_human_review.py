@@ -9,7 +9,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from app.custom import human_review
-from app.custom.material_discovery import MaterialCandidate, MaterialDiscoveryResult
+from app.custom.material_discovery import DiscoveryDiagnostic, MaterialCandidate, MaterialDiscoveryResult
 from app.custom.material_selection import MaterialSelectionDecision, MaterialSelectionOptions, MaterialSelectionResult
 from app.models.schema import VideoParams
 from app.models.schema import MaterialInfo
@@ -1832,6 +1832,45 @@ class TestHumanReviewPipeline(unittest.TestCase):
             ["asset_hub", "pexels", "pixabay", "coverr", "local"],
         )
         self.assertEqual(next(item for item in diagnostics if item["provider"] == "pixabay")["review_visible_count"], 1)
+
+    def test_review_plan_completes_with_stock_pool_when_asset_hub_is_unavailable(self):
+        policy = {
+            "providers": {"enabled": ["asset_hub", "pexels", "pixabay"]},
+            "asset_hub": {"include": {"generic": True}},
+        }
+        params = VideoParams(
+            video_subject="tema", video_script="Un guion corto.", video_aspect="9:16",
+            video_clip_duration=5, material_source_policy=policy,
+        )
+        plan_file = self.root / "review" / "production-plan.json"
+        object.__setattr__(params, "human_review", {
+            "batch_id": "batch", "stem": "story", "production_plan_path": plan_file.as_posix(),
+        })
+        stock_pool = (candidate("pexels-001", provider="pexels"), candidate("pixabay-002", provider="pixabay"))
+        discovery = MaterialDiscoveryResult(
+            stock_pool,
+            (DiscoveryDiagnostic("asset_hub", "tema", "unavailable", "KurukinAssetHubUnavailableError: circuit open", 0),),
+            ("asset_hub", "pexels", "pixabay"),
+            ("pexels", "pixabay"),
+            {"stock": ("tema",), "asset_hub": ("tema",)},
+        )
+        with patch.object(task, "_select_autonomous_materials", return_value=(discovery, selection(stock_pool))), \
+             patch.object(task.human_review, "ensure_candidate_preview", return_value=({"type": "none", "value": "", "status": "unavailable"}, [])), \
+             patch.object(task.sm.state, "update_task"):
+            result = task._prepare_human_review_plan(
+                "task-1", params, params.video_script, ["tema"], "/tmp/audio.mp3", 5,
+            )
+
+        self.assertEqual(result["review_status"], human_review.STATUS_PENDING)
+        plan = human_review.read_json(plan_file)
+        self.assertNotIn("asset_hub", [
+            asset["source"] for segment in plan["segments"]
+            for asset in [segment["selected_asset"], *segment["alternatives"]]
+            if asset
+        ])
+        asset_hub = next(item for item in plan["provider_diagnostics"] if item["provider"] == "asset_hub")
+        self.assertEqual(asset_hub["status"], "unavailable")
+        self.assertEqual(asset_hub["candidate_count"], 0)
 
     def test_autonomous_selection_does_not_use_review_reserve(self):
         params = SimpleNamespace(

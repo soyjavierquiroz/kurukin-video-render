@@ -115,6 +115,13 @@ class TestVisualRankingV2(unittest.TestCase):
         self.assertTrue(any("observando" in item or "dos personas" in item for item in hub))
         self.assertTrue(all(item.isascii() for item in stock))
 
+    def test_stock_queries_keep_a_concrete_video_term_seed_and_scene_context(self):
+        intent = build_scene_visual_intent("una persona agotada descansa en casa")
+        queries = build_scene_retrieval_queries(intent, "pixabay", ("worried person", "abstract emotional pattern"))
+        self.assertIn("worried person", queries)
+        self.assertTrue(any("tired" in query or "home" in query for query in queries))
+        self.assertTrue(all(query.isascii() and len(query.split()) <= 7 for query in queries))
+
     def test_guilt_while_resting_prefers_narrative_candidate_over_commercial_literal(self):
         intent = build_scene_visual_intent("una mujer se siente culpable cuando descansa", editorial_profile={"subject_gender": "feminine"})
         literal = asset("literal", "woman smiling at camera on sofa, commercial wellness advertisement", contains_people=True, person_visibility="clear", visual_presentation="feminine")
@@ -175,6 +182,20 @@ class TestVisualRankingV2(unittest.TestCase):
         minimal = asset("limited", "", contains_people=True)
         ranking = rank_candidate(intent, minimal, video_aspect="9:16", clip_duration=5)
         self.assertNotIn("explicit_narrative_contradiction", ranking.penalty_codes)
+
+    def test_zero_editorial_unknown_cannot_beat_positive_match_on_technical_score(self):
+        intent = build_scene_visual_intent("mujer con culpa al descansar en casa")
+        unknown = MaterialCandidate(
+            "asset_hub", "hub:unknown", "hub:unknown", "generic stock clip", width=2160, height=3840,
+            duration=30, orientation="portrait", source_info={"editorial_quality": 100, "contains_people": True},
+        )
+        match = MaterialCandidate(
+            "pexels", "pexels:match", "pexels:match", "resting", width=720, height=1280,
+            duration=5, orientation="portrait", source_info={"description": "worried woman resting alone at home"},
+        )
+        ranked = rank_candidates_v2(intent, [unknown, match], video_aspect="9:16", clip_duration=5)
+        self.assertEqual(ranked[0][0].canonical_id, "pexels:match")
+        self.assertNotIn("explicit_narrative_contradiction", ranked[1][1].penalty_codes)
 
     def test_provider_is_not_a_preference_in_a_common_ranking(self):
         intent = build_scene_visual_intent("reconciliación después de un conflicto familiar")

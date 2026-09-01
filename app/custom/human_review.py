@@ -2165,12 +2165,15 @@ def visual_queries_for_review_segments(
 
 
 def retrieval_queries_for_review_segments(
-    script_text: str, segment_count: int, editorial_profile: Mapping[str, Any] | None = None,
+    script_text: str,
+    segment_count: int,
+    editorial_profile: Mapping[str, Any] | None = None,
+    video_terms: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, tuple[str, ...]]]:
     """Build provider representations from one SceneVisualIntent per scene."""
     return [
         {
-            provider: build_scene_retrieval_queries(intent, provider)
+            provider: build_scene_retrieval_queries(intent, provider, video_terms)
             for provider in ("pexels", "pixabay", "coverr", "asset_hub")
         }
         for intent in (

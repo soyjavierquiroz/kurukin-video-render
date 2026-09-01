@@ -15,7 +15,33 @@ def _query_unique(values: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(" ".join(value.split()) for value in values if value and value.strip()))
 
 
-def build_scene_retrieval_queries(intent: "SceneVisualIntent", provider: str) -> tuple[str, ...]:
+def _concrete_seed_queries(values: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """Keep operator/generated terms as a bounded retrieval seed.
+
+    Native stock APIs work best with short, observable English phrases.  Do
+    not turn a long conceptual phrase into a request merely because it was
+    supplied as a video term; the scene query below remains the contextual
+    request in that case.
+    """
+    results: list[str] = []
+    for value in values or ():
+        query = " ".join(str(value or "").split())
+        words = query.split()
+        if (
+            2 <= len(words) <= 7
+            and query.isascii()
+            and all(word.replace("-", "").isalpha() for word in words)
+            and query not in results
+        ):
+            results.append(query)
+    return tuple(results[:2])
+
+
+def build_scene_retrieval_queries(
+    intent: "SceneVisualIntent",
+    provider: str,
+    seed_terms: tuple[str, ...] | list[str] | None = None,
+) -> tuple[str, ...]:
     """Turn evidenced scene intent into 2--3 camera-observable queries.
 
     This deliberately does not reuse generated script terms.  Native stock
@@ -31,6 +57,10 @@ def build_scene_retrieval_queries(intent: "SceneVisualIntent", provider: str) ->
     queries: list[str] = []
     if "observing reactions" in intent.action or "hypervigilance" in intent.emotional_intent or "watchful" in intent.character_state:
         queries.append(f"{subject} preocupada observando la reacción de otra persona" if spanish else f"worried {subject} watching another person's reaction")
+    if "checking phone" in intent.action:
+        queries.append(f"{subject} mirando el teléfono pensativamente en casa" if spanish else f"{subject} checking phone thoughtfully at home")
+    if "thinking alone" in intent.action:
+        queries.append(f"{subject} pensando a solas en casa" if spanish else f"{subject} thinking alone at home")
     if relationship and tense:
         queries.append("dos personas en conversación seria en casa" if spanish else "two people in a tense conversation at home")
     elif "seeking reassurance" in intent.action or "appeasing" in intent.character_state:
@@ -51,6 +81,14 @@ def build_scene_retrieval_queries(intent: "SceneVisualIntent", provider: str) ->
         action = next(iter(intent.action), "sitting")
         place = "en casa" if spanish and home else "at home" if home else "interior" if spanish else "indoors"
         queries.append(f"{subject} {action} {place}")
+    queries = list(_query_unique(queries))
+    # A global video-term list is a discovery seed, not a replacement for the
+    # scene.  Reserve one bounded slot so it can broaden recall while the
+    # first request always contains the narration-derived visual intent.
+    if provider in _STOCK_PROVIDERS:
+        seeds = [seed for seed in _concrete_seed_queries(seed_terms) if seed not in queries]
+        if seeds:
+            queries = [queries[0], seeds[0], *queries[1:]]
     return _query_unique(queries)[:3]
 
 
@@ -110,6 +148,14 @@ def build_scene_visual_intent(
     if _contains(text, ("culpa", "culpable")):
         emotional += ["guilt", "internal conflict"]; state += ["thoughtful", "anxious"]
         mood += ["intimate", "reflective"]; negative += ["smiling at camera", "commercial wellness", "influencer pose", "yoga advertisement"]
+    if _contains(text, ("pensar", "preguntate", "pregúntate", "pendiente", "urgente")):
+        state += ["reflective"]; action += ["thinking alone"]
+    if _contains(text, ("mensaje", "telefono", "teléfono")):
+        action += ["checking phone"]
+    if _contains(text, ("responsabilidades", "responsable", "irresponsable", "ser util", "ser útil")):
+        emotional += ["self blame", "internal conflict"]; state += ["worried", "reflective"]
+        mood += ["intimate", "reflective"]
+        negative += ["commercial", "influencer pose", "corporate", "advertising pose"]
     if _contains(text, ("agot", "cansad", "fatiga")):
         emotional += ["exhaustion"]; state += ["tired"]; mood += ["quiet", "reflective"]
         negative += ["energetic pose", "commercial smile"]

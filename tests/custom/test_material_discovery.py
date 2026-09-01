@@ -6,7 +6,11 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from app.custom.kurukin_asset_hub import KurukinAssetHubAuthError, KurukinAssetHubUnavailableError
+from app.custom.kurukin_asset_hub import (
+    KurukinAssetHubAuthError,
+    KurukinAssetHubUnavailableError,
+    KurukinAssetHubValidationError,
+)
 from app.custom.asset_search_v2 import build_visual_queries_v2
 from app.custom.material_discovery import (
     TITLE_PREFERRED_MIN_CANDIDATES,
@@ -653,11 +657,57 @@ class TestMaterialDiscovery(unittest.TestCase):
 
     def test_human_review_reserve_opens_circuit_on_unavailable_provider(self):
         hub = FakeAssetHub(error=KurukinAssetHubUnavailableError("offline"))
-        with self.assertRaises(KurukinAssetHubUnavailableError):
-            discover_asset_hub_review_reserve_candidates(
-                policy=policy(PROVIDER_ASSET_HUB), terms=["uno", "dos"], asset_hub_provider=hub,
-            )
+        result = discover_asset_hub_review_reserve_candidates(
+            policy=policy(PROVIDER_ASSET_HUB), terms=["uno", "dos"], asset_hub_provider=hub,
+        )
         self.assertEqual(len(hub.calls), 1)
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(result.diagnostics[0].status, "unavailable")
+        self.assertEqual(result.diagnostics[0].candidate_count, 0)
+
+    def test_asset_hub_unavailable_keeps_pexels_and_pixabay_candidates(self):
+        hub = FakeAssetHub(error=KurukinAssetHubUnavailableError("timeout"))
+        with patch("app.custom.material_discovery.material.search_videos_for_provider", side_effect=lambda provider, *_args: [stock(provider, provider)]):
+            result = discover_material_candidates(
+                policy=policy(PROVIDER_ASSET_HUB, PROVIDER_PEXELS, PROVIDER_PIXABAY),
+                stock_terms=["term"],
+                asset_hub_provider=hub,
+            )
+
+        self.assertEqual({item.provider for item in result.candidates}, {PROVIDER_PEXELS, PROVIDER_PIXABAY})
+        diagnostics = provider_diagnostics_for_review(
+            result,
+            enabled_providers=(PROVIDER_ASSET_HUB, PROVIDER_PEXELS, PROVIDER_PIXABAY),
+        )
+        asset_hub = diagnostics[0]
+        self.assertEqual(asset_hub["status"], "unavailable")
+        self.assertEqual(asset_hub["error_class"], "KurukinAssetHubUnavailableError")
+        self.assertEqual(asset_hub["candidate_count"], 0)
+
+    def test_asset_hub_outage_discards_prior_reserve_candidates(self):
+        class Hub:
+            def __init__(self):
+                self.calls = 0
+
+            def search(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return [{"asset_uid": "prior", "orientation": "vertical-9x16"}]
+                raise KurukinAssetHubUnavailableError("circuit open")
+
+        result = discover_asset_hub_review_reserve_candidates(
+            policy=policy(PROVIDER_ASSET_HUB), terms=["first", "second"],
+            asset_hub_provider=Hub(), queries_are_visual=True,
+        )
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(result.diagnostics[-1].status, "unavailable")
+
+    def test_asset_hub_validation_error_remains_fatal(self):
+        with self.assertRaises(KurukinAssetHubValidationError):
+            discover_asset_hub_review_reserve_candidates(
+                policy=policy(PROVIDER_ASSET_HUB), terms=["term"],
+                asset_hub_provider=FakeAssetHub(error=KurukinAssetHubValidationError("malformed response")),
+            )
 
     def test_human_review_reserve_does_not_reexpand_v2_visual_queries(self):
         hub = FakeAssetHub({"mujer triste tristeza": [{"asset_uid": "v", "orientation": "vertical-9x16"}]})

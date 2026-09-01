@@ -50,6 +50,21 @@ class TestAutonomousMaterialPreparation(unittest.TestCase):
             task._select_autonomous_materials("t1", params, terms, 10, "a script that must not replace terms")
         self.assertEqual(discover.call_args.kwargs["stock_terms"], terms)
 
+    def test_generated_terms_seed_scene_driven_provider_queries_for_human_review(self):
+        params = SimpleNamespace(
+            material_source_policy=self.policy(), asset_hub_terms=[], video_aspect="9:16",
+            video_clip_duration=5, human_review={"video_terms_source": "generated"}, editorial_profile={},
+        )
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            task._select_autonomous_materials("t1", params, ["worried person"], 10, "Una persona agotada descansa en casa")
+        stock_terms = discover.call_args.kwargs["stock_terms"]
+        self.assertIn("worried person", stock_terms)
+        self.assertTrue(any("tired" in term or "home" in term for term in stock_terms))
+
     def test_human_review_plan_records_operator_video_terms_provenance(self):
         params = SimpleNamespace(
             material_source_policy=self.policy(), video_aspect="9:16", editorial_profile={},

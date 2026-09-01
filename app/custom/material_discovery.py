@@ -133,6 +133,7 @@ def provider_diagnostics_for_review(
             "normalized_count": normalized,
             "orientation_valid_count": orientation_valid,
             "deduped_count": deduped,
+            "candidate_count": deduped,
             "selected_count": selected,
             "review_visible_count": 0,
             "error_class": problem[0].message.split(":", 1)[0] if problem else "",
@@ -674,6 +675,15 @@ def discover_material_candidates(
             except Exception as exc:
                 if provider == PROVIDER_ASSET_HUB and _is_fatal_asset_hub_error(exc):
                     raise
+                if provider == PROVIDER_ASSET_HUB and isinstance(exc, KurukinAssetHubUnavailableError):
+                    # Availability is not a match.  Discard any prior result
+                    # from this provider for this job and let other providers
+                    # determine whether review coverage is sufficient.
+                    candidates = [item for item in candidates if item.provider != PROVIDER_ASSET_HUB]
+                    diagnostics.append(DiscoveryDiagnostic(
+                        provider, term, "unavailable", _safe_error_message(exc), 0,
+                    ))
+                    break
                 technical_failures += 1
                 diagnostics.append(DiscoveryDiagnostic(provider, term, "error", _safe_error_message(exc), None))
                 if remote_provider_count == 1:
@@ -790,7 +800,19 @@ def discover_asset_hub_review_reserve_candidates(
             # Per-job circuit breaker: a failed provider must not be called
             # again for every remaining scene/query in this execution.
             if isinstance(exc, KurukinAssetHubUnavailableError):
-                raise
+                return MaterialDiscoveryResult(
+                    (),
+                    tuple(diagnostics) + (DiscoveryDiagnostic(
+                        PROVIDER_ASSET_HUB,
+                        term,
+                        "unavailable",
+                        _safe_error_message(exc),
+                        0,
+                    ),),
+                    (PROVIDER_ASSET_HUB,),
+                    (),
+                    {"stock": (), "asset_hub": normalized_terms},
+                )
             if _is_fatal_asset_hub_error(exc):
                 raise
 
@@ -865,6 +887,16 @@ def discover_asset_hub_title_fallback_candidates(
     except Exception as exc:
         if _is_fatal_asset_hub_error(exc):
             raise
+        if isinstance(exc, KurukinAssetHubUnavailableError):
+            return MaterialDiscoveryResult(
+                (),
+                (DiscoveryDiagnostic(
+                    PROVIDER_ASSET_HUB, title, "unavailable", _safe_error_message(exc), 0,
+                ),),
+                (PROVIDER_ASSET_HUB,),
+                (),
+                {"stock": (), "asset_hub": (title,)},
+            )
         raise MaterialDiscoveryError("material provider 'asset_hub' failed") from exc
 
     candidates = []
