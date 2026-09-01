@@ -35,6 +35,33 @@ class AsyncReviewPreparationTests(unittest.TestCase):
             "script_path": f"/MoneyPrinterTurbo/storage/content_jobs/niche/{content_id}/script.txt",
         }
 
+    def _exclusive_empty_plan(self, *, unavailable: bool) -> dict:
+        plan = self._canonical_plan()
+        plan.update({
+            "material_source_policy": {
+                "providers": {"enabled": ["asset_hub"]},
+                "asset_hub": {"include": {"titles": ["mi-otra-yo"]}},
+            },
+            "asset_hub_source_policy": {
+                "sources": [{"scope": "title", "title": "mi-otra-yo"}],
+            },
+            "source_policy": "title-exclusive",
+            "provider_diagnostics": [{
+                "provider": "asset_hub",
+                "status": "unavailable" if unavailable else "empty",
+                "candidate_count": 0,
+                "error_class": "KurukinAssetHubUnavailableError" if unavailable else "",
+                "error": "transport detail must remain plan-only",
+            }],
+            "segments": [{
+                "selected_asset": None,
+                "alternatives": [],
+                "backup_assets": [],
+                "warnings": [{"code": "missing_primary"}],
+            }],
+        })
+        return plan
+
     def test_enqueue_is_durable_and_idempotent_without_execution(self) -> None:
         with patch.object(review_preparation.content_ingest, "ingest_content") as ingest, patch.object(review_preparation.create_content_job_review, "create_content_job_review") as create:
             first = review_preparation.enqueue(self.payload, job_root=self.jobs)
@@ -67,6 +94,68 @@ class AsyncReviewPreparationTests(unittest.TestCase):
         with patch.object(
             review_preparation.content_ingest, "ingest_content", return_value=self.payload,
         ), patch.object(
+            review_preparation.create_content_job_review, "create_content_job_review", return_value=("created", plan),
+        ):
+            result = review_preparation.run_record(self._path(), boot_id="boot", pid=1)
+        self.assertEqual(result["action"], "completed")
+        self.assertEqual(json.loads(self._path().read_text())["state"], "completed")
+
+    def test_title_exclusive_unavailable_with_no_material_fails_closed(self) -> None:
+        """A plan file alone must not make an empty exclusive review reachable."""
+        review_preparation.enqueue(self.payload, job_root=self.jobs)
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps(self._exclusive_empty_plan(unavailable=True)), encoding="utf-8")
+
+        with patch.object(review_preparation.content_ingest, "ingest_content", return_value=self.payload), patch.object(
+            review_preparation.create_content_job_review, "create_content_job_review", return_value=("created", plan),
+        ):
+            result = review_preparation.run_record(self._path(), boot_id="boot", pid=1)
+
+        record = json.loads(self._path().read_text())
+        self.assertEqual(result["action"], "error")
+        self.assertEqual(record["state"], "error")
+        self.assertEqual(review_preparation.public_state(record), "ERROR")
+        self.assertEqual(
+            record["last_error_message"],
+            "Exclusive asset source is unavailable; no review material could be prepared.",
+        )
+        self.assertNotIn("transport detail", record["last_error_message"])
+        persisted = json.loads(plan.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["provider_diagnostics"][0]["error_class"], "KurukinAssetHubUnavailableError")
+        self.assertEqual(persisted["material_source_policy"]["providers"]["enabled"], ["asset_hub"])
+        self.assertEqual(persisted["asset_hub_source_policy"]["sources"], [{"scope": "title", "title": "mi-otra-yo"}])
+
+    def test_title_exclusive_empty_provider_returns_safe_no_material_error(self) -> None:
+        review_preparation.enqueue(self.payload, job_root=self.jobs)
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps(self._exclusive_empty_plan(unavailable=False)), encoding="utf-8")
+        with patch.object(review_preparation.content_ingest, "ingest_content", return_value=self.payload), patch.object(
+            review_preparation.create_content_job_review, "create_content_job_review", return_value=("created", plan),
+        ):
+            review_preparation.run_record(self._path(), boot_id="boot", pid=1)
+        record = json.loads(self._path().read_text())
+        self.assertEqual(record["state"], "error")
+        self.assertEqual(
+            record["last_error_message"],
+            "Exclusive asset source returned no usable material; no review material could be prepared.",
+        )
+
+    def test_open_generales_plan_with_stock_material_still_completes(self) -> None:
+        review_preparation.enqueue(self.payload, job_root=self.jobs)
+        plan = self.root / "plan.json"
+        payload = self._canonical_plan()
+        payload.update({
+            "material_source_policy": {"providers": {"enabled": ["asset_hub", "pexels", "pixabay"]}},
+            "asset_hub_source_policy": {"sources": [{"scope": "generic"}]},
+            "provider_diagnostics": [
+                {"provider": "asset_hub", "status": "unavailable", "candidate_count": 0},
+                {"provider": "pexels", "status": "success", "candidate_count": 1},
+                {"provider": "pixabay", "status": "success", "candidate_count": 1},
+            ],
+            "segments": [{"selected_asset": {"asset_uid": "pexels-1"}, "alternatives": []}],
+        })
+        plan.write_text(json.dumps(payload), encoding="utf-8")
+        with patch.object(review_preparation.content_ingest, "ingest_content", return_value=self.payload), patch.object(
             review_preparation.create_content_job_review, "create_content_job_review", return_value=("created", plan),
         ):
             result = review_preparation.run_record(self._path(), boot_id="boot", pid=1)

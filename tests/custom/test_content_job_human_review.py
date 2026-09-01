@@ -186,6 +186,21 @@ class ContentJobHumanReviewTests(unittest.TestCase):
 
         self.assertEqual(human_review.read_json(plan), original)
 
+    def test_approved_plan_authority_is_not_rebuilt_or_mutated(self):
+        job, _ = self._job()
+        (_, plan), _ = self._create(job)
+        approved = human_review.read_json(plan)
+        approved["review_status"] = human_review.STATUS_APPROVED
+        human_review.write_json_atomic(plan, approved)
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), patch.object(
+            produce_batch, "process_job",
+        ) as process, self.assertRaisesRegex(adapter.ContentJobReviewError, "not pending"):
+            adapter.create_content_job_review(job, registry_path=self.registry)
+
+        self.assertEqual(human_review.read_json(plan), approved)
+        process.assert_not_called()
+
     def test_policy_mismatch_prevents_backfill(self):
         job, _ = self._job()
         (_, plan), _ = self._create(job)

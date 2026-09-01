@@ -184,6 +184,66 @@ def public_state(record: dict[str, Any]) -> str:
     return "HUMAN_REVIEW_READY" if record.get("state") == "completed" else "ERROR" if record.get("state") == "error" else "PREPARING_REVIEW"
 
 
+def _has_usable_review_material(plan: dict[str, Any]) -> bool:
+    """Whether a plan exposes at least one operator-selectable asset."""
+    for segment in plan.get("segments", ()) or ():
+        if not isinstance(segment, dict):
+            continue
+        candidates = [segment.get("selected_asset")]
+        for field in ("alternatives", "backup_assets"):
+            candidates.extend(segment.get(field, ()) or ())
+        if any(
+            isinstance(candidate, dict)
+            and str(
+                candidate.get("asset_uid")
+                or candidate.get("canonical_id")
+                or candidate.get("url")
+                or ""
+            ).strip()
+            for candidate in candidates
+        ):
+            return True
+    return False
+
+
+def _exclusive_asset_hub_plan_error(plan: dict[str, Any]) -> str | None:
+    """Return an operator-safe error only for an empty exclusive review plan.
+
+    This deliberately does not impose coverage thresholds: existing Human
+    Review scarcity semantics remain authoritative once any review material is
+    available.  Open policies retain their established stock-provider failover.
+    """
+    policy = plan.get("material_source_policy")
+    asset_hub_policy = plan.get("asset_hub_source_policy")
+    if not isinstance(policy, dict) or not isinstance(asset_hub_policy, dict):
+        return None
+    providers = policy.get("providers")
+    enabled = providers.get("enabled") if isinstance(providers, dict) else providers
+    if list(enabled or ()) != ["asset_hub"]:
+        return None
+    sources = asset_hub_policy.get("sources")
+    is_title_exclusive = (
+        isinstance(sources, list)
+        and len(sources) == 1
+        and isinstance(sources[0], dict)
+        and str(sources[0].get("scope") or "").strip() == "title"
+        and bool(str(sources[0].get("title") or "").strip())
+    )
+    if not is_title_exclusive or _has_usable_review_material(plan):
+        return None
+
+    diagnostics = plan.get("provider_diagnostics") or ()
+    asset_hub_unavailable = any(
+        isinstance(item, dict)
+        and item.get("provider") == "asset_hub"
+        and item.get("status") in {"unavailable", "error", "config_missing"}
+        for item in diagnostics
+    )
+    if asset_hub_unavailable:
+        return "Exclusive asset source is unavailable; no review material could be prepared."
+    return "Exclusive asset source returned no usable material; no review material could be prepared."
+
+
 def is_transient(exc: BaseException) -> bool:
     chain: BaseException | None = exc
     while chain is not None:
@@ -234,6 +294,9 @@ def run_record(path: Path, *, boot_id: str, pid: int, clock: Callable[[], dt.dat
             raise create_content_job_review.ContentJobReviewError(
                 "generated review plan identity differs from content job"
             )
+        exclusive_error = _exclusive_asset_hub_plan_error(plan_payload)
+        if exclusive_error:
+            raise create_content_job_review.ContentJobReviewError(exclusive_error)
         outcome = "completed"
         error: BaseException | None = None
     except Exception as exc:
