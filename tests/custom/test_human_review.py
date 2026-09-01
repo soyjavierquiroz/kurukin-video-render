@@ -277,6 +277,29 @@ class TestHumanReviewPlan(unittest.TestCase):
             ["asset-a", "asset-b"],
         )
 
+    def test_used_positive_primary_skips_to_next_positive_before_unknown(self):
+        positive_a = candidate(
+            "positive-a", source_info={"visual_description": "worried woman resting alone at home"},
+        )
+        positive_b = candidate(
+            "positive-b", source_info={"visual_description": "tired woman resting quietly at home"},
+        )
+        unknown = candidate(
+            "unknown", source_info={"editorial_quality": 100, "contains_people": True},
+        )
+        plan = human_review.build_plan(
+            batch_id="batch", task_id="task-1", stem="story", audio_path="/tmp/audio.mp3",
+            script_path="/tmp/story.txt", script_text="Descansa con culpa. Descansa con culpa.",
+            duration=10, aspect_ratio="9:16", visual_style="none",
+            selection_result=selection([positive_a, positive_a]),
+            discovery_result=SimpleNamespace(candidates=(positive_a, positive_b, unknown)),
+            output_path=self.root / "positive-allocation.json",
+        )
+        self.assertEqual(
+            [segment["selected_asset"]["asset_uid"] for segment in plan["segments"]],
+            ["positive-a", "positive-b"],
+        )
+
     def test_scene_queries_prefer_scene_derived_asset_over_old_hint(self):
         old_hint = candidate("old-hint", term="niña sola")
         scene_asset = candidate("scene-asset", term="persona culpa agotamiento")

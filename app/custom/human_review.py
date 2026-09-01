@@ -30,7 +30,11 @@ from app.custom.candidate_ranking_v2 import (
     rank_candidates_v2,
     stable_secondary_dedupe,
 )
-from app.custom.scene_visual_intent import build_scene_visual_intent, build_scene_retrieval_queries
+from app.custom.scene_visual_intent import (
+    build_scene_visual_intent,
+    build_scene_retrieval_queries,
+    inherited_subject_preference,
+)
 from app.models.schema import MaterialInfo
 from app.utils import utils
 
@@ -2169,15 +2173,26 @@ def retrieval_queries_for_review_segments(
     segment_count: int,
     editorial_profile: Mapping[str, Any] | None = None,
     video_terms: list[str] | tuple[str, ...] | None = None,
+    material_title: str = "",
+    content_title: str = "",
 ) -> list[dict[str, tuple[str, ...]]]:
     """Build provider representations from one SceneVisualIntent per scene."""
+    inherited_subject = inherited_subject_preference(
+        material_title=content_title or material_title,
+        script_text=script_text,
+    )
     return [
         {
             provider: build_scene_retrieval_queries(intent, provider, video_terms)
             for provider in ("pexels", "pixabay", "coverr", "asset_hub")
         }
         for intent in (
-            build_scene_visual_intent(fragment, editorial_profile=editorial_profile)
+            build_scene_visual_intent(
+                fragment,
+                editorial_profile=editorial_profile,
+                inherited_subject=inherited_subject,
+                subject_hints=video_terms,
+            )
             for fragment in split_script_for_segments(script_text, segment_count)
         )
     ]
@@ -2200,6 +2215,8 @@ def build_plan(
     material_title: str = "",
     source_policy: str = "",
     provider_diagnostics: list[dict[str, Any]] | None = None,
+    video_terms: list[str] | tuple[str, ...] | None = None,
+    content_title: str = "",
     selection_result: Any,
     discovery_result: Any,
     output_path: Path,
@@ -2219,7 +2236,18 @@ def build_plan(
     # remains an editorial cadence, but is not a fixed-duration timeline grid.
     editorial_profile = normalize_editorial_profile(editorial_profile)
     script_fragments = split_script_for_segments(script_text, target_segment_count)
-    segment_query_maps = retrieval_queries_for_review_segments(script_text, target_segment_count, editorial_profile)
+    inherited_subject = inherited_subject_preference(
+        material_title=content_title or stem,
+        script_text=script_text,
+    )
+    segment_query_maps = retrieval_queries_for_review_segments(
+        script_text,
+        target_segment_count,
+        editorial_profile,
+        video_terms,
+        material_title,
+        content_title or stem,
+    )
     review_inputs = [
         (
             selected_decisions[index] if index < len(selected_decisions) else None,
@@ -2268,7 +2296,13 @@ def build_plan(
             ranked_candidates,
             editorial_profile,
         )
-        intent = build_scene_visual_intent(script_fragment, editorial_profile=editorial_profile, visual_style=visual_style)
+        intent = build_scene_visual_intent(
+            script_fragment,
+            editorial_profile=editorial_profile,
+            visual_style=visual_style,
+            inherited_subject=inherited_subject,
+            subject_hints=video_terms,
+        )
         # Discovery stays provider-specific, while all normalized eligible
         # candidates compete here against the same scene intent.
         if visible_ranked_candidates:

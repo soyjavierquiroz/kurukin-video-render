@@ -17,6 +17,7 @@ from app.custom.candidate_ranking_v2 import (
 from app.custom.material_discovery import MaterialCandidate, MaterialDiscoveryResult
 from app.custom.material_selection import select_material_candidates
 from app.custom.scene_visual_intent import build_scene_visual_intent, build_scene_retrieval_queries
+from app.custom import human_review
 
 
 _BENCHMARK_SPEC = importlib.util.spec_from_file_location(
@@ -121,6 +122,39 @@ class TestVisualRankingV2(unittest.TestCase):
         self.assertIn("worried person", queries)
         self.assertTrue(any("tired" in query or "home" in query for query in queries))
         self.assertTrue(all(query.isascii() and len(query.split()) <= 7 for query in queries))
+
+    def test_explicit_female_protagonist_is_inherited_by_neutral_segments(self):
+        queries = human_review.retrieval_queries_for_review_segments(
+            "Te sientas. Intentas relajarte.", 2,
+            material_title="La mujer que se siente culpable cuando descansa",
+        )
+        self.assertTrue(all("woman" in scene["pexels"][0] for scene in queries))
+
+    def test_explicit_male_protagonist_is_inherited_by_neutral_segments(self):
+        queries = human_review.retrieval_queries_for_review_segments(
+            "Se sienta. Intenta relajarse.", 2,
+            material_title="El hombre que no puede descansar",
+        )
+        self.assertTrue(all("man" in scene["pixabay"][0] for scene in queries))
+
+    def test_no_explicit_subject_remains_person_neutral(self):
+        intent = build_scene_visual_intent("Intenta relajarse en casa")
+        self.assertNotIn("woman", intent.literal_concepts)
+        self.assertNotIn("man", intent.literal_concepts)
+        self.assertIn("person", build_scene_retrieval_queries(intent, "pexels")[0])
+
+    def test_local_explicit_subject_overrides_global_subject(self):
+        intent = build_scene_visual_intent(
+            "Un hombre intenta relajarse en casa", inherited_subject="woman",
+        )
+        self.assertEqual(intent.literal_concepts[0], "man")
+        self.assertIn("man", build_scene_retrieval_queries(intent, "pexels")[0])
+
+    def test_video_term_subject_hint_cannot_override_explicit_script_subject(self):
+        intent = build_scene_visual_intent(
+            "Un hombre intenta relajarse en casa", subject_hints=("woman resting at home",),
+        )
+        self.assertEqual(intent.literal_concepts[0], "man")
 
     def test_guilt_while_resting_prefers_narrative_candidate_over_commercial_literal(self):
         intent = build_scene_visual_intent("una mujer se siente culpable cuando descansa", editorial_profile={"subject_gender": "feminine"})

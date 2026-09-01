@@ -9,6 +9,8 @@ from typing import Any, Mapping
 
 
 _STOCK_PROVIDERS = {"pexels", "pixabay", "coverr"}
+_FEMININE_SUBJECT_WORDS = frozenset({"mujer", "mujeres", "woman", "women", "female"})
+_MASCULINE_SUBJECT_WORDS = frozenset({"hombre", "hombres", "man", "men", "male"})
 
 
 def _query_unique(values: list[str]) -> tuple[str, ...]:
@@ -110,6 +112,30 @@ def _unique(values: list[str]) -> tuple[str, ...]:
     return tuple(result)
 
 
+def explicit_subject_preference(text: Any) -> str:
+    """Return a textual editorial subject request, never a visual inference.
+
+    This deliberately recognizes only explicit subject nouns in script/title
+    text (or operator terms).  It does not use grammatical adjectives or asset
+    metadata, because those are not a reliable statement of subject request.
+    """
+    words = set(re.findall(r"[a-zñ]+", _fold(text)))
+    feminine = bool(words & _FEMININE_SUBJECT_WORDS)
+    masculine = bool(words & _MASCULINE_SUBJECT_WORDS)
+    if feminine == masculine:
+        return ""
+    return "woman" if feminine else "man"
+
+
+def inherited_subject_preference(*, material_title: str = "", script_text: str = "") -> str:
+    """Find the explicit global protagonist request without overriding scenes.
+
+    The title is the most concise global declaration.  Only if it is neutral
+    do we use the full script, where mixed explicit subjects stay neutral.
+    """
+    return explicit_subject_preference(material_title) or explicit_subject_preference(script_text)
+
+
 @dataclass(frozen=True)
 class SceneVisualIntent:
     literal_concepts: tuple[str, ...] = ()
@@ -133,6 +159,8 @@ def build_scene_visual_intent(
     *,
     editorial_profile: Mapping[str, Any] | None = None,
     visual_style: str = "",
+    inherited_subject: str = "",
+    subject_hints: tuple[str, ...] | list[str] | None = None,
 ) -> SceneVisualIntent:
     """Extract only evidenced, reusable visual signals; no model calls."""
     text = _fold(scene_text)
@@ -194,11 +222,17 @@ def build_scene_visual_intent(
         environment += ["home"]
     if not environment and _contains(text, ("descans", "soledad", "culpa")):
         environment += ["intimate home"]
+    # Subject is an editorial request derived from supplied text.  A local
+    # explicit noun wins, then the globally established protagonist, then a
+    # compatible operator hint.  The legacy profile remains a final fallback.
+    # None of these paths infer a person's identity from an asset appearance.
+    local_subject = explicit_subject_preference(scene_text)
+    hinted_subject = explicit_subject_preference(" ".join(str(item or "") for item in (subject_hints or ())))
     gender = str((editorial_profile or {}).get("subject_gender") or "").lower()
-    if gender == "feminine": literal.insert(0, "woman")
-    elif gender == "masculine": literal.insert(0, "man")
-    if "mujer" in text: literal.insert(0, "woman")
-    if "hombre" in text: literal.insert(0, "man")
+    profile_subject = "woman" if gender == "feminine" else "man" if gender == "masculine" else ""
+    subject = local_subject or inherited_subject or hinted_subject or profile_subject
+    if subject:
+        literal.insert(0, subject)
     if visual_style and str(visual_style).strip().lower() not in {"none", "default"}:
         mood.append(str(visual_style).strip().lower())
     return SceneVisualIntent(_unique(literal)[:12], _unique(emotional), _unique(state), _unique(relation), _unique(action), _unique(environment), _unique(mood), ("clear human subject",), _unique(negative))

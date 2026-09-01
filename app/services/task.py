@@ -1212,6 +1212,7 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
                 segment_count,
                 getattr(params, "editorial_profile", None) or {},
                 video_terms,
+                content_title=str(getattr(params, "video_subject", "") or ""),
             )
             stock_terms = tuple(dict.fromkeys(
                 query for item in query_maps for provider in ("pexels", "pixabay", "coverr")
@@ -1511,6 +1512,8 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
             enabled_providers=policy.providers.enabled,
             selection=selection,
         ),
+        video_terms=video_terms,
+        content_title=str(getattr(params, "video_subject", "") or ""),
         selection_result=selection,
         discovery_result=discovery,
         output_path=output_path,

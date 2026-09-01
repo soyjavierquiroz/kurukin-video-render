@@ -542,6 +542,7 @@ def run_review(manifest: dict) -> dict:
             "visual_style": manifest.get("visual_style", "none"),
             "editorial_profile": manifest.get("editorial_profile") or {},
             "material_title": manifest.get("material_title") or "",
+            "content_title": manifest["stem"],
             "source_policy": manifest.get("source_policy") or "",
             "mpt_defaults": manifest.get("mpt_defaults"),
             "effective_mpt_settings": mpt_settings,
