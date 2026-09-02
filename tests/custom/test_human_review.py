@@ -1,6 +1,7 @@
 import json
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1263,6 +1264,57 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(again_warnings, [])
         ffmpeg.assert_called_once()
 
+    def test_accessible_remote_mp4_persists_usable_preview_metadata(self):
+        thumbnails = self.root / "thumbs"
+        item = candidate("pexels:remote", provider="pexels", url="https://cdn.example/remote.mp4")
+
+        def extract_frame(args, **_kwargs):
+            Path(args[-1]).write_bytes(b"jpeg-frame")
+
+        with patch("app.custom.human_review.subprocess.run", side_effect=extract_frame) as ffmpeg:
+            preview, warnings = human_review.ensure_candidate_preview(item, thumbnails)
+            again, again_warnings = human_review.ensure_candidate_preview(item, thumbnails)
+
+        self.assertEqual(preview["type"], "local")
+        self.assertEqual(preview["status"], "available")
+        self.assertTrue(Path(preview["value"]).is_file())
+        self.assertTrue(human_review.review_previewable(preview))
+        self.assertEqual(again, preview)
+        self.assertEqual(warnings, [])
+        self.assertEqual(again_warnings, [])
+        ffmpeg.assert_called_once()
+
+    def test_remote_mp4_frame_failure_stays_non_previewable(self):
+        thumbnails = self.root / "thumbs"
+        item = candidate("pexels:broken", provider="pexels", url="https://cdn.example/broken.mp4")
+
+        with patch("app.custom.human_review.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["ffmpeg"])):
+            preview, warnings = human_review.ensure_candidate_preview(item, thumbnails)
+
+        self.assertFalse(human_review.review_previewable(preview))
+        self.assertEqual(preview["type"], "none")
+        self.assertEqual(warnings[0]["code"], "preview_unavailable")
+
+    def test_plan_persists_remote_mp4_preview_before_marking_previewable(self):
+        item = candidate("pexels:plan", provider="pexels", url="https://cdn.example/plan.mp4")
+        plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
+
+        def extract_frame(args, **_kwargs):
+            Path(args[-1]).write_bytes(b"jpeg-frame")
+
+        with patch("app.custom.human_review.subprocess.run", side_effect=extract_frame):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task-1", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="script", duration=5,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([item]),
+                discovery_result=SimpleNamespace(candidates=(item,)), output_path=plan_file,
+            )
+
+        stored = human_review.read_json(plan_file)["segments"][0]["selected_asset"]
+        self.assertEqual(stored["preview"], plan["segments"][0]["selected_asset"]["preview"])
+        self.assertTrue(human_review.review_previewable(stored["preview"]))
+        self.assertTrue(stored["review_previewable"])
+
     def test_mixed_selected_and_alternatives_use_normalized_preview_contract(self):
         selected = candidate("pexels:1", provider="pexels", source_info={"thumbnail_url": "https://img.example/one.jpg"})
         alternatives = [
@@ -1311,18 +1363,18 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertNotIn("X-Asset-Hub-Api-Key", source)
         self.assertNotIn("requests.", source)
 
-    def test_video_preview_url_does_not_download_or_materialize_video(self):
+    def test_remote_video_preview_does_not_use_preview_url_as_an_image(self):
         thumbnails = self.root / "thumbs"
         item = candidate("coverr:video-preview", provider="coverr", source_info={"preview_url": "https://cdn.example/preview.mp4"})
 
         with patch("app.custom.human_review.requests.get") as get, \
-            patch("app.custom.human_review.subprocess.run") as ffmpeg:
+            patch("app.custom.human_review.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["ffmpeg"])) as ffmpeg:
             preview, warnings = human_review.ensure_candidate_preview(item, thumbnails)
 
         self.assertEqual(preview["type"], "none")
         self.assertEqual(warnings[0]["code"], "preview_unavailable")
         get.assert_not_called()
-        ffmpeg.assert_not_called()
+        ffmpeg.assert_called_once()
 
     def test_human_review_preview_code_does_not_use_rclone_or_direct_drive(self):
         source = Path(human_review.__file__).read_text(encoding="utf-8").lower()

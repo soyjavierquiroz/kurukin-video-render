@@ -1975,9 +1975,19 @@ def _cache_frame_from_local_video(candidate: Any, thumbnails_dir: Path, uid: str
     thumb = thumbnails_dir / f"{uid}.jpg"
     if not source_path.is_file():
         return None
+    return _extract_video_frame(source_path.as_posix(), thumb)
+
+
+def _extract_video_frame(source: str, thumb: Path) -> Path | None:
+    """Extract a bounded review image without materializing the video asset.
+
+    FFmpeg can seek HTTP(S) MP4s itself, so a review preview does not need a
+    full provider download.  The thumbnail is the durable cache entry; callers
+    only expose it after FFmpeg has successfully produced a non-empty file.
+    """
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-ss", "00:00:01", "-i", source_path.as_posix(), "-frames:v", "1", "-q:v", "3", thumb.as_posix()],
+            [utils.get_ffmpeg_binary(), "-y", "-ss", "00:00:01", "-i", source, "-frames:v", "1", "-q:v", "3", thumb.as_posix()],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1985,7 +1995,15 @@ def _cache_frame_from_local_video(candidate: Any, thumbnails_dir: Path, uid: str
         )
         return thumb if thumb.exists() and thumb.stat().st_size > 0 else None
     except Exception:
+        thumb.unlink(missing_ok=True)
         return None
+
+
+def _cache_frame_from_remote_video(candidate: Any, thumbnails_dir: Path, uid: str) -> Path | None:
+    source_url = str(getattr(candidate, "url", "") or "").strip()
+    if not _is_url(source_url) or not _looks_like_video(source_url):
+        return None
+    return _extract_video_frame(source_url, thumbnails_dir / f"{uid}.jpg")
 
 
 def ensure_candidate_preview(candidate: Any, thumbnails_dir: Path) -> tuple[dict[str, str], list[dict[str, str]]]:
@@ -2027,6 +2045,13 @@ def ensure_candidate_preview(candidate: Any, thumbnails_dir: Path) -> tuple[dict
     cached = _cache_frame_from_local_video(candidate, thumbnails_dir, uid)
     if cached:
         return {"type": "local", "value": _project_relative_path(cached), "status": "available"}, []
+
+    # Asset Hub owns its preview authorization contract.  Stock candidates
+    # with a public remote video URL can be inspected directly by FFmpeg.
+    if not is_asset_hub:
+        cached = _cache_frame_from_remote_video(candidate, thumbnails_dir, uid)
+        if cached:
+            return {"type": "local", "value": _project_relative_path(cached), "status": "available"}, []
 
     placeholder = thumbnails_dir / f"{uid}.svg"
     if not placeholder.exists():
