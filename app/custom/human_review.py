@@ -28,7 +28,6 @@ from app.custom.material_selection import MaterialSelectionDecision
 from app.custom.candidate_ranking_v2 import (
     candidate_editorial_evidence,
     candidate_identity_keys,
-    has_strong_scene_intent,
     rank_candidates_v2,
     stable_secondary_dedupe,
 )
@@ -437,6 +436,30 @@ def _visible_editorial_candidates(
         for candidate in candidates
         if _candidate_matches_editorial_profile(candidate, editorial_profile)
     ]
+
+
+EDITORIAL_TIERS = ("POSITIVE", "UNKNOWN", "MISMATCH / CONTRADICTION")
+
+
+def _allocation_editorial_tier(intent: Any, candidate: Any, ranking: Any | None) -> str:
+    """Classify an already-ranked candidate without introducing a new score."""
+    if ranking is not None and "explicit_narrative_contradiction" in ranking.penalty_codes:
+        return "MISMATCH / CONTRADICTION"
+    if candidate_editorial_evidence(intent, candidate) > 0:
+        return "POSITIVE"
+    return "UNKNOWN"
+
+
+def _tier_counts(candidates: list[Any], tier_for: Callable[[Any], str]) -> dict[str, int]:
+    counts = {tier: 0 for tier in EDITORIAL_TIERS}
+    seen: set[str] = set()
+    for candidate in candidates:
+        uid = candidate_uid(candidate)
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        counts[tier_for(candidate)] += 1
+    return counts
 
 
 def _select_segment_candidate(
@@ -2418,12 +2441,24 @@ def build_plan(
     # Allocate up to three segment-local suggestions. Once all PRIMARYs have
     # been finalized, their UIDs are globally authorized. Prefer candidates
     # outside that set so displayed suggestions are promotable whenever the
-    # retrieval pool permits it. Suggestions themselves remain reusable until
-    # an operator promotes one.
+    # retrieval pool permits it.  Within the existing editorial ordering,
+    # prefer assets that are not yet visible anywhere in this review plan.
+    # This is deliberately a soft allocation preference: a positive editorial
+    # match remains ahead of an UNKNOWN or explicit contradiction even when
+    # the latter has not been shown before.
     # ----------------------------------------------------------
 
     assigned_suggestions: list[list[Any]] = [
         []
+        for _ in reserved_segments
+    ]
+    allocation_audit: list[dict[str, Any]] = [
+        {
+            "previewable_eligible_count": 0,
+            "promotable_excluding_primary_count": 0,
+            "globally_unseen_promotable_per_slot": [],
+            "suggestion_slots": [],
+        }
         for _ in reserved_segments
     ]
 
@@ -2463,20 +2498,32 @@ def build_plan(
         for reserved in reserved_segments
         if reserved[7] is not None and candidate_uid(reserved[7])
     }
+    # PRIMARY reservation happens before this pass, so every primary is
+    # already visible to suggestion allocation, including primaries in later
+    # segments.  Add suggestions as they are assigned to avoid repeating them
+    # in normal visible slots when another equally eligible candidate exists.
+    visible_asset_uids = set(authorized_primary_uids)
+    visible_asset_frequencies: dict[str, int] = {
+        uid: 1 for uid in authorized_primary_uids
+    }
 
     for segment_index, queue in enumerate(candidate_queues):
         local_identities: set[str] = set()
-        # ``ranked_candidates`` is already V2's editorial order.  Do not
-        # re-sort it by the aggregate score here: that would let a technically
-        # strong UNKNOWN or an explicit contradiction leapfrog a positive
-        # editorial match after allocation.
+        # Keep V2's editorial order inside a tier.  Allocation adds one
+        # deterministic guardrail only: an unseen, previewable, promotable
+        # candidate wins over a previously-visible candidate in *that same*
+        # tier.  It never trades a stronger editorial tier for novelty.
         intent = reserved_segments[segment_index][5]
         ranking_by_uid = reserved_segments[segment_index][6]
+        tier_for = lambda item: _allocation_editorial_tier(
+            intent, item, ranking_by_uid.get(candidate_uid(item))
+        )
+        tier_rank = {tier: index for index, tier in enumerate(EDITORIAL_TIERS)}
         queue = sorted(
             enumerate(queue),
             key=lambda item: (
-                1 if "explicit_narrative_contradiction" in (ranking_by_uid.get(candidate_uid(item[1])).penalty_codes if ranking_by_uid.get(candidate_uid(item[1])) else ()) else 0,
-                1 if has_strong_scene_intent(intent) and candidate_editorial_evidence(intent, item[1]) == 0 else 0,
+                tier_rank[tier_for(item[1])],
+                1 if candidate_uid(item[1]) in visible_asset_uids else 0,
                 item[0],
             ),
         )
@@ -2503,15 +2550,121 @@ def build_plan(
             item for item in queue
             if candidate_uid(item[1]) in authorized_primary_uids
         ]
+        allocation_audit[segment_index]["previewable_eligible_count"] = len({
+            candidate_uid(item)
+            for _position, item in previewable_queue
+            if candidate_uid(item)
+        })
+        allocation_audit[segment_index]["promotable_excluding_primary_count"] = len({
+            candidate_uid(item)
+            for _position, item in promotable_queue
+            if candidate_uid(item)
+        })
         for _position, alt in promotable_queue + blocked_queue:
             alt_uid = candidate_uid(alt)
             identity_keys = candidate_identity_keys(alt)
             if not alt_uid or any(key in local_identities for key in identity_keys):
                 continue
+            def usable(item: Any) -> bool:
+                return (
+                    bool(candidate_uid(item))
+                    and review_previewable(cached_preview(item)[0])
+                    and not any(key in local_identities for key in candidate_identity_keys(item))
+                )
+
+            previewable_eligible = [item for _p, item in queue if usable(item)]
+            promotable = [item for item in previewable_eligible if candidate_uid(item) not in authorized_primary_uids]
+            unseen_promotable = [item for item in promotable if candidate_uid(item) not in visible_asset_uids]
+            previously_visible_promotable = [item for item in promotable if candidate_uid(item) in visible_asset_uids]
+            primary_used_blocked = [
+                item for item in previewable_eligible
+                if candidate_uid(item) in authorized_primary_uids
+            ]
+            slot_telemetry = {
+                "slot": len(assigned_suggestions[segment_index]) + 1,
+                "previewable_eligible_count": len({candidate_uid(item) for item in previewable_eligible}),
+                "promotable_count": len({candidate_uid(item) for item in promotable}),
+                "globally_unseen_promotable_count": len({candidate_uid(item) for item in unseen_promotable}),
+                "previously_visible_promotable_count": len({candidate_uid(item) for item in previously_visible_promotable}),
+                "primary_used_blocked_count": len({candidate_uid(item) for item in primary_used_blocked}),
+                "editorial_tiers": {
+                    "previewable_eligible": _tier_counts(previewable_eligible, tier_for),
+                    "promotable": _tier_counts(promotable, tier_for),
+                    "globally_unseen_promotable": _tier_counts(unseen_promotable, tier_for),
+                    "previously_visible_promotable": _tier_counts(previously_visible_promotable, tier_for),
+                    "primary_used_blocked": _tier_counts(primary_used_blocked, tier_for),
+                },
+            }
+            alt_tier = tier_for(alt)
+            previously_visible = alt_uid in visible_asset_uids
+            if alt_uid in authorized_primary_uids:
+                selection_reason = "BLOCKED_DIAGNOSTIC"
+            elif not previously_visible:
+                selection_reason = "UNSEEN_SAME_TIER"
+            elif slot_telemetry["editorial_tiers"]["globally_unseen_promotable"][alt_tier] == 0:
+                selection_reason = "REPEATED_TRUE_SCARCITY"
+            elif any(
+                slot_telemetry["editorial_tiers"]["globally_unseen_promotable"][tier] > 0
+                for tier in EDITORIAL_TIERS[tier_rank[alt_tier] + 1:]
+            ):
+                selection_reason = "REPEATED_STRONGER_EDITORIAL"
+            else:
+                selection_reason = "OTHER"
+            slot_telemetry.update({
+                "asset_uid": alt_uid,
+                "editorial_tier": alt_tier,
+                "previously_visible": previously_visible,
+                "global_frequency_before_selection": visible_asset_frequencies.get(alt_uid, 0),
+                "selection_reason": selection_reason,
+            })
+            allocation_audit[segment_index]["suggestion_slots"].append(slot_telemetry)
+            allocation_audit[segment_index]["globally_unseen_promotable_per_slot"].append(
+                slot_telemetry["globally_unseen_promotable_count"]
+            )
             assigned_suggestions[segment_index].append(alt)
             local_identities.update(identity_keys)
+            visible_asset_uids.add(alt_uid)
+            visible_asset_frequencies[alt_uid] = visible_asset_frequencies.get(alt_uid, 0) + 1
             if len(assigned_suggestions[segment_index]) == 3:
                 break
+
+    # Persist the union actually supplied to plan construction.  This is not
+    # a provider-cache proxy: a UID is counted only when it entered at least
+    # one segment's ranked pool.  It makes a later review able to distinguish
+    # allocation reuse from a genuinely narrow discovery pool.
+    union_candidates: dict[str, Any] = {}
+    positive_uids: set[str] = set()
+    unknown_uids: set[str] = set()
+    for reserved in reserved_segments:
+        ranked_candidates, intent, ranking_by_uid = reserved[4], reserved[5], reserved[6]
+        for item in ranked_candidates:
+            uid = candidate_uid(item)
+            if not uid:
+                continue
+            union_candidates.setdefault(uid, item)
+            ranking = ranking_by_uid.get(uid)
+            mismatch = bool(ranking and "explicit_narrative_contradiction" in ranking.penalty_codes)
+            if not mismatch and candidate_editorial_evidence(intent, item) > 0:
+                positive_uids.add(uid)
+            elif not mismatch:
+                unknown_uids.add(uid)
+
+    previewable_union_uids = {
+        uid
+        for uid, item in union_candidates.items()
+        if review_previewable(cached_preview(item)[0])
+    }
+    promotable_union_uids = set(union_candidates) - authorized_primary_uids
+    visible_allocation_audit = {
+        "unique_candidate_uids": len(union_candidates),
+        "unique_previewable_uids": len(previewable_union_uids),
+        "unique_promotable_excluding_primary_uids": len(promotable_union_uids),
+        "unique_positive_previewable_uids": len(positive_uids & previewable_union_uids),
+        "unique_positive_promotable_uids": len(positive_uids & promotable_union_uids),
+        "unique_unknown_previewable_uids": len(unknown_uids & previewable_union_uids),
+        "unique_unknown_promotable_uids": len(unknown_uids & promotable_union_uids),
+        "unique_primary_uids": len(authorized_primary_uids),
+    }
 
     for index, reserved in enumerate(
         reserved_segments,
@@ -2611,9 +2764,7 @@ def build_plan(
                 }
             )
 
-        for alt in assigned_suggestions[
-            index - 1
-        ]:
+        for alternative_index, alt in enumerate(assigned_suggestions[index - 1]):
             alt_preview, alt_preview_warnings = cached_preview(alt)
 
             alt_thumb = (
@@ -2640,6 +2791,14 @@ def build_plan(
                 alt_thumb,
             )
             _serialize_v2_ranking(payload, ranking_by_uid.get(candidate_uid(alt)))
+            allocation = allocation_audit[index - 1]["suggestion_slots"][alternative_index]
+            payload["allocation"] = {
+                "asset_uid": allocation["asset_uid"],
+                "editorial_tier": allocation["editorial_tier"],
+                "previously_visible": allocation["previously_visible"],
+                "global_frequency_before_selection": allocation["global_frequency_before_selection"],
+                "selection_reason": allocation["selection_reason"],
+            }
 
             payload["preview"] = alt_preview
             payload["review_previewable"] = review_previewable(alt_preview)
@@ -2647,6 +2806,12 @@ def build_plan(
                 # Preserve scarcity provenance without presenting an
                 # uninspectable item as a normal operator choice.
                 payload["diagnostic_only"] = True
+            elif candidate_uid(alt) in authorized_primary_uids:
+                # A PRIMARY is already committed to another segment.  Keep it
+                # as honest scarcity provenance, but never expose it as a
+                # normal choice that the operator cannot promote here.
+                payload["diagnostic_only"] = True
+                payload["diagnostic_reason"] = "primary_used_elsewhere"
 
             if alt_thumb_url:
                 payload[
@@ -2712,6 +2877,10 @@ def build_plan(
                         for provider in sorted({str(getattr(item, "provider", "")) for item in ranked_candidates if str(getattr(item, "provider", ""))})
                     },
                     "scarcity_reason": "segment_local_scarcity_global_compatibility_fallback" if len(ranked_candidates) < 4 else "",
+                    "previewable_eligible_count": allocation_audit[index - 1]["previewable_eligible_count"],
+                    "promotable_excluding_primary_count": allocation_audit[index - 1]["promotable_excluding_primary_count"],
+                    "globally_unseen_promotable_per_slot": allocation_audit[index - 1]["globally_unseen_promotable_per_slot"],
+                    "suggestion_slots": allocation_audit[index - 1]["suggestion_slots"],
                 },
                 "selected_asset": (
                     selected_asset
@@ -2756,6 +2925,7 @@ def build_plan(
         "title_scope": str(material_title or ""),
         "source_policy": str(source_policy or ""),
         "provider_diagnostics": [dict(item) for item in (provider_diagnostics or [])],
+        "visible_allocation_audit": visible_allocation_audit,
         "review_required": True,
         "review_status": STATUS_PENDING,
         "visual_search_version": "scene-intent-v2",

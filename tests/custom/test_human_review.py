@@ -410,6 +410,166 @@ class TestHumanReviewPlan(unittest.TestCase):
 
         self.assertEqual([item["asset_uid"] for item in plan["segments"][0]["alternatives"]], ["positive", "asset-unknown"])
 
+    def test_visible_alternatives_prefer_globally_unseen_eligible_candidates(self):
+        description = {"visual_description": "woman resting quietly at home"}
+        primary_a = candidate("primary-a", source_info=description)
+        primary_b = candidate("primary-b", source_info=description)
+        alternatives = [candidate(f"alternative-{index}", source_info=description) for index in range(1, 7)]
+        with patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Una mujer descansa en casa. Una mujer descansa en casa.", duration=10,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([primary_a, primary_b]),
+                discovery_result=SimpleNamespace(candidates=tuple([primary_a, primary_b, *alternatives])),
+                output_path=self.root / "global-visible-diversity.json",
+            )
+
+        visible_uids = [
+            asset["asset_uid"]
+            for segment in plan["segments"]
+            for asset in [segment["selected_asset"], *segment["alternatives"]]
+        ]
+        self.assertEqual(len(visible_uids), len(set(visible_uids)))
+        self.assertEqual(
+            [item["asset_uid"] for item in plan["segments"][1]["alternatives"]],
+            ["alternative-4", "alternative-5", "alternative-6"],
+        )
+        second_slots = plan["segments"][1]["candidate_funnel"]["suggestion_slots"]
+        self.assertEqual(second_slots[0]["editorial_tier"], "POSITIVE")
+        self.assertEqual(second_slots[0]["selection_reason"], "UNSEEN_SAME_TIER")
+
+    def test_visible_alternative_keeps_stronger_repeated_match_over_unseen_mismatch(self):
+        primary_a = candidate("primary-a", source_info={"visual_description": "woman resting at home"})
+        primary_b = candidate("primary-b", source_info={"visual_description": "woman resting at home"})
+        repeated_positive = candidate("repeated-positive", source_info={"visual_description": "woman resting at home"})
+        unseen_mismatch = candidate("unseen-mismatch", source_info={"visual_description": "car speeding on a highway"})
+        with patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Una mujer descansa en casa. Una mujer descansa en casa.", duration=10,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([primary_a, primary_b]),
+                discovery_result=SimpleNamespace(candidates=(primary_a, primary_b, repeated_positive, unseen_mismatch)),
+                output_path=self.root / "stronger-repeat.json",
+            )
+
+        self.assertEqual(plan["segments"][1]["alternatives"][0]["asset_uid"], "repeated-positive")
+
+    def test_visible_alternative_keeps_repeated_unknown_over_unseen_explicit_mismatch(self):
+        primary_a = candidate("primary-a")
+        primary_b = candidate("primary-b")
+        repeated_unknown = candidate("repeated-unknown")
+        unseen_mismatch = candidate("unseen-mismatch", source_info={"visual_description": "car speeding on a highway"})
+        with patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Una mujer descansa en casa. Una mujer descansa en casa.", duration=10,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([primary_a, primary_b]),
+                discovery_result=SimpleNamespace(candidates=(primary_a, primary_b, repeated_unknown, unseen_mismatch)),
+                output_path=self.root / "unknown-over-mismatch.json",
+            )
+
+        self.assertEqual(plan["segments"][1]["alternatives"][0]["asset_uid"], "repeated-unknown")
+
+    def test_unseen_unknown_beats_repeated_unknown(self):
+        primary_a = candidate("primary-a")
+        primary_b = candidate("primary-b")
+        alternatives = [candidate(f"unknown-{index}") for index in range(1, 7)]
+        with patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Primera escena. Segunda escena.", duration=10,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([primary_a, primary_b]),
+                discovery_result=SimpleNamespace(candidates=tuple([primary_a, primary_b, *alternatives])),
+                output_path=self.root / "unseen-unknown.json",
+            )
+
+        first_slot = plan["segments"][1]["candidate_funnel"]["suggestion_slots"][0]
+        self.assertEqual(plan["segments"][1]["alternatives"][0]["asset_uid"], "unknown-4")
+        self.assertEqual(first_slot["editorial_tier"], "UNKNOWN")
+        self.assertEqual(first_slot["selection_reason"], "UNSEEN_SAME_TIER")
+
+    def test_suggestion_slot_telemetry_is_persisted_with_chosen_asset(self):
+        primary = candidate("primary")
+        alternative = candidate("alternative")
+        with patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Escena simple.", duration=5,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([primary]),
+                discovery_result=SimpleNamespace(candidates=(primary, alternative)),
+                output_path=self.root / "allocation-telemetry.json",
+            )
+
+        slot = plan["segments"][0]["candidate_funnel"]["suggestion_slots"][0]
+        self.assertEqual(slot["asset_uid"], "alternative")
+        self.assertEqual(slot["selection_reason"], "UNSEEN_SAME_TIER")
+        self.assertEqual(slot["editorial_tier"], "UNKNOWN")
+        self.assertEqual(set(slot["editorial_tiers"]), {
+            "previewable_eligible", "promotable", "globally_unseen_promotable",
+            "previously_visible_promotable", "primary_used_blocked",
+        })
+        self.assertEqual(plan["segments"][0]["alternatives"][0]["allocation"]["asset_uid"], "alternative")
+
+    def test_visible_alternative_reuse_is_retained_for_true_scarcity(self):
+        primary_a = candidate("primary-a")
+        primary_b = candidate("primary-b")
+        only_alternative = candidate("only-alternative")
+        with patch("app.custom.human_review.subprocess.run"):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Primera escena. Segunda escena.", duration=10,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([primary_a, primary_b]),
+                discovery_result=SimpleNamespace(candidates=(primary_a, primary_b, only_alternative)),
+                output_path=self.root / "scarcity-repeat.json",
+            )
+
+        self.assertEqual(
+            [item["asset_uid"] for item in plan["segments"][1]["alternatives"]],
+            ["only-alternative", "primary-a"],
+        )
+
+    def test_primary_used_elsewhere_is_diagnostic_not_normal_when_promotable_exists(self):
+        primary_a = candidate("primary-a")
+        primary_b = candidate("primary-b")
+        promotable = [candidate("promotable-a"), candidate("promotable-b")]
+        available = lambda _item, _dir: ({"status": "available", "type": "url", "value": "https://example.test/preview.jpg"}, [])
+        with patch("app.custom.human_review.ensure_candidate_preview", side_effect=available):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Primera escena. Segunda escena.", duration=10,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([primary_a, primary_b]),
+                discovery_result=SimpleNamespace(candidates=(primary_a, primary_b, *promotable)),
+                output_path=self.root / "primary-diagnostic.json",
+            )
+
+        primary_uids = {"primary-a", "primary-b"}
+        for segment in plan["segments"]:
+            normal = [item for item in segment["alternatives"] if not item.get("diagnostic_only")]
+            self.assertFalse(primary_uids & {item["asset_uid"] for item in normal})
+            blocked = [item for item in segment["alternatives"] if item["asset_uid"] in primary_uids]
+            self.assertTrue(blocked)
+            self.assertTrue(all(item.get("diagnostic_reason") == "primary_used_elsewhere" for item in blocked))
+
+    def test_primary_used_elsewhere_is_only_a_diagnostic_scarcity_fallback(self):
+        primary_a = candidate("primary-a")
+        primary_b = candidate("primary-b")
+        available = lambda _item, _dir: ({"status": "available", "type": "url", "value": "https://example.test/preview.jpg"}, [])
+        with patch("app.custom.human_review.ensure_candidate_preview", side_effect=available):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Primera escena. Segunda escena.", duration=10,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([primary_a, primary_b]),
+                discovery_result=SimpleNamespace(candidates=(primary_a, primary_b)),
+                output_path=self.root / "primary-only-scarcity.json",
+            )
+
+        for segment in plan["segments"]:
+            self.assertEqual(len(segment["alternatives"]), 1)
+            fallback = segment["alternatives"][0]
+            self.assertTrue(fallback["diagnostic_only"])
+            self.assertEqual(fallback["diagnostic_reason"], "primary_used_elsewhere")
+            self.assertEqual(segment["candidate_funnel"]["promotable_excluding_primary_count"], 0)
+
     def test_scene_queries_prefer_scene_derived_asset_over_old_hint(self):
         old_hint = candidate("old-hint", term="niña sola")
         scene_asset = candidate("scene-asset", term="persona culpa agotamiento")
