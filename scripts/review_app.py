@@ -599,7 +599,7 @@ def main() -> None:
                 segment.get("alternatives")
                 or []
             )
-            if isinstance(item, dict)
+            if isinstance(item, dict) and not item.get("diagnostic_only")
         ][:3]
 
         backups = [

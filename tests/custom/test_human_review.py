@@ -277,6 +277,57 @@ class TestHumanReviewPlan(unittest.TestCase):
             ["asset-a", "asset-b"],
         )
 
+    def test_primary_allocation_prefers_previewable_without_reordering_editorial_candidates(self):
+        positive_previewable = candidate("positive-previewable")
+        unknown_previewable = candidate("unknown-previewable")
+        non_previewable = candidate("non-previewable")
+        chosen, repeated = human_review._select_segment_candidate(
+            [positive_previewable, non_previewable, unknown_previewable], set(), set(),
+            is_review_previewable=lambda item: item.canonical_id != "non-previewable",
+        )
+        self.assertEqual(chosen.canonical_id, "positive-previewable")
+        self.assertFalse(repeated)
+
+    def test_primary_allocation_does_not_use_previewable_mismatch_over_valid_candidate(self):
+        valid_non_previewable = candidate("valid-non-previewable")
+        mismatch_previewable = candidate("mismatch-previewable")
+        chosen, _repeated = human_review._select_segment_candidate(
+            [mismatch_previewable, valid_non_previewable], set(), set(),
+            is_review_previewable=lambda item: item.canonical_id == "mismatch-previewable",
+            is_primary_eligible=lambda item: item.canonical_id != "mismatch-previewable",
+        )
+        self.assertEqual(chosen.canonical_id, "valid-non-previewable")
+
+    def test_primary_allocation_uses_next_previewable_candidate_after_global_use(self):
+        first = candidate("first-previewable")
+        second = candidate("second-previewable")
+        chosen, _repeated = human_review._select_segment_candidate(
+            [first, second], {"first-previewable"}, set(),
+            is_review_previewable=lambda _item: True,
+        )
+        self.assertEqual(chosen.canonical_id, "second-previewable")
+
+    def test_build_plan_persists_previewability_and_promotes_previewable_primary(self):
+        selected_non_previewable = candidate("selected-non-previewable")
+        inspectable = candidate("inspectable")
+
+        def preview(candidate_item, _thumbnails_dir):
+            if candidate_item.canonical_id == "inspectable":
+                return {"status": "available", "type": "url", "value": "https://example.test/inspectable.jpg"}, []
+            return {"status": "unavailable", "type": "none", "value": ""}, []
+
+        with patch("app.custom.human_review.ensure_candidate_preview", side_effect=preview):
+            plan = human_review.build_plan(
+                batch_id="batch", task_id="task", stem="story", audio_path="/tmp/audio.mp3",
+                script_path="/tmp/story.txt", script_text="Escena simple.", duration=5,
+                aspect_ratio="9:16", visual_style="none", selection_result=selection([selected_non_previewable]),
+                discovery_result=SimpleNamespace(candidates=(selected_non_previewable, inspectable)),
+                output_path=self.root / "inspectable-primary.json",
+            )
+        primary = plan["segments"][0]["selected_asset"]
+        self.assertEqual(primary["asset_uid"], "inspectable")
+        self.assertTrue(primary["review_previewable"])
+
     def test_used_positive_primary_skips_to_next_positive_before_unknown(self):
         positive_a = candidate(
             "positive-a", source_info={"visual_description": "worried woman resting alone at home"},
@@ -301,7 +352,10 @@ class TestHumanReviewPlan(unittest.TestCase):
         )
 
     def test_previewable_alternatives_fill_visible_slots_before_unavailable_candidates(self):
-        selected = candidate("selected", source_info={"visual_description": "worried woman resting alone at home"})
+        selected = candidate("selected", source_info={
+            "visual_description": "worried woman resting alone at home",
+            "thumbnail_url": "https://img.example/selected.jpg",
+        })
         unavailable = candidate("unavailable")
         previewable = [
             candidate(f"previewable-{index}", source_info={"thumbnail_url": f"https://img.example/{index}.jpg"})
@@ -337,6 +391,7 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertEqual(alternative["asset_uid"], "unavailable")
         self.assertFalse(human_review.review_previewable(alternative["preview"]))
         self.assertFalse(alternative["review_previewable"])
+        self.assertTrue(alternative["diagnostic_only"])
         self.assertEqual(plan["segments"][0]["warnings"][0]["code"], "preview_unavailable")
 
     def test_visible_alternatives_keep_v2_positive_editorial_order(self):

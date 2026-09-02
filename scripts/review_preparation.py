@@ -206,6 +206,24 @@ def _has_usable_review_material(plan: dict[str, Any]) -> bool:
     return False
 
 
+def _uninspectable_primary_plan_error(plan: dict[str, Any]) -> str | None:
+    """Fail closed when a generated review segment has no inspectable PRIMARY.
+
+    ``human_review.review_previewable`` is the single canonical definition.
+    This check deliberately runs after the adapter has materialized previews
+    and persisted the plan, preserving its diagnostics while preventing a
+    completed preparation record from advertising an unusable review.
+    """
+    for segment in plan.get("segments", ()) or ():
+        if not isinstance(segment, dict):
+            continue
+        primary = segment.get("selected_asset")
+        preview = primary.get("preview") if isinstance(primary, dict) else None
+        if not human_review.review_previewable(preview):
+            return "No inspectable visual candidate is available for one or more review segments."
+    return None
+
+
 def _exclusive_asset_hub_plan_error(plan: dict[str, Any]) -> str | None:
     """Return an operator-safe error only for an empty exclusive review plan.
 
@@ -297,6 +315,9 @@ def run_record(path: Path, *, boot_id: str, pid: int, clock: Callable[[], dt.dat
         exclusive_error = _exclusive_asset_hub_plan_error(plan_payload)
         if exclusive_error:
             raise create_content_job_review.ContentJobReviewError(exclusive_error)
+        preview_error = _uninspectable_primary_plan_error(plan_payload)
+        if preview_error:
+            raise create_content_job_review.ContentJobReviewError(preview_error)
         outcome = "completed"
         error: BaseException | None = None
     except Exception as exc:

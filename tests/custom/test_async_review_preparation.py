@@ -152,7 +152,10 @@ class AsyncReviewPreparationTests(unittest.TestCase):
                 {"provider": "pexels", "status": "success", "candidate_count": 1},
                 {"provider": "pixabay", "status": "success", "candidate_count": 1},
             ],
-            "segments": [{"selected_asset": {"asset_uid": "pexels-1"}, "alternatives": []}],
+            "segments": [{"selected_asset": {
+                "asset_uid": "pexels-1",
+                "preview": {"status": "available", "type": "url", "value": "https://example.test/preview.jpg"},
+            }, "alternatives": []}],
         })
         plan.write_text(json.dumps(payload), encoding="utf-8")
         with patch.object(review_preparation.content_ingest, "ingest_content", return_value=self.payload), patch.object(
@@ -161,6 +164,31 @@ class AsyncReviewPreparationTests(unittest.TestCase):
             result = review_preparation.run_record(self._path(), boot_id="boot", pid=1)
         self.assertEqual(result["action"], "completed")
         self.assertEqual(json.loads(self._path().read_text())["state"], "completed")
+
+    def test_uninspectable_primary_fails_closed_and_projects_safe_error(self) -> None:
+        review_preparation.enqueue(self.payload, job_root=self.jobs)
+        plan = self.root / "plan.json"
+        payload = self._canonical_plan()
+        payload["segments"] = [{"selected_asset": {
+            "asset_uid": "diagnostic-only",
+            "preview": {"status": "unavailable", "type": "none", "value": ""},
+        }, "alternatives": []}]
+        plan.write_text(json.dumps(payload), encoding="utf-8")
+        with patch.object(review_preparation.content_ingest, "ingest_content", return_value=self.payload), patch.object(
+            review_preparation.create_content_job_review, "create_content_job_review", return_value=("created", plan),
+        ):
+            result = review_preparation.run_record(self._path(), boot_id="boot", pid=1)
+        record = json.loads(self._path().read_text())
+        self.assertEqual(result["action"], "error")
+        self.assertEqual(record["state"], "error")
+        self.assertEqual(
+            record["last_error_message"],
+            "No inspectable visual candidate is available for one or more review segments.",
+        )
+        self.assertEqual(
+            review_preparation.sheet_error_message(record),
+            "Human Review preparation failed: No inspectable visual candidate is available for one or more review segments.",
+        )
 
     def test_transient_failure_retries_then_eventually_completes(self) -> None:
         review_preparation.enqueue(self.payload, job_root=self.jobs)

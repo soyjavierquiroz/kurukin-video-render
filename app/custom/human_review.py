@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -443,8 +443,21 @@ def _select_segment_candidate(
     ranked_candidates: list[Any],
     used_selected_asset_uids: set[str],
     used_selected_identity_keys: set[str] | None = None,
+    *,
+    is_review_previewable: Callable[[Any], bool] | None = None,
+    is_primary_eligible: Callable[[Any], bool] | None = None,
 ) -> tuple[Any, bool]:
-    for candidate in ranked_candidates:
+    # V2 has already established the editorial order.  Previewability is an
+    # actionability constraint for Human Review, so use that same order within
+    # the inspectable subset rather than treating it as a ranking signal.
+    candidates = ranked_candidates
+    if is_primary_eligible is not None:
+        non_mismatch = [item for item in candidates if is_primary_eligible(item)]
+        candidates = non_mismatch or candidates
+    if is_review_previewable is not None:
+        previewable = [item for item in candidates if is_review_previewable(item)]
+        candidates = previewable or candidates
+    for candidate in candidates:
         uid = candidate_uid(candidate)
         identity_keys = candidate_identity_keys(candidate)
         if (
@@ -2298,6 +2311,16 @@ def build_plan(
     used_selected_asset_uids: set[str] = set()
     used_selected_identity_keys: set[str] = set()
     previous_selected_candidates: list[Any] = []
+    # Materialize the canonical Human Review representation before PRIMARY
+    # allocation.  The result is cached so later serialization and suggestion
+    # allocation observe exactly the same previewability decision.
+    preview_cache: dict[str, tuple[dict[str, str], list[dict[str, str]]]] = {}
+
+    def cached_preview(item: Any) -> tuple[dict[str, str], list[dict[str, str]]]:
+        uid = candidate_uid(item)
+        if uid not in preview_cache:
+            preview_cache[uid] = ensure_candidate_preview(item, thumbnails_dir)
+        return preview_cache[uid]
 
     for decision, script_fragment, query_map in review_inputs:
         original_candidate = getattr(decision, "candidate", None)
@@ -2336,6 +2359,11 @@ def build_plan(
             visible_ranked_candidates,
             used_selected_asset_uids,
             used_selected_identity_keys,
+            is_review_previewable=lambda item: review_previewable(cached_preview(item)[0]),
+            is_primary_eligible=lambda item: "explicit_narrative_contradiction" not in (
+                ranking_by_uid.get(candidate_uid(item)).penalty_codes
+                if ranking_by_uid.get(candidate_uid(item)) else ()
+            ),
         )
 
         selected_uid = candidate_uid(candidate) if candidate is not None else ""
@@ -2375,14 +2403,6 @@ def build_plan(
     ]
 
     candidate_queues: list[list[Any]] = []
-    preview_cache: dict[str, tuple[dict[str, str], list[dict[str, str]]]] = {}
-
-    def cached_preview(item: Any) -> tuple[dict[str, str], list[dict[str, str]]]:
-        uid = candidate_uid(item)
-        if uid not in preview_cache:
-            preview_cache[uid] = ensure_candidate_preview(item, thumbnails_dir)
-        return preview_cache[uid]
-
     for reserved in reserved_segments:
         (
             decision,
@@ -2499,12 +2519,7 @@ def build_plan(
         selected_asset = None
         selected_preview_warnings = []
         if candidate is not None:
-            selected_preview, selected_preview_warnings = (
-                ensure_candidate_preview(
-                    candidate,
-                    thumbnails_dir,
-                )
-            )
+            selected_preview, selected_preview_warnings = cached_preview(candidate)
 
             selected_thumb = (
                 selected_preview.get("value")
@@ -2534,6 +2549,7 @@ def build_plan(
             selected_asset["preview"] = (
                 selected_preview
             )
+            selected_asset["review_previewable"] = review_previewable(selected_preview)
 
             if selected_thumb_url:
                 selected_asset[
@@ -2602,6 +2618,10 @@ def build_plan(
 
             payload["preview"] = alt_preview
             payload["review_previewable"] = review_previewable(alt_preview)
+            if not payload["review_previewable"]:
+                # Preserve scarcity provenance without presenting an
+                # uninspectable item as a normal operator choice.
+                payload["diagnostic_only"] = True
 
             if alt_thumb_url:
                 payload[
