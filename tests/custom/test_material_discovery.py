@@ -11,9 +11,11 @@ from app.custom.kurukin_asset_hub import (
     KurukinAssetHubUnavailableError,
     KurukinAssetHubValidationError,
 )
+from app.custom.atlas_client import AtlasProtocolError, AtlasUnavailableError
 from app.custom.asset_search_v2 import build_visual_queries_v2
 from app.custom.material_discovery import (
     TITLE_PREFERRED_MIN_CANDIDATES,
+    MaterialCandidate,
     MaterialDiscoveryError,
     discover_asset_hub_title_fallback_candidates,
     discover_asset_hub_review_reserve_candidates,
@@ -27,6 +29,7 @@ from app.custom.material_source_policy import (
     MaterialProviderPolicy,
     MaterialSourcePolicy,
     PROVIDER_ASSET_HUB,
+    PROVIDER_ATLAS,
     PROVIDER_COVERR,
     PROVIDER_LOCAL,
     PROVIDER_PEXELS,
@@ -63,6 +66,30 @@ class FakeAssetHub:
         if self.error:
             raise self.error
         return self.results.get(query, [])
+
+
+class FakeAtlas:
+    def __init__(self, results=None, error=None):
+        self.results = list(results or [])
+        self.error = error
+        self.calls = []
+
+    def search(self, request_data, *, scope=None):
+        self.calls.append((request_data, scope))
+        if self.error:
+            raise self.error
+        return list(self.results)
+
+
+def atlas_candidate(*, kind="vertical", score=0.91):
+    orientation = {"horizontal": "landscape", "vertical": "portrait"}[kind]
+    return MaterialCandidate(
+        "atlas", f"123e4567-e89b-12d3-a456-426614174000:{kind}",
+        f"atlas:123e4567-e89b-12d3-a456-426614174000:{kind}", "Atlas term",
+        rank=1, orientation=orientation,
+        source_info={"asset_uid": "123e4567-e89b-12d3-a456-426614174000", "rendition_kind": kind,
+                     "atlas_local_score": score, "evidence": {"matched": ["explicit"]}},
+    )
 
 
 def stock(provider, asset_id, *, filename=None):
@@ -277,6 +304,57 @@ class TestMaterialDiscovery(unittest.TestCase):
         self.assertEqual([call[0] for call in calls], ["pexels", "pixabay", "coverr"])
         self.assertEqual(hub.calls[0][0], "es")
         self.assertEqual(result.providers_attempted, ("asset_hub", "pexels", "pixabay", "coverr"))
+
+    def test_atlas_uses_only_explicit_scope_and_keeps_primitive_evidence(self):
+        candidate = atlas_candidate()
+        atlas = FakeAtlas([candidate])
+        scope = {"kind": "title", "title_id": "title-7"}
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ATLAS), stock_terms=["exact term"], video_aspect="9:16",
+            atlas_provider=atlas, atlas_scope=scope,
+        )
+        self.assertEqual(atlas.calls, [({"query": "exact term", "aspect_ratio": "9:16", "limit": 20}, scope)])
+        self.assertEqual(result.candidates, (candidate,))
+        self.assertEqual(result.candidates[0].provider, PROVIDER_ATLAS)
+        self.assertEqual(result.candidates[0].source_info["atlas_local_score"], 0.91)
+        self.assertEqual(result.terms_used["atlas"], ("exact term",))
+
+    def test_atlas_orientation_is_filtered_by_existing_mpt_rule(self):
+        atlas = FakeAtlas([atlas_candidate(kind="horizontal")])
+        result = discover_material_candidates(
+            policy=policy(PROVIDER_ATLAS), stock_terms=["term"], video_aspect="9:16",
+            atlas_provider=atlas, atlas_scope={"kind": "general"},
+        )
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(result.diagnostics[-1].status, "empty")
+
+    def test_atlas_empty_unavailable_and_protocol_errors_keep_distinct_diagnostics(self):
+        scope = {"kind": "general"}
+        with patch("app.custom.material_discovery.material.search_videos_for_provider", return_value=[]):
+            empty = discover_material_candidates(
+                policy=policy(PROVIDER_ATLAS, PROVIDER_PEXELS), stock_terms=["term"],
+                atlas_provider=FakeAtlas(), atlas_scope=scope,
+            )
+            self.assertEqual(empty.diagnostics[0].status, "empty")
+            unavailable = discover_material_candidates(
+                policy=policy(PROVIDER_ATLAS, PROVIDER_PEXELS), stock_terms=["term"],
+                atlas_provider=FakeAtlas(error=AtlasUnavailableError("busy")), atlas_scope=scope,
+            )
+            self.assertEqual(unavailable.diagnostics[0].status, "unavailable")
+            protocol = discover_material_candidates(
+                policy=policy(PROVIDER_ATLAS, PROVIDER_PEXELS), stock_terms=["term"],
+                atlas_provider=FakeAtlas(error=AtlasProtocolError("bad response")), atlas_scope=scope,
+            )
+            self.assertEqual(protocol.diagnostics[0].status, "error")
+
+    def test_atlas_missing_scope_or_capability_fails_closed_without_default_scope(self):
+        atlas = FakeAtlas([atlas_candidate()])
+        with self.assertRaises(MaterialDiscoveryError):
+            discover_material_candidates(policy=policy(PROVIDER_ATLAS), stock_terms=["term"], atlas_provider=atlas)
+        self.assertEqual(atlas.calls, [])
+        with patch("app.custom.material_discovery.material.search_videos_for_provider", return_value=[]):
+            result = discover_material_candidates(policy=policy(PROVIDER_ATLAS, PROVIDER_PEXELS), stock_terms=["term"], atlas_scope={"kind": "catalog"})
+        self.assertEqual(result.diagnostics[0].status, "config_missing")
 
     def test_each_stock_policy_provider_calls_its_native_mpt_entrypoint(self):
         for provider in (PROVIDER_PEXELS, PROVIDER_PIXABAY, PROVIDER_COVERR):

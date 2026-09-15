@@ -16,6 +16,8 @@ from app.custom.asset_hub_manifest import extract_asset_hub_local_assets
 from app.custom.kurukin_asset_hub import KurukinAssetProvider
 from app.custom.kurukin_asset_hub_wiring import wire_explicit_asset_hub_bundle
 from app.custom.kurukin_asset_hub_wiring import KurukinAssetHubMaterializationNotReady
+from app.custom.atlas_client import validate_asset_uid, validate_rendition_kind
+from app.custom.atlas_materializer import AtlasMaterializer
 from app.models.schema import MaterialInfo
 from app.services import material
 from app.utils import utils
@@ -264,6 +266,7 @@ def _asset_hub_materials(
 
 def acquire_selected_materials(*, selection_result: Any, task_id: str,
                                asset_hub_provider: Any = None,
+                               atlas_materializer: AtlasMaterializer | None = None,
                                approved_plan: Mapping[str, Any] | None = None) -> MaterialAcquisitionResult:
     """Download stock to a task directory and materialize Asset Hub once.
 
@@ -331,6 +334,30 @@ def acquire_selected_materials(*, selection_result: Any, task_id: str,
         provider = str(getattr(candidate, "provider", "") or "")
         if provider == "asset_hub":
             info = hub_by_key[candidate.dedupe_key]
+        elif provider == "atlas":
+            if atlas_materializer is None:
+                raise MaterialAcquisitionError("Atlas materializer capability is required")
+            source_info = getattr(candidate, "source_info", None)
+            if not isinstance(source_info, Mapping):
+                raise MaterialAcquisitionError("Atlas candidate is missing validated source_info")
+            diagnostic_asset_uid = "<invalid>"
+            try:
+                asset_uid = validate_asset_uid(source_info.get("asset_uid"))
+                diagnostic_asset_uid = asset_uid
+                rendition_kind = validate_rendition_kind(source_info.get("rendition_kind"))
+                local_path = atlas_materializer.materialize(asset_uid, rendition_kind, materials_dir)
+            except Exception as exc:
+                if isinstance(exc, MaterialAcquisitionError):
+                    raise
+                raise MaterialAcquisitionError(
+                    f"Atlas materialization failed for {diagnostic_asset_uid}"
+                ) from exc
+            info = MaterialInfo(
+                provider="atlas",
+                url=str(local_path),
+                duration=int(float(getattr(candidate, "duration", 0) or 0)),
+                source_info=_safe(dict(source_info)),
+            )
         elif provider == "local":
             info = MaterialInfo(provider="local", url=str(getattr(candidate, "url", "") or ""),
                                 duration=int(float(getattr(candidate, "duration", 0) or 0)),

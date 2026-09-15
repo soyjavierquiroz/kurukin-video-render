@@ -81,6 +81,19 @@ class TestMaterialSelection(unittest.TestCase):
         self.assertEqual([item.candidate.dedupe_key for item in result.decisions], ["best", "other"])
         self.assertEqual(result.covered_terms, ("one",))
 
+    def test_atlas_local_score_is_not_a_cross_provider_selection_score(self):
+        atlas = candidate(
+            "atlas:uid:vertical", provider="atlas", rank=30, orientation="portrait",
+            source_info={"atlas_local_score": 9999, "asset_uid": "uid", "rendition_kind": "vertical"},
+        )
+        pexels = candidate("pexels:1", provider="pexels", rank=1, orientation="portrait")
+
+        result = select_material_candidates(
+            discovery_result=discovery(atlas, pexels), video_aspect="9:16", target_duration=5, clip_duration=5,
+        )
+
+        self.assertEqual(result.decisions[0].candidate.provider, "pexels")
+
     def test_diversity_recent_fallback_no_duplicates_and_shortfall(self):
         items = (candidate("p1", provider="pexels", rank=1, width=1280, height=720),
                  candidate("p2", provider="pexels", rank=1, width=1280, height=720),
