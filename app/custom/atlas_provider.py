@@ -18,6 +18,22 @@ from app.custom.material_discovery import MaterialCandidate
 _SCOPE_KINDS = frozenset({"title", "titles", "all_titles", "brand", "general", "catalog"})
 
 
+def build_atlas_scope_from_params(params: Any) -> dict[str, str] | None:
+    """Build a title-only Atlas scope from MPT's explicit Atlas identity.
+
+    ``atlas_title_id`` is deliberately the sole input.  In particular, MPT's
+    display subject, task identity, and Asset Hub policy must never become an
+    Atlas scope by implication.
+    """
+    title_id = getattr(params, "atlas_title_id", None)
+    if not isinstance(title_id, str):
+        return None
+    title_id = title_id.strip()
+    if not title_id:
+        return None
+    return {"kind": "title", "title_id": title_id}
+
+
 def _clean_text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 

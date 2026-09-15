@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.config import config
 
@@ -97,6 +97,11 @@ class VideoParams(BaseModel):
     )
     video_resolution: str = ""
 
+    # This is an Atlas namespace identity, deliberately distinct from the
+    # operator-facing subject and from Asset Hub's catalog scopes.  Atlas is
+    # opt-in, so ordinary MPT jobs do not need to provide it.
+    atlas_title_id: Optional[str] = None
+
     asset_hub_renderer_manifest_path: str = ""
     asset_hub_bundle_uid: str = ""
     asset_hub_scene_mode: str = "ordered"
@@ -146,6 +151,17 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    @field_validator("atlas_title_id", mode="before")
+    @classmethod
+    def normalize_atlas_title_id(cls, value: Any) -> Optional[str]:
+        """Trim transport whitespace without deriving or rewriting an ID."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        return normalized or None
 
 
 class SubtitleRequest(BaseModel):

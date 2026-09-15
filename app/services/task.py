@@ -17,6 +17,7 @@ from loguru import logger
 from app.config import config
 from app.custom import asset_hub_manifest
 from app.custom import human_review
+from app.custom.atlas_provider import build_atlas_scope_from_params
 from app.custom.video_terms import normalize_video_terms
 from app.custom.kurukin_asset_hub import KurukinAssetHubUnavailableError
 from app.custom.material_acquisition import acquire_selected_materials
@@ -32,6 +33,7 @@ from app.custom.material_selection import (
     select_material_candidates,
 )
 from app.custom.material_source_policy import (
+    PROVIDER_ATLAS,
     PROVIDER_ASSET_HUB,
     build_discovery_plan,
     material_source_policy_from_dict,
@@ -1185,6 +1187,15 @@ def _record_loomloom_run_reference(
 def _select_autonomous_materials(task_id, params, video_terms, audio_duration, video_script: str = ""):
     """Run discovery and ranking without materializing selected assets."""
     policy = material_source_policy_from_dict(params.material_source_policy)
+    # Scope exists only for an explicitly enabled Atlas provider.  Task service
+    # does not construct an Atlas runtime or provider here, so this cannot
+    # initiate an Atlas request.  When Atlas is enabled, the helper returns
+    # None for a missing identity and discovery remains fail-closed.
+    atlas_scope = (
+        build_atlas_scope_from_params(params)
+        if policy.providers.is_enabled(PROVIDER_ATLAS)
+        else None
+    )
     is_human_review = bool(getattr(params, "human_review", None))
     # Keep established V1 multi-provider discovery and selection for open
     # policies (including GENERALES). Human Review applies the common V2
@@ -1230,6 +1241,7 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
             asset_hub_terms=asset_hub_terms,
             video_aspect=params.video_aspect,
             minimum_duration=params.video_clip_duration,
+            atlas_scope=atlas_scope,
         )
         if any(
             item.provider == PROVIDER_ASSET_HUB and item.status == "unavailable"

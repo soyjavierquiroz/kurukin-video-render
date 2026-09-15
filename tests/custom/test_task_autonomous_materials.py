@@ -1,10 +1,51 @@
 import importlib.util
+import sys
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-if importlib.util.find_spec("openai") is None:
-    raise unittest.SkipTest("task service optional dependencies are not installed")
+
+def _install_openai_import_stub() -> None:
+    """Allow task's pure selection seam to load without the optional SDK.
+
+    The selected task tests patch every LLM-facing operation.  This test-only
+    package shape satisfies the imports made by ``llm`` and ``voice`` without
+    adding a production fallback or simulating any network client behavior.
+    """
+    if importlib.util.find_spec("openai") is not None:
+        return
+
+    openai = types.ModuleType("openai")
+    openai.__path__ = []
+    openai.OpenAI = type("OpenAI", (), {})
+    openai.AzureOpenAI = type("AzureOpenAI", (), {})
+    openai_types = types.ModuleType("openai.types")
+    openai_types.__path__ = []
+    openai_chat = types.ModuleType("openai.types.chat")
+    openai_chat.ChatCompletion = type("ChatCompletion", (), {})
+    openai.types = openai_types
+    openai_types.chat = openai_chat
+    sys.modules.update({
+        "openai": openai,
+        "openai.types": openai_types,
+        "openai.types.chat": openai_chat,
+    })
+
+
+def _install_edge_tts_import_stub() -> None:
+    """Satisfy voice's import-time annotations; no TTS path is exercised."""
+    if importlib.util.find_spec("edge_tts") is not None:
+        return
+
+    edge_tts = types.ModuleType("edge_tts")
+    edge_tts.Communicate = type("Communicate", (), {})
+    edge_tts.SubMaker = type("SubMaker", (), {})
+    sys.modules["edge_tts"] = edge_tts
+
+
+_install_openai_import_stub()
+_install_edge_tts_import_stub()
 
 from app.models.schema import MaterialInfo, VideoParams
 from app.custom.video_terms import normalize_video_terms
@@ -15,6 +56,9 @@ from app.custom.material_discovery import MaterialDiscoveryResult
 class TestAutonomousMaterialPreparation(unittest.TestCase):
     def policy(self):
         return {"providers": {"enabled": ["pexels"]}}
+
+    def atlas_policy(self):
+        return {"providers": {"enabled": ["atlas"]}}
 
     def title_policy(self):
         return {
@@ -94,6 +138,93 @@ class TestAutonomousMaterialPreparation(unittest.TestCase):
         self.assertEqual(discover.call_args.kwargs["asset_hub_terms"], ["hub cat"])
         self.assertEqual(select.call_args.kwargs["target_duration"], 17)
         acquire.assert_called_once_with(selection_result=selection, task_id="t1")
+
+    def test_explicit_atlas_identity_reaches_discovery_as_a_title_only_scope(self):
+        params = VideoParams(
+            video_subject="A display subject must not be used as scope",
+            atlas_title_id="romper-el-circulo",
+            material_source_policy=self.atlas_policy(),
+        )
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            task._select_autonomous_materials("unrelated-task-id", params, ["term"], 5)
+
+        self.assertEqual(
+            discover.call_args.kwargs["atlas_scope"],
+            {"kind": "title", "title_id": "romper-el-circulo"},
+        )
+
+    def test_video_subject_never_becomes_an_atlas_scope(self):
+        params = VideoParams(
+            video_subject="romper-el-circulo",
+            material_source_policy=self.atlas_policy(),
+        )
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            task._select_autonomous_materials("unrelated-task-id", params, ["term"], 5)
+
+        self.assertIsNone(discover.call_args.kwargs["atlas_scope"])
+
+    def test_asset_hub_scope_never_becomes_an_atlas_scope(self):
+        params = VideoParams(
+            video_subject="display title",
+            asset_hub_bundle_uid="romper-el-circulo",
+            material_source_policy={
+                "providers": {"enabled": ["atlas", "asset_hub"]},
+                "asset_hub": {"include": {"titles": ["romper-el-circulo"]}},
+            },
+        )
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            task._select_autonomous_materials("unrelated-task-id", params, ["term"], 5)
+
+        self.assertIsNone(discover.call_args.kwargs["atlas_scope"])
+
+    def test_task_id_never_becomes_an_atlas_scope(self):
+        params = VideoParams(video_subject="display title", material_source_policy=self.atlas_policy())
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            task._select_autonomous_materials("romper-el-circulo", params, ["term"], 5)
+
+        self.assertIsNone(discover.call_args.kwargs["atlas_scope"])
+
+    def test_missing_identity_never_becomes_a_broad_atlas_scope(self):
+        params = VideoParams(video_subject="display title", material_source_policy=self.atlas_policy())
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            task._select_autonomous_materials("unrelated-task-id", params, ["term"], 5)
+
+        self.assertIsNone(discover.call_args.kwargs["atlas_scope"])
+
+    def test_non_atlas_policy_discards_even_an_explicit_atlas_identity(self):
+        params = VideoParams(
+            video_subject="existing job",
+            atlas_title_id="romper-el-circulo",
+            material_source_policy=self.policy(),
+        )
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        with patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            task._select_autonomous_materials("t1", params, ["term"], 5)
+
+        self.assertIsNone(discover.call_args.kwargs["atlas_scope"])
 
     def test_title_only_global_fallback_runs_once_on_shortfall(self):
         params = VideoParams(video_subject="cat", material_source_policy=self.title_policy())
