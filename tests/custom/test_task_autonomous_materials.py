@@ -48,6 +48,7 @@ _install_openai_import_stub()
 _install_edge_tts_import_stub()
 
 from app.models.schema import MaterialInfo, VideoParams
+from app.custom.atlas_runtime import AtlasRuntimeConfigurationError
 from app.custom.video_terms import normalize_video_terms
 from app.services import task
 from app.custom.material_discovery import MaterialDiscoveryResult
@@ -138,6 +139,110 @@ class TestAutonomousMaterialPreparation(unittest.TestCase):
         self.assertEqual(discover.call_args.kwargs["asset_hub_terms"], ["hub cat"])
         self.assertEqual(select.call_args.kwargs["target_duration"], 17)
         acquire.assert_called_once_with(selection_result=selection, task_id="t1")
+
+    def test_non_atlas_policy_does_not_construct_or_validate_atlas_runtime(self):
+        params = VideoParams(video_subject="cat", material_source_policy=self.policy())
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        acquired = [MaterialInfo(provider="pexels", url="/tmp/cat.mp4")]
+        with patch.dict(task.os.environ, {"ATLAS_ENABLED": "not-a-boolean"}, clear=False), \
+             patch.object(task, "build_atlas_runtime_from_env") as build_runtime, \
+             patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task, "acquire_selected_materials", return_value=SimpleNamespace(materials=acquired)) as acquire, \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            self.assertIsNone(task._prepare_autonomous_materials("t1", params, ["cat"], 5))
+
+        build_runtime.assert_not_called()
+        self.assertIsNone(discover.call_args.kwargs["atlas_provider"])
+        acquire.assert_called_once_with(selection_result=selection, task_id="t1")
+
+    def test_atlas_runtime_is_built_once_and_injected_through_both_stages(self):
+        params = VideoParams(
+            video_subject="display title",
+            atlas_title_id="romper-el-circulo",
+            material_source_policy=self.atlas_policy(),
+        )
+        shared_client = object()
+        runtime = SimpleNamespace(
+            client=shared_client,
+            provider=SimpleNamespace(client=shared_client),
+            materializer=SimpleNamespace(client=shared_client),
+        )
+        discovery = SimpleNamespace(candidates=(SimpleNamespace(),))
+        selection = SimpleNamespace(decisions=(SimpleNamespace(),), shortfall=0, selected_count=1)
+        acquired = [MaterialInfo(provider="atlas", url="/tmp/atlas.mp4")]
+        with patch.object(task, "build_atlas_runtime_from_env", return_value=runtime) as build_runtime, \
+             patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task, "acquire_selected_materials", return_value=SimpleNamespace(materials=acquired)) as acquire, \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            self.assertIsNone(task._prepare_autonomous_materials("t1", params, ["scene"], 5))
+
+        build_runtime.assert_called_once_with()
+        self.assertIs(discover.call_args.kwargs["atlas_provider"], runtime.provider)
+        self.assertEqual(
+            discover.call_args.kwargs["atlas_scope"],
+            {"kind": "title", "title_id": "romper-el-circulo"},
+        )
+        acquire.assert_called_once_with(
+            selection_result=selection,
+            task_id="t1",
+            atlas_materializer=runtime.materializer,
+        )
+        self.assertIs(runtime.provider.client, runtime.client)
+        self.assertIs(runtime.materializer.client, runtime.client)
+
+    def test_disabled_atlas_runtime_keeps_discovery_config_missing_authoritative(self):
+        params = VideoParams(
+            video_subject="display title",
+            atlas_title_id="romper-el-circulo",
+            material_source_policy=self.atlas_policy(),
+        )
+        discovery = SimpleNamespace(candidates=())
+        selection = SimpleNamespace(decisions=(), shortfall=0, selected_count=0)
+        with patch.object(task, "build_atlas_runtime_from_env", return_value=None) as build_runtime, \
+             patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task, "acquire_selected_materials") as acquire, \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            self.assertEqual(
+                task._prepare_autonomous_materials("t1", params, ["scene"], 5),
+                "No usable visual materials found",
+            )
+
+        build_runtime.assert_called_once_with()
+        self.assertIsNone(discover.call_args.kwargs["atlas_provider"])
+        acquire.assert_not_called()
+
+    def test_invalid_atlas_runtime_configuration_surfaces_without_fallback(self):
+        params = VideoParams(video_subject="display title", material_source_policy=self.atlas_policy())
+        configuration_error = AtlasRuntimeConfigurationError("ATLAS_BASE_URL is required")
+        with patch.object(task, "build_atlas_runtime_from_env", side_effect=configuration_error), \
+             patch.object(task, "discover_material_candidates") as discover, \
+             patch.object(task, "acquire_selected_materials") as acquire:
+            with self.assertRaisesRegex(AtlasRuntimeConfigurationError, "ATLAS_BASE_URL"):
+                task._prepare_autonomous_materials("t1", params, ["scene"], 5)
+
+        discover.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_runtime_does_not_broaden_missing_atlas_title_identity(self):
+        params = VideoParams(video_subject="display title", material_source_policy=self.atlas_policy())
+        runtime = SimpleNamespace(provider=object(), materializer=object())
+        discovery = SimpleNamespace(candidates=())
+        selection = SimpleNamespace(decisions=(), shortfall=0, selected_count=0)
+        with patch.object(task, "build_atlas_runtime_from_env", return_value=runtime), \
+             patch.object(task, "discover_material_candidates", return_value=discovery) as discover, \
+             patch.object(task, "select_material_candidates", return_value=selection), \
+             patch.object(task.material, "recent_external_asset_keys", return_value=set()):
+            self.assertEqual(
+                task._prepare_autonomous_materials("t1", params, ["scene"], 5),
+                "No usable visual materials found",
+            )
+
+        self.assertIs(discover.call_args.kwargs["atlas_provider"], runtime.provider)
+        self.assertIsNone(discover.call_args.kwargs["atlas_scope"])
 
     def test_explicit_atlas_identity_reaches_discovery_as_a_title_only_scope(self):
         params = VideoParams(
