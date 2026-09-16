@@ -572,7 +572,10 @@ class TestHumanReviewPlan(unittest.TestCase):
 
     def test_scene_queries_prefer_scene_derived_asset_over_old_hint(self):
         old_hint = candidate("old-hint", term="niña sola")
-        scene_asset = candidate("scene-asset", term="persona culpa agotamiento")
+        scene_asset = candidate(
+            "scene-asset", term="persona culpa agotamiento",
+            source_info={"visual_description": "woman resting alone at home, feeling guilt and exhaustion"},
+        )
         plan_file = self.root / "storage/review_queue/batch/story/production-plan.json"
 
         plan = human_review.build_plan(

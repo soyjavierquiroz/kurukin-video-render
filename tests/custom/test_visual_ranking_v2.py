@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from app.custom.candidate_ranking_v2 import (
     WEIGHTS,
+    candidate_editorial_evidence,
     candidate_identity_keys,
     evaluate_candidate_eligibility,
     normalize_source_url,
@@ -249,6 +250,72 @@ class TestVisualRankingV2(unittest.TestCase):
         self.assertEqual(ranked[0][0].canonical_id, "pexels:relationship")
         self.assertEqual(ranked[1][0].canonical_id, "pexels:object")
         self.assertNotIn("explicit_narrative_contradiction", ranked[1][1].penalty_codes)
+
+    def test_retrieval_query_alone_cannot_create_positive_asset_evidence(self):
+        intent = build_scene_visual_intent("woman dealing with guilt while resting at home")
+        query_only = MaterialCandidate(
+            "pexels", "pexels:query-only", "pexels:query-only", "people pleasing woman",
+            width=1080, height=1920, duration=10, source_info={},
+        )
+
+        ranking = rank_candidate(intent, query_only, video_aspect="9:16", clip_duration=5)
+
+        self.assertEqual(candidate_editorial_evidence(intent, query_only), 0.0)
+        self.assertNotIn("semantic_relevance", ranking.score_components)
+        self.assertNotIn("narrative_emotional_fit", ranking.score_components)
+        self.assertNotIn("semantic_match", ranking.reason_codes)
+        self.assertNotIn("emotional_match", ranking.reason_codes)
+
+    def test_video_terms_alone_cannot_create_positive_asset_evidence(self):
+        intent = build_scene_visual_intent("woman dealing with guilt while resting at home")
+        query_only = MaterialCandidate(
+            "pexels", "pexels:term-only", "pexels:term-only", "woman feeling responsible for everyone",
+            width=1080, height=1920, duration=10,
+            source_info={"video_terms": "woman feeling responsible for everyone"},
+        )
+
+        ranking = rank_candidate(intent, query_only, video_aspect="9:16", clip_duration=5)
+
+        self.assertEqual(candidate_editorial_evidence(intent, query_only), 0.0)
+        self.assertNotIn("semantic_relevance", ranking.score_components)
+        self.assertNotIn("narrative_emotional_fit", ranking.score_components)
+
+    def test_asset_specific_metadata_can_create_positive_evidence(self):
+        intent = build_scene_visual_intent("woman dealing with guilt while resting at home")
+        matching = MaterialCandidate(
+            "pexels", "pexels:matching", "pexels:matching", "people pleasing woman",
+            width=1080, height=1920, duration=10,
+            source_info={"description": "worried woman resting alone at home, reflecting on guilt and responsibilities"},
+        )
+
+        ranking = rank_candidate(intent, matching, video_aspect="9:16", clip_duration=5)
+
+        self.assertGreater(candidate_editorial_evidence(intent, matching), 0.0)
+        self.assertIn("semantic_match", ranking.reason_codes)
+
+    def test_conflicting_asset_metadata_demotes_candidate_without_query_credit(self):
+        intent = build_scene_visual_intent("una mujer se siente culpable cuando descansa")
+        fashion = MaterialCandidate(
+            "pexels", "pexels:fashion", "pexels:fashion", "people pleasing woman",
+            width=1080, height=1920, duration=10,
+            source_info={"title": "commercial fashion shopping with sunglasses and mirror"},
+        )
+        matching = MaterialCandidate(
+            "pexels", "pexels:matching", "pexels:matching", "people pleasing woman",
+            width=720, height=1280, duration=5,
+            source_info={"description": "worried woman resting alone at home, reflecting on guilt"},
+        )
+
+        ranked = rank_candidates_v2(intent, [fashion, matching], video_aspect="9:16", clip_duration=5)
+
+        self.assertLess(
+            candidate_editorial_evidence(intent, fashion),
+            candidate_editorial_evidence(intent, matching),
+        )
+        self.assertEqual(ranked[0][0].canonical_id, "pexels:matching")
+        self.assertEqual(ranked[1][0].canonical_id, "pexels:fashion")
+        self.assertNotIn("semantic_match", ranked[1][1].reason_codes)
+        self.assertIn("explicit_narrative_contradiction", ranked[1][1].penalty_codes)
 
     def test_provider_is_not_a_preference_in_a_common_ranking(self):
         intent = build_scene_visual_intent("reconciliación después de un conflicto familiar")

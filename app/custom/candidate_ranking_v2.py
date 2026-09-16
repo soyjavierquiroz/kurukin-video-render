@@ -126,17 +126,20 @@ def stable_secondary_dedupe(candidates: Iterable[Any]) -> list[Any]:
         seen.update(keys)
         unique.append(candidate)
     return unique
-def _text(candidate: Any, *, include_search_term: bool = True) -> str:
+def _text(candidate: Any, *, include_search_term: bool = False) -> str:
     data = _metadata(candidate)
     values: list[Any] = []
     # Providers expose different subsets of this contract. Absence is kept
-    # unavailable rather than converted into a negative score.
+    # unavailable rather than converted into a negative score. These fields
+    # must be attached to this returned asset (or its canonical source page).
+    # Asset-specific generated semantic fields are retained when providers
+    # supply them as metadata; retrieval context is handled separately below.
     for key in ("title", "description", "keywords", "filename", "tags", "visual_description", "action_description", "search_text", "embedding_text", "primary_theme", "primary_topic", "presentation", "visual_presentation", "source_page"):
         value = data.get(key)
         values.extend(value) if isinstance(value, (list, tuple, set)) else values.append(value)
-    # A retrieval query is useful for the legacy relevance score, but not for
-    # the later editorial-evidence bucket.  Provider source-page slugs are
-    # retained above because they are asset-specific provenance.
+    # ``search_term`` records retrieval provenance only. It can explain why an
+    # asset was fetched, but never what that asset depicts. Provider source-page
+    # slugs are retained above because they are asset-specific provenance.
     for key in ("title", "description", "filename"):
         values.append(_candidate_value(candidate, key))
     if include_search_term:
@@ -176,8 +179,8 @@ def has_strong_scene_intent(intent: SceneVisualIntent) -> bool:
 
 
 def candidate_editorial_evidence(intent: SceneVisualIntent, candidate: Any) -> float:
-    """Evidence from asset metadata, excluding the provider retrieval query."""
-    text = _text(candidate, include_search_term=False)
+    """Positive editorial evidence from candidate-specific asset metadata."""
+    text = _text(candidate)
     values = (
         _match((*intent.literal_concepts, *intent.action, *intent.environment, *intent.relationship_context), text),
         _match((*intent.emotional_intent, *intent.character_state, *intent.cinematic_mood), text),
@@ -275,6 +278,8 @@ class CandidateRanking:
 
 def rank_candidate(intent: SceneVisualIntent, candidate: Any, *, video_aspect: str, clip_duration: float, previous_candidates: Iterable[Any] = ()) -> CandidateRanking:
     del previous_candidates  # Sequence-aware ranking is intentionally deferred.
+    # All semantic scores and contradiction checks must use asset provenance,
+    # not the query that happened to retrieve this candidate.
     text = _text(candidate); info = _metadata(candidate); reasons: list[str] = []; penalties: list[str] = []
     semantic = _match((*intent.literal_concepts, *intent.action, *intent.environment, *intent.relationship_context), text)
     emotional = _match((*intent.emotional_intent, *intent.character_state, *intent.cinematic_mood), text)
