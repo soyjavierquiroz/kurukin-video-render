@@ -192,6 +192,72 @@ class TestMaterialAcquisition(unittest.TestCase):
         download.assert_called_once()
         self.assertEqual(result.materials[0].provider, "pixabay")
 
+    def test_atlas_materializes_only_validated_source_identity(self):
+        candidate = MaterialCandidate(
+            "atlas", "not-used", "atlas:selected", "atlas scene", url=None, duration=8,
+            source_info={
+                "asset_uid": "123e4567-e89b-12d3-a456-426614174000",
+                "rendition_kind": "vertical",
+                "content_locator": "/v1/assets/123e4567-e89b-12d3-a456-426614174000/renditions/vertical/content",
+                "atlas_local_score": 0.8,
+            },
+        )
+        delivered = Path(self.tmp.name) / "tasks/t1/materials/atlas.mp4"
+        calls = []
+
+        def materialize(uid, kind, directory):
+            calls.append((uid, kind, directory))
+            return delivered
+
+        materializer = SimpleNamespace(materialize=materialize)
+        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), \
+             patch("app.custom.material_acquisition.material.download_material_candidate", side_effect=AssertionError("generic downloader must not run"), create=True):
+            result = acquire_selected_materials(
+                selection_result=SimpleNamespace(decisions=(decision(candidate),)), task_id="t1",
+                atlas_materializer=materializer,
+            )
+        self.assertEqual(result.materials[0].provider, "atlas")
+        self.assertEqual(result.materials[0].url, str(delivered))
+        self.assertEqual(result.materials[0].source_info, candidate.source_info)
+        self.assertEqual(calls, [("123e4567-e89b-12d3-a456-426614174000", "vertical", Path(self.tmp.name) / "tasks/t1/materials")])
+
+    def test_atlas_materialization_failure_does_not_fallback(self):
+        candidate = MaterialCandidate(
+            "atlas", "not-used", "atlas:selected", "atlas scene",
+            source_info={"asset_uid": "123e4567-e89b-12d3-a456-426614174000", "rendition_kind": "horizontal"},
+        )
+        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), \
+             patch("app.custom.material_acquisition.material.download_material_candidate", side_effect=AssertionError("no fallback"), create=True):
+            with self.assertRaises(MaterialAcquisitionError):
+                acquire_selected_materials(
+                    selection_result=SimpleNamespace(decisions=(decision(candidate),)), task_id="t1",
+                    atlas_materializer=SimpleNamespace(materialize=lambda *_args: (_ for _ in ()).throw(RuntimeError("delivery failed"))),
+                )
+
+    def test_atlas_invalid_uid_does_not_reuse_previous_candidate_uid_in_failure(self):
+        previous_uid = "123e4567-e89b-12d3-a456-426614174000"
+        candidates = (
+            MaterialCandidate(
+                "atlas", "first", "atlas:first", "first Atlas scene",
+                source_info={"asset_uid": previous_uid, "rendition_kind": "horizontal"},
+            ),
+            MaterialCandidate(
+                "atlas", "second", "atlas:second", "second Atlas scene",
+                source_info={"asset_uid": "not-a-valid-uid", "rendition_kind": "horizontal"},
+            ),
+        )
+        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage):
+            with self.assertRaises(MaterialAcquisitionError) as raised:
+                acquire_selected_materials(
+                    selection_result=SimpleNamespace(decisions=tuple(decision(item) for item in candidates)),
+                    task_id="t1",
+                    atlas_materializer=SimpleNamespace(
+                        materialize=lambda *_args: Path(self.tmp.name) / "atlas.mp4"
+                    ),
+                )
+        self.assertIn("<invalid>", str(raised.exception))
+        self.assertNotIn(previous_uid, str(raised.exception))
+
     def test_approved_plan_bundle_drift_blocks_before_materialization(self):
         selected = MaterialCandidate("asset_hub", "B", "hub:B", "plan")
         with patch("app.custom.material_acquisition.wire_explicit_asset_hub_bundle") as wire:

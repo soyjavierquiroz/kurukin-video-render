@@ -17,6 +17,8 @@ from loguru import logger
 from app.config import config
 from app.custom import asset_hub_manifest
 from app.custom import human_review
+from app.custom.atlas_provider import build_atlas_scope_from_params
+from app.custom.atlas_runtime import AtlasRuntime, build_atlas_runtime_from_env
 from app.custom.video_terms import normalize_video_terms
 from app.custom.kurukin_asset_hub import KurukinAssetHubUnavailableError
 from app.custom.material_acquisition import acquire_selected_materials
@@ -32,6 +34,7 @@ from app.custom.material_selection import (
     select_material_candidates,
 )
 from app.custom.material_source_policy import (
+    PROVIDER_ATLAS,
     PROVIDER_ASSET_HUB,
     build_discovery_plan,
     material_source_policy_from_dict,
@@ -1182,9 +1185,26 @@ def _record_loomloom_run_reference(
     return None
 
 
-def _select_autonomous_materials(task_id, params, video_terms, audio_duration, video_script: str = ""):
+def _select_autonomous_materials(
+    task_id,
+    params,
+    video_terms,
+    audio_duration,
+    video_script: str = "",
+    atlas_runtime: AtlasRuntime | None = None,
+):
     """Run discovery and ranking without materializing selected assets."""
     policy = material_source_policy_from_dict(params.material_source_policy)
+    # Scope exists only for an explicitly enabled Atlas provider.  The runtime
+    # is owned by the parent task preparation function, which lets its provider
+    # and materializer share one client through discovery and acquisition.
+    # When Atlas is enabled, the helper returns None for a missing identity and
+    # discovery remains fail-closed.
+    atlas_scope = (
+        build_atlas_scope_from_params(params)
+        if policy.providers.is_enabled(PROVIDER_ATLAS)
+        else None
+    )
     is_human_review = bool(getattr(params, "human_review", None))
     # Keep established V1 multi-provider discovery and selection for open
     # policies (including GENERALES). Human Review applies the common V2
@@ -1230,6 +1250,8 @@ def _select_autonomous_materials(task_id, params, video_terms, audio_duration, v
             asset_hub_terms=asset_hub_terms,
             video_aspect=params.video_aspect,
             minimum_duration=params.video_clip_duration,
+            atlas_provider=(atlas_runtime.provider if atlas_runtime is not None else None),
+            atlas_scope=atlas_scope,
         )
         if any(
             item.provider == PROVIDER_ASSET_HUB and item.status == "unavailable"
@@ -1438,8 +1460,17 @@ def _human_review_plan_has_usable_candidates(plan: dict, target_count: int) -> b
 
 def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) -> str | None:
     """Materialize policy-selected assets into the normal local-material path."""
+    policy = material_source_policy_from_dict(params.material_source_policy)
+    # This is the narrow common owner of autonomous discovery and acquisition.
+    # Do not read or validate ATLAS_* configuration for jobs whose resolved
+    # policy does not explicitly opt into Atlas.
+    atlas_runtime = (
+        build_atlas_runtime_from_env()
+        if policy.providers.is_enabled(PROVIDER_ATLAS)
+        else None
+    )
     discovery, selection = _select_autonomous_materials(
-        task_id, params, video_terms, audio_duration
+        task_id, params, video_terms, audio_duration, atlas_runtime=atlas_runtime
     )
     if not selection.decisions:
         return "No usable visual materials found"
@@ -1448,10 +1479,13 @@ def _prepare_autonomous_materials(task_id, params, video_terms, audio_duration) 
             "autonomous material selection shortfall: "
             f"selected={selection.selected_count}, shortfall={selection.shortfall}"
         )
-    acquisition = acquire_selected_materials(
-        selection_result=selection,
-        task_id=task_id,
-    )
+    acquisition_kwargs = {
+        "selection_result": selection,
+        "task_id": task_id,
+    }
+    if atlas_runtime is not None:
+        acquisition_kwargs["atlas_materializer"] = atlas_runtime.materializer
+    acquisition = acquire_selected_materials(**acquisition_kwargs)
     params.video_source = "local"
     params.video_materials = list(acquisition.materials)
     return None
@@ -1465,8 +1499,22 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
             "human review requires material_source_policy selection",
         )
     try:
+        policy = material_source_policy_from_dict(params.material_source_policy)
+        # Review planning uses the generic discovery seam but deliberately has
+        # no materialization stage.  Keep the capability local to this one
+        # planning execution; do not add provider-specific review retrieval.
+        atlas_runtime = (
+            build_atlas_runtime_from_env()
+            if policy.providers.is_enabled(PROVIDER_ATLAS)
+            else None
+        )
         discovery, selection = _select_autonomous_materials(
-            task_id, params, video_terms, audio_duration, video_script
+            task_id,
+            params,
+            video_terms,
+            audio_duration,
+            video_script,
+            atlas_runtime=atlas_runtime,
         )
     except KurukinAssetHubUnavailableError:
         # The host-owned review preparation record recognizes this as
@@ -1479,7 +1527,6 @@ def _prepare_human_review_plan(task_id, params, video_script, video_terms, audio
         return _mark_task_failed(task_id, "materials", "No usable visual materials found")
 
     review = getattr(params, "human_review", None) or {}
-    policy = material_source_policy_from_dict(params.material_source_policy)
     discovery_plan = build_discovery_plan(policy)
     output_path = Path(review.get("production_plan_path") or human_review.plan_path(
         str(review.get("batch_id") or "batch"),

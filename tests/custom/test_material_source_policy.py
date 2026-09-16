@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.custom.material_source_policy import (
-    PROVIDER_ASSET_HUB, PROVIDER_COVERR, PROVIDER_LOCAL, PROVIDER_PEXELS,
+    PROVIDER_ATLAS, PROVIDER_ASSET_HUB, PROVIDER_COVERR, PROVIDER_LOCAL, PROVIDER_PEXELS,
     PROVIDER_PIXABAY, AssetHubCatalogPolicy, AssetHubExcludePolicy,
     AssetHubIncludePolicy, CatalogExpansionRequired, MaterialProviderPolicy,
     MaterialSourcePolicy, asset_hub_only_policy, build_asset_hub_source_policy,
@@ -98,6 +98,12 @@ class TestMaterialSourcePolicy(unittest.TestCase):
             "asset_hub": {"include": {"generic": True}},
         })
         self.assertEqual(policy.providers.enabled, (PROVIDER_ASSET_HUB, PROVIDER_PEXELS))
+
+    def test_atlas_is_known_ordered_before_asset_hub_and_never_implicit(self):
+        atlas = MaterialSourcePolicy(MaterialProviderPolicy((PROVIDER_LOCAL, PROVIDER_ASSET_HUB, PROVIDER_ATLAS)), AssetHubCatalogPolicy(include=AssetHubIncludePolicy(generic=True)))
+        self.assertEqual(atlas.providers.enabled, (PROVIDER_ATLAS, PROVIDER_ASSET_HUB, PROVIDER_LOCAL))
+        self.assertTrue(build_discovery_plan(atlas)["atlas"]["enabled"])
+        self.assertNotIn(PROVIDER_ATLAS, open_sources_policy().providers.enabled)
 
 
 if __name__ == "__main__":

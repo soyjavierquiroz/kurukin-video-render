@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import re
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from app.custom.asset_search_v2 import build_visual_queries_v2
 from app.custom.kurukin_asset_hub import (
@@ -17,9 +17,11 @@ from app.custom.kurukin_asset_hub import (
     dedupe_key as asset_hub_dedupe_key,
     validate_asset_uid,
 )
+from app.custom.atlas_client import AtlasInvalidRequestError, AtlasUnavailableError
 from app.custom.material_source_policy import (
     CatalogExpansionRequired,
     MaterialSourcePolicy,
+    PROVIDER_ATLAS,
     PROVIDER_ASSET_HUB,
     PROVIDER_LOCAL,
     build_discovery_plan,
@@ -31,6 +33,11 @@ from app.custom.material_provider_availability import (
 )
 from app.custom.kurukin_local_visual_picker import pick_local_visual_for_intent
 from app.services import material
+
+if TYPE_CHECKING:
+    # Imported only for typing: atlas_provider imports MaterialCandidate from
+    # this module, so a runtime import would create a cycle.
+    from app.custom.atlas_provider import AtlasProvider
 
 
 _FORBIDDEN_SOURCE_KEY_PARTS = (
@@ -577,6 +584,8 @@ def discover_material_candidates(
     video_aspect: str = "9:16",
     minimum_duration: int | float = 0,
     asset_hub_provider: KurukinAssetProvider | None = None,
+    atlas_provider: AtlasProvider | None = None,
+    atlas_scope: Mapping[str, Any] | None = None,
 ) -> MaterialDiscoveryResult:
     """Search every enabled remote provider and return normalized candidates.
 
@@ -587,6 +596,8 @@ def discover_material_candidates(
     normalized_stock_terms = _normalize_terms(stock_terms)
     normalized_hub_terms = _normalize_terms(asset_hub_terms) if asset_hub_terms is not None else normalized_stock_terms
     terms_used = {"stock": normalized_stock_terms, "asset_hub": normalized_hub_terms}
+    if plan["atlas"]["enabled"]:
+        terms_used["atlas"] = normalized_stock_terms
     if plan["asset_hub"]["requires_catalog_expansion"]:
         raise CatalogExpansionRequired("Asset Hub all_titles/all_brands requires catalog expansion before discovery")
 
@@ -596,7 +607,11 @@ def discover_material_candidates(
     succeeded: list[str] = []
     technical_failures = 0
     remote_attempts = 0
-    remote_provider_count = len(plan["external_providers"]) + int(plan["asset_hub"]["enabled"])
+    remote_provider_count = (
+        len(plan["external_providers"])
+        + int(plan["asset_hub"]["enabled"])
+        + int(plan["atlas"]["enabled"])
+    )
 
     for provider in policy.providers.enabled:
         attempted.append(provider)
@@ -624,7 +639,27 @@ def discover_material_candidates(
                 succeeded.append(provider)
             continue
         terms = normalized_hub_terms if provider == PROVIDER_ASSET_HUB else normalized_stock_terms
-        if provider != PROVIDER_ASSET_HUB and not native_stock_provider_configured(provider):
+        if provider == PROVIDER_ATLAS:
+            if not callable(getattr(atlas_provider, "search", None)):
+                diagnostics.append(DiscoveryDiagnostic(
+                    provider, None, "config_missing", "Atlas provider capability is required", 0, 0, 0, 0,
+                ))
+                continue
+            if atlas_scope is None:
+                # Scope is never inferred from a term, another provider, or a
+                # generic catalog default.  Treat its absence as a technical
+                # discovery failure so an Atlas-only request fails closed.
+                technical_failures += 1
+                remote_attempts += 1
+                diagnostics.append(DiscoveryDiagnostic(
+                    provider, None, "error", _safe_error_message(
+                        AtlasInvalidRequestError("an explicit atlas_scope is required")
+                    ), None,
+                ))
+                if remote_provider_count == 1:
+                    raise MaterialDiscoveryError("material provider 'atlas' failed")
+                continue
+        if provider not in (PROVIDER_ASSET_HUB, PROVIDER_ATLAS) and not native_stock_provider_configured(provider):
             config_key = native_stock_config_key(provider) or "native provider configuration"
             diagnostics.append(DiscoveryDiagnostic(
                 provider, None, "config_missing",
@@ -638,7 +673,21 @@ def discover_material_candidates(
         for term in terms:
             found: list[MaterialCandidate] = []
             try:
-                if provider != PROVIDER_ASSET_HUB:
+                if provider == PROVIDER_ATLAS:
+                    remote_attempts += 1
+                    atlas_results = atlas_provider.search(
+                        {"query": term, "aspect_ratio": video_aspect, "limit": 20},
+                        scope=atlas_scope,
+                    )
+                    # AtlasProvider already emitted normalized, evidence-rich
+                    # candidates.  Keep its local score confined to source_info.
+                    found = [
+                        candidate for candidate in atlas_results
+                        if _is_orientation_compatible(candidate, video_aspect)
+                    ]
+                    raw_count = len(atlas_results)
+                    normalized = atlas_results
+                elif provider != PROVIDER_ASSET_HUB:
                     remote_attempts += 1
                     items = material.search_videos_for_provider(provider, term, minimum_duration, video_aspect)
                     raw_count = len(items)
@@ -675,6 +724,12 @@ def discover_material_candidates(
             except Exception as exc:
                 if provider == PROVIDER_ASSET_HUB and _is_fatal_asset_hub_error(exc):
                     raise
+                if provider == PROVIDER_ATLAS and isinstance(exc, AtlasUnavailableError):
+                    candidates = [item for item in candidates if item.provider != PROVIDER_ATLAS]
+                    diagnostics.append(DiscoveryDiagnostic(
+                        provider, term, "unavailable", _safe_error_message(exc), 0,
+                    ))
+                    break
                 if provider == PROVIDER_ASSET_HUB and isinstance(exc, KurukinAssetHubUnavailableError):
                     # Availability is not a match.  Discard any prior result
                     # from this provider for this job and let other providers

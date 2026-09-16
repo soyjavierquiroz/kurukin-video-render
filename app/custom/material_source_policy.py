@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
 
+PROVIDER_ATLAS = "atlas"
 PROVIDER_ASSET_HUB = "asset_hub"
 PROVIDER_PEXELS = "pexels"
 PROVIDER_PIXABAY = "pixabay"
@@ -18,6 +19,7 @@ PROVIDER_LOCAL = "local"
 
 # This is also the canonical discovery order, independent of input ordering.
 PROVIDER_ORDER = (
+    PROVIDER_ATLAS,
     PROVIDER_ASSET_HUB,
     PROVIDER_PEXELS,
     PROVIDER_PIXABAY,
@@ -206,6 +208,9 @@ def build_discovery_plan(policy: MaterialSourcePolicy) -> dict[str, Any]:
     asset_hub_enabled = policy.providers.is_enabled(PROVIDER_ASSET_HUB)
     expansion_required = asset_hub_enabled and policy.asset_hub.requires_catalog_expansion
     return {
+        "atlas": {
+            "enabled": policy.providers.is_enabled(PROVIDER_ATLAS),
+        },
         "external_providers": [
             provider for provider in EXTERNAL_PROVIDER_ORDER if policy.providers.is_enabled(provider)
         ],
@@ -222,8 +227,16 @@ def build_discovery_plan(policy: MaterialSourcePolicy) -> dict[str, Any]:
 
 
 def open_sources_policy() -> MaterialSourcePolicy:
+    # Keep this legacy convenience policy's established provider set.  Atlas
+    # must always be opted into explicitly by a caller.
     return MaterialSourcePolicy(
-        providers=MaterialProviderPolicy(PROVIDER_ORDER),
+        providers=MaterialProviderPolicy((
+            PROVIDER_ASSET_HUB,
+            PROVIDER_PEXELS,
+            PROVIDER_PIXABAY,
+            PROVIDER_COVERR,
+            PROVIDER_LOCAL,
+        )),
         asset_hub=AssetHubCatalogPolicy(include=AssetHubIncludePolicy(generic=True)),
     )
 
