@@ -3,6 +3,7 @@ from uuid import uuid4
 
 from app.custom.atlas_client import AtlasInvalidRequestError, AtlasProtocolError
 from app.custom.atlas_provider import AtlasProvider, build_atlas_search_payload
+from app.custom.material_selection import _is_orientation_compatible
 
 
 UID = str(uuid4())
@@ -54,15 +55,38 @@ class TestAtlasProvider(unittest.TestCase):
             with self.subTest(scope=scope):
                 self.assertEqual(build_atlas_search_payload({"atlas_scope": scope})["scope"], expected)
 
-    def test_orientation_is_soft_and_square_is_neutral(self):
+    def test_explicit_portrait_orientation_requires_vertical_rendition(self):
+        payload = build_atlas_search_payload({"atlas_scope": {"kind": "general"}, "aspect_ratio": "9:16"})
+
+        self.assertEqual(payload["preferences"]["preferred_rendition_kind"], "vertical")
+        self.assertEqual(payload["requirements"]["rendition"], {
+            "acceptable_kinds": ["horizontal", "vertical"],
+            "preferred_kind": "vertical",
+            "preferred_required": True,
+        })
+
+    def test_explicit_landscape_orientation_requires_horizontal_rendition(self):
+        payload = build_atlas_search_payload({"atlas_scope": {"kind": "general"}, "aspect_ratio": "16:9"})
+
+        self.assertEqual(payload["preferences"]["preferred_rendition_kind"], "horizontal")
+        self.assertEqual(payload["requirements"]["rendition"], {
+            "acceptable_kinds": ["horizontal", "vertical"],
+            "preferred_kind": "horizontal",
+            "preferred_required": True,
+        })
+
+    def test_no_explicit_orientation_preserves_soft_neutral_rendition_request(self):
         landscape = build_atlas_search_payload({"atlas_scope": {"kind": "general"}, "orientation": "landscape"})
-        portrait = build_atlas_search_payload({"atlas_scope": {"kind": "general"}, "aspect_ratio": "9:16"})
         square = build_atlas_search_payload({"atlas_scope": {"kind": "general"}, "orientation": "square", "scene_visual_intent": {"relationships": ["family"]}})
         self.assertEqual(landscape["preferences"]["preferred_rendition_kind"], "horizontal")
-        self.assertEqual(portrait["preferences"]["preferred_rendition_kind"], "vertical")
+        self.assertTrue(landscape["requirements"]["rendition"]["preferred_required"])
         self.assertIsNone(square["preferences"]["preferred_rendition_kind"])
         self.assertEqual(set(square["requirements"]), {"rendition"})
-        self.assertFalse(landscape["requirements"]["rendition"]["preferred_required"])
+        self.assertEqual(square["requirements"]["rendition"], {
+            "acceptable_kinds": ["horizontal", "vertical"],
+            "preferred_kind": None,
+            "preferred_required": False,
+        })
 
     def test_candidate_identity_and_ordinal_rank_preserve_local_score_as_metadata(self):
         client = FakeClient([atlas_candidate(score=99.9), atlas_candidate(uid=str(uuid4()), kind="vertical", score=-4)])
@@ -82,6 +106,29 @@ class TestAtlasProvider(unittest.TestCase):
         self.assertIsNone(found[0].url)
         self.assertNotIn("remote_path", found[0].source_info)
         self.assertNotIn("rclone", str(found[0].source_info))
+
+    def test_normalized_renditions_survive_only_their_matching_orientation_filter(self):
+        vertical_uid = str(uuid4())
+        client = FakeClient([
+            atlas_candidate(uid=vertical_uid, kind="vertical"),
+            atlas_candidate(kind="horizontal"),
+        ])
+
+        vertical, horizontal = AtlasProvider(client).search(
+            {"query": "conversation", "atlas_scope": {"kind": "title", "title_id": "t1"}}
+        )
+
+        self.assertEqual(vertical.source_info["rendition_kind"], "vertical")
+        self.assertEqual(vertical.orientation, "portrait")
+        self.assertTrue(_is_orientation_compatible(vertical, "9:16"))
+        self.assertFalse(_is_orientation_compatible(vertical, "16:9"))
+        self.assertEqual(horizontal.source_info["rendition_kind"], "horizontal")
+        self.assertEqual(horizontal.orientation, "landscape")
+        self.assertTrue(_is_orientation_compatible(horizontal, "16:9"))
+        self.assertFalse(_is_orientation_compatible(horizontal, "9:16"))
+        self.assertIsNone(vertical.url)
+        self.assertEqual(vertical.canonical_id, f"{vertical_uid}:vertical")
+        self.assertEqual(vertical.dedupe_key, f"atlas:{vertical_uid}:vertical")
 
     def test_unsafe_logical_locators_are_rejected(self):
         bad = (

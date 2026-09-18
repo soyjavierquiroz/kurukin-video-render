@@ -114,7 +114,11 @@ def build_atlas_search_payload(
     rendition = {
         "acceptable_kinds": ["horizontal", "vertical"],
         "preferred_kind": preferred,
-        "preferred_required": False,
+        # MPT's aspect ratio is a hard output constraint.  When it maps to a
+        # known Atlas rendition, require Atlas to select that rendition rather
+        # than accepting a soft-preference fallback that discovery will later
+        # reject at its strict orientation boundary.
+        "preferred_required": preferred is not None,
     }
     return {
         "schema_version": "asset_search_v1",
