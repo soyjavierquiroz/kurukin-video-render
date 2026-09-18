@@ -73,6 +73,22 @@ class TestAtlasClient(unittest.TestCase):
         self.assertFalse(session.calls[0][2]["allow_redirects"])
         self.assertFalse(session.response.closed)
 
+    def test_public_thumbnail_url_requires_the_exact_logical_thumbnail_path(self):
+        uid = str(uuid4())
+        client = AtlasClient("https://atlas.example/api", session=FakeSession(FakeResponse()))
+        locator = f"/v1/assets/{uid}/renditions/horizontal/thumbnail"
+        self.assertEqual(
+            client.public_thumbnail_url(uid, "horizontal", locator),
+            f"https://atlas.example/api{locator}",
+        )
+        for unsafe in (
+            f"/v1/assets/{uid}/renditions/horizontal/content",
+            f"https://other.example{locator}",
+            f"{locator}?query=1",
+        ):
+            with self.subTest(locator=unsafe), self.assertRaises(AtlasInvalidRequestError):
+                client.public_thumbnail_url(uid, "horizontal", unsafe)
+
     def test_delivery_http_errors_close_streaming_responses(self):
         uid = str(uuid4())
         cases = ((404, AtlasNotFoundError), (503, AtlasUnavailableError))

@@ -56,6 +56,30 @@ def candidate(uid, term="term", provider="pexels", url=None, source_info=None, d
     )
 
 
+ATLAS_REVIEW_UID = "00000000-0000-4000-8000-000000000001"
+
+
+def atlas_review_candidate(*, thumbnail_locator=None, source_info=None):
+    info = {
+        "asset_uid": ATLAS_REVIEW_UID,
+        "rendition_kind": "horizontal",
+    }
+    if thumbnail_locator is not None:
+        info["thumbnail_locator"] = thumbnail_locator
+    if source_info:
+        info.update(source_info)
+    return MaterialCandidate(
+        provider="atlas",
+        canonical_id=f"{ATLAS_REVIEW_UID}:horizontal",
+        dedupe_key=f"atlas:{ATLAS_REVIEW_UID}:horizontal",
+        search_term="review-safe",
+        rank=1,
+        url=None,
+        orientation="landscape",
+        source_info=info,
+    )
+
+
 class FakeImageResponse:
     headers = {"content-type": "image/jpeg"}
 
@@ -1200,6 +1224,75 @@ class TestHumanReviewPlan(unittest.TestCase):
         self.assertTrue(Path(preview["value"]).is_file())
         get.assert_called_once()
         ffmpeg.assert_not_called()
+
+    def test_atlas_logical_thumbnail_is_an_inspectable_public_url_without_acquisition(self):
+        thumbnails = self.root / "thumbs"
+        locator = f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/thumbnail"
+        item = atlas_review_candidate(thumbnail_locator=locator)
+
+        with patch.dict(os.environ, {
+            "ATLAS_ENABLED": "true",
+            "ATLAS_BASE_URL": "http://atlas.example:18765/api/",
+            "ATLAS_TIMEOUT_SECONDS": "15",
+        }, clear=True), patch("app.custom.human_review.requests.get") as get:
+            preview, warnings = human_review.ensure_candidate_preview(item, thumbnails)
+
+        self.assertIsNone(item.url)
+        self.assertEqual(preview, {
+            "type": "url",
+            "value": f"http://atlas.example:18765/api{locator}",
+            "status": "available",
+        })
+        self.assertTrue(human_review.review_previewable(preview))
+        self.assertEqual(warnings, [])
+        self.assertNotIn("rclone", preview["value"])
+        self.assertNotIn("drive", preview["value"])
+        get.assert_not_called()
+
+    def test_atlas_missing_thumbnail_locator_is_unavailable(self):
+        item = atlas_review_candidate()
+
+        with patch.dict(os.environ, {
+            "ATLAS_ENABLED": "true",
+            "ATLAS_BASE_URL": "http://atlas.example:18765",
+        }, clear=True):
+            preview, warnings = human_review.ensure_candidate_preview(item, self.root / "thumbs")
+
+        self.assertIsNone(item.url)
+        self.assertEqual(preview["status"], "unavailable")
+        self.assertEqual(preview["type"], "none")
+        self.assertFalse(human_review.review_previewable(preview))
+        self.assertEqual(warnings[0]["code"], "preview_unavailable")
+
+    def test_atlas_unsafe_or_content_thumbnail_locator_fails_closed(self):
+        unsafe_locators = (
+            f"https://elsewhere.example/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/thumbnail",
+            f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/thumbnail?x=1",
+            f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/content",
+            f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/vertical/thumbnail",
+        )
+        for locator in unsafe_locators:
+            with self.subTest(locator=locator), patch.dict(os.environ, {
+                "ATLAS_ENABLED": "true",
+                "ATLAS_BASE_URL": "http://atlas.example:18765",
+            }, clear=True), patch("app.custom.human_review.requests.get") as get:
+                preview, warnings = human_review.ensure_candidate_preview(
+                    atlas_review_candidate(thumbnail_locator=locator),
+                    self.root / f"thumbs-{unsafe_locators.index(locator)}",
+                )
+            self.assertEqual(preview["status"], "unavailable")
+            self.assertEqual(preview["type"], "none")
+            self.assertFalse(human_review.review_previewable(preview))
+            self.assertEqual(warnings[0]["code"], "preview_unavailable")
+            get.assert_not_called()
+
+    def test_atlas_preview_fails_closed_when_runtime_is_disabled(self):
+        item = atlas_review_candidate(
+            thumbnail_locator=f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/thumbnail",
+        )
+        with patch.dict(os.environ, {"ATLAS_ENABLED": "false"}, clear=True):
+            preview, _warnings = human_review.ensure_candidate_preview(item, self.root / "thumbs")
+        self.assertEqual(preview["status"], "unavailable")
 
     def test_pixabay_preview_url_falls_back_to_url_when_cache_fails(self):
         thumbnails = self.root / "thumbs"

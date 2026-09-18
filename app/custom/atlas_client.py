@@ -99,6 +99,32 @@ class AtlasClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
+    def public_thumbnail_url(
+        self,
+        asset_uid: str,
+        rendition_kind: str,
+        thumbnail_locator: str,
+    ) -> str:
+        """Resolve only Atlas' exact public logical thumbnail endpoint.
+
+        Discovery carries this logical path without turning it into a content
+        URL.  Human Review can safely expose the resulting public thumbnail
+        URL, but must not accept an arbitrary URL or a content locator here.
+        """
+        uid = validate_asset_uid(asset_uid)
+        kind = validate_rendition_kind(rendition_kind)
+        if not isinstance(thumbnail_locator, str):
+            raise AtlasInvalidRequestError("thumbnail_locator must be a string")
+        parsed = urlsplit(thumbnail_locator)
+        expected = f"/v1/assets/{uid}/renditions/{kind}/thumbnail"
+        if (
+            parsed.scheme or parsed.netloc or parsed.query or parsed.fragment
+            or parsed.path != expected or parsed.path != thumbnail_locator
+            or ".." in parsed.path.split("/") or "\\" in thumbnail_locator
+        ):
+            raise AtlasInvalidRequestError("thumbnail_locator is not an Atlas public logical thumbnail")
+        return self._url(thumbnail_locator)
+
     @staticmethod
     def _payload(payload: Any) -> Any:
         if hasattr(payload, "model_dump"):

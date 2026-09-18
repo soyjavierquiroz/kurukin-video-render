@@ -19,6 +19,11 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from app.custom.atlas_client import AtlasInvalidRequestError
+from app.custom.atlas_runtime import (
+    AtlasRuntimeConfigurationError,
+    build_atlas_runtime_from_env,
+)
 from app.custom.asset_search_v2 import (
     build_visual_queries_v2,
     normalize_editorial_profile,
@@ -1855,6 +1860,36 @@ def _thumbnail_url(candidate: Any) -> str:
     return _preview_value_from_mapping(info)
 
 
+def _atlas_public_thumbnail_url(candidate: Any) -> str:
+    """Resolve an Atlas logical thumbnail through its configured public API.
+
+    Atlas candidates intentionally have no URL before acquisition.  Do not
+    fall back to their content locator: the thumbnail locator is the sole
+    public preview contract at this stage.
+    """
+    info = getattr(candidate, "source_info", None)
+    if not isinstance(info, Mapping):
+        return ""
+    asset_uid = info.get("asset_uid")
+    rendition_kind = info.get("rendition_kind")
+    thumbnail_locator = info.get("thumbnail_locator")
+    if not all(isinstance(value, str) and value.strip() for value in (
+        asset_uid, rendition_kind, thumbnail_locator,
+    )):
+        return ""
+    try:
+        runtime = build_atlas_runtime_from_env()
+        if runtime is None:
+            return ""
+        return runtime.client.public_thumbnail_url(
+            asset_uid,
+            rendition_kind,
+            thumbnail_locator,
+        )
+    except (AtlasRuntimeConfigurationError, AtlasInvalidRequestError):
+        return ""
+
+
 def _safe_preview_filename(uid: str) -> str:
     return (uid.replace("/", "-").replace(":", "-") or "asset")[:140]
 
@@ -1916,6 +1951,21 @@ def _preview_warning(candidate: Any, code: str, message: str) -> dict[str, str]:
         "code": code,
         "message": message,
     }
+
+
+def _unavailable_preview(candidate: Any, thumbnails_dir: Path, uid: str) -> tuple[dict[str, str], list[dict[str, str]]]:
+    placeholder = thumbnails_dir / f"{uid}.svg"
+    if not placeholder.exists():
+        _write_placeholder_thumbnail(placeholder, candidate_uid(candidate))
+    return (
+        {
+            "type": "none",
+            "value": "",
+            "status": "unavailable",
+            "placeholder_path": _project_relative_path(placeholder),
+        },
+        [_preview_warning(candidate, "preview_unavailable", "NO PREVIEW AVAILABLE")],
+    )
 
 
 def _write_placeholder_thumbnail(path: Path, label: str) -> None:
@@ -2032,6 +2082,14 @@ def _cache_frame_from_remote_video(candidate: Any, thumbnails_dir: Path, uid: st
 def ensure_candidate_preview(candidate: Any, thumbnails_dir: Path) -> tuple[dict[str, str], list[dict[str, str]]]:
     thumbnails_dir.mkdir(parents=True, exist_ok=True)
     uid = _safe_preview_filename(candidate_uid(candidate))
+    is_atlas = _provider(candidate) == "atlas"
+
+    if is_atlas:
+        atlas_thumbnail_url = _atlas_public_thumbnail_url(candidate)
+        if atlas_thumbnail_url:
+            return {"type": "url", "value": atlas_thumbnail_url, "status": "available"}, []
+        return _unavailable_preview(candidate, thumbnails_dir, uid)
+
     url = _thumbnail_url(candidate)
     is_asset_hub = _provider(candidate) == "asset_hub"
 
@@ -2076,18 +2134,7 @@ def ensure_candidate_preview(candidate: Any, thumbnails_dir: Path) -> tuple[dict
         if cached:
             return {"type": "local", "value": _project_relative_path(cached), "status": "available"}, []
 
-    placeholder = thumbnails_dir / f"{uid}.svg"
-    if not placeholder.exists():
-        _write_placeholder_thumbnail(placeholder, candidate_uid(candidate))
-    return (
-        {
-            "type": "none",
-            "value": "",
-            "status": "unavailable",
-            "placeholder_path": _project_relative_path(placeholder),
-        },
-        [_preview_warning(candidate, "preview_unavailable", "NO PREVIEW AVAILABLE")],
-    )
+    return _unavailable_preview(candidate, thumbnails_dir, uid)
 
 
 def review_previewable(preview: Mapping[str, Any] | None) -> bool:
