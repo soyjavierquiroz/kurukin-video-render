@@ -53,11 +53,22 @@ class ContentIngestTests(unittest.TestCase):
         with self.assertRaisesRegex(ContentIngestError, "unknown niche_id"):
             ingest_content(**self.args(niche_id="missing"))
 
-    def test_profile_not_allowed_or_not_ready_fails(self):
+    def test_profile_not_allowed_fails(self):
         with self.assertRaisesRegex(ContentIngestError, "not allowed"):
             ingest_content(**self.args(asset_profile="NOT_ALLOWED"))
-        with self.assertRaisesRegex(ContentIngestError, "NOT READY"):
-            ingest_content(**self.args(asset_profile="ROMPIENDO_CIRCULO"))
+
+    def test_rompiendo_circulo_persists_atlas_policy_and_title_identity_independently(self):
+        metadata = ingest_content(**self.args(
+            content_id="cf_000104", asset_profile="ROMPIENDO_CIRCULO",
+        ))
+        self.assertEqual(metadata["resolved_asset_policy"]["providers"], ["atlas"])
+        self.assertEqual(metadata["atlas_title_id"], "romper-el-circulo")
+        self.assertEqual(metadata["resolved_asset_policy"]["asset_hub"]["sources"], [])
+        persisted = json.loads(
+            (self.root / "jobs" / "test-niche" / "cf_000104" / "content.json").read_text()
+        )
+        self.assertEqual(persisted["resolved_asset_policy"]["providers"], ["atlas"])
+        self.assertEqual(persisted["atlas_title_id"], "romper-el-circulo")
 
     def test_unsafe_content_id_fails(self):
         with self.assertRaisesRegex(ContentIngestError, "filesystem-safe"):

@@ -28,10 +28,18 @@ from app.custom.material_source_policy import PROVIDER_ASSET_HUB, build_asset_hu
 from app.custom.mpt_defaults import resolve_effective_mpt_settings
 
 try:  # Supports both ``python scripts/...`` and package imports in tests.
-    from scripts.asset_profile_resolver import AssetProfileError, resolve_asset_profile
+    from scripts.asset_profile_resolver import (
+        AssetProfileError,
+        asset_profile_atlas_title_id,
+        resolve_asset_profile,
+    )
     from scripts.niche_registry import DEFAULT_REGISTRY_PATH, NicheRegistryError, load_niche
 except ModuleNotFoundError:  # pragma: no cover - exercised by the direct CLI
-    from asset_profile_resolver import AssetProfileError, resolve_asset_profile
+    from asset_profile_resolver import (
+        AssetProfileError,
+        asset_profile_atlas_title_id,
+        resolve_asset_profile,
+    )
     from niche_registry import DEFAULT_REGISTRY_PATH, NicheRegistryError, load_niche
 
 
@@ -229,6 +237,9 @@ def ingest_content(
     niche, policy = validate_request(
         niche_id, content_id, title, audio_file_id, script_file_id, asset_profile, registry_path
     )
+    # Provider policy and Atlas title identity intentionally travel as
+    # independent fields.  The resolver above is the only opt-in for Atlas.
+    atlas_title_id = asset_profile_atlas_title_id(asset_profile)
     job_dir = Path(job_root) / niche_id / content_id
     metadata_path = job_dir / "content.json"
     audio_path = job_dir / "source.mp3"
@@ -293,6 +304,8 @@ def ingest_content(
             "mpt_defaults": niche.get("mpt_defaults"),
             "effective_mpt_settings": resolve_effective_mpt_settings(niche.get("mpt_defaults")),
         }
+        if atlas_title_id is not None:
+            metadata["atlas_title_id"] = atlas_title_id
         if isinstance(video_terms, str) and video_terms.strip():
             metadata["video_terms"] = video_terms
         temporary = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.partial")

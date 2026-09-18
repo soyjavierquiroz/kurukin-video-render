@@ -101,12 +101,40 @@ class ContentJobHumanReviewTests(unittest.TestCase):
         policy = adapter.resolve_asset_profile("test-niche", "GENERALES", self.registry)
         self.assertEqual(adapter.legacy_review_arguments(policy), ("", "open"))
 
-    def test_not_ready_blocks_before_review(self):
+    def test_rompiendo_circulo_forwards_policy_and_title_identity_to_review_task(self):
         job, _ = self._job(profile="ROMPIENDO_CIRCULO")
-        with patch.object(produce_batch, "process_job") as process:
-            with self.assertRaisesRegex(adapter.ContentJobReviewError, "NOT READY"):
-                adapter.create_content_job_review(job, registry_path=self.registry)
-        process.assert_not_called()
+        data = json.loads((job / "content.json").read_text(encoding="utf-8"))
+        data["atlas_title_id"] = "romper-el-circulo"
+        (job / "content.json").write_text(json.dumps(data), encoding="utf-8")
+
+        def fake_process(job, **kwargs):
+            plan = human_review.plan_path(job.batch_id, job.stem, self.root)
+            human_review.write_json_atomic(plan, {
+                "batch_id": job.batch_id,
+                "task_id": job.task_id,
+                "stem": job.stem,
+                "job_name": job.stem,
+                "audio_path": job.mp3.as_posix(),
+                "script_path": job.txt.as_posix(),
+                "material_source_policy": kwargs["material_source_policy"],
+                "asset_hub_source_policy": {},
+                "review_status": human_review.STATUS_PENDING,
+            })
+            return human_review.STATUS_PENDING
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), patch.object(
+            produce_batch, "process_job", side_effect=fake_process,
+        ) as process:
+            result, plan = adapter.create_content_job_review(job, registry_path=self.registry)
+
+        self.assertEqual(result, "created")
+        self.assertEqual(process.call_args.kwargs["material_source_policy"]["providers"]["enabled"], ("atlas",))
+        self.assertEqual(process.call_args.kwargs["atlas_title_id"], "romper-el-circulo")
+        payload = human_review.read_json(plan)
+        self.assertEqual(payload["material_source_policy"]["providers"]["enabled"], ["atlas"])
+        self.assertEqual(payload["asset_hub_source_policy"], {})
+        self.assertEqual(payload["atlas_title_id"], "romper-el-circulo")
+        self.assertEqual(payload["content_job"]["atlas_title_id"], "romper-el-circulo")
 
     def test_provenance_is_added_to_generated_plan(self):
         job, data = self._job()

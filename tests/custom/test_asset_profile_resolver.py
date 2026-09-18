@@ -9,16 +9,19 @@ import unittest
 from unittest.mock import patch
 
 from app.custom.material_source_policy import (
+    PROVIDER_ATLAS,
     PROVIDER_ASSET_HUB,
     PROVIDER_COVERR,
     PROVIDER_LOCAL,
     PROVIDER_PEXELS,
     PROVIDER_PIXABAY,
     build_asset_hub_source_policy,
+    build_discovery_plan,
 )
 from scripts.asset_profile_resolver import (
     AssetProfileError,
     AssetProfileNotReadyError,
+    asset_profile_atlas_title_id,
     resolve_asset_profile,
 )
 
@@ -69,9 +72,18 @@ class AssetProfileResolverTests(unittest.TestCase):
         )
         self.assertTrue(policy.asset_hub.include.generic)
 
-    def test_rompiendo_circulo_is_not_ready(self):
-        with self.assertRaisesRegex(AssetProfileNotReadyError, "ROMPIENDO_CIRCULO"):
-            resolve_asset_profile("test-niche", "ROMPIENDO_CIRCULO", self.registry(["ROMPIENDO_CIRCULO"]))
+    def test_rompiendo_circulo_resolves_to_atlas_only_with_explicit_title_identity(self):
+        policy = resolve_asset_profile(
+            "test-niche", "ROMPIENDO_CIRCULO", self.registry(["ROMPIENDO_CIRCULO"])
+        )
+        self.assertEqual(policy.providers.enabled, (PROVIDER_ATLAS,))
+        self.assertEqual(
+            asset_profile_atlas_title_id("ROMPIENDO_CIRCULO"),
+            "romper-el-circulo",
+        )
+        self.assertFalse(policy.asset_hub.include.generic)
+        self.assertEqual(policy.asset_hub.include.titles, ())
+        self.assertIsNone(build_discovery_plan(policy)["asset_hub"]["source_policy"])
 
     def test_cf_mix_is_not_ready(self):
         with self.assertRaisesRegex(AssetProfileNotReadyError, "ROMPIENDO_CIRCULO dependency"):

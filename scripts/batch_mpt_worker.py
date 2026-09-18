@@ -64,8 +64,16 @@ def _material_source_policy(manifest: dict) -> dict:
         MaterialProviderPolicy,
         MaterialSourcePolicy,
         PROVIDER_ASSET_HUB,
+        material_source_policy_from_dict,
         open_sources_policy,
     )
+
+    # Current content jobs carry an explicit provider policy.  It is
+    # authoritative and deliberately independent of atlas_title_id: identity
+    # alone must never opt a task into Atlas.
+    explicit = manifest.get("material_source_policy")
+    if explicit is not None:
+        return material_source_policy_from_dict(explicit).to_dict()
 
     title = str(manifest.get("material_title") or "").strip()
     source_policy = str(manifest.get("source_policy") or "").strip()
@@ -440,6 +448,7 @@ def run_master(manifest: dict) -> dict:
         video_count=1,
         video_source="pexels",
         material_source_policy=_material_source_policy(manifest),
+        atlas_title_id=manifest.get("atlas_title_id"),
         editorial_profile=manifest.get("editorial_profile") or {},
         custom_audio_file=custom_audio_file,
         voice_name="",
@@ -518,6 +527,7 @@ def run_review(manifest: dict) -> dict:
         video_count=1,
         video_source="pexels",
         material_source_policy=_material_source_policy(manifest),
+        atlas_title_id=manifest.get("atlas_title_id"),
         editorial_profile=manifest.get("editorial_profile") or {},
         custom_audio_file=custom_audio_file,
         voice_name="",

@@ -17,6 +17,7 @@ from app.custom.material_source_policy import (
     AssetHubIncludePolicy,
     MaterialProviderPolicy,
     MaterialSourcePolicy,
+    PROVIDER_ATLAS,
     PROVIDER_ASSET_HUB,
     build_asset_hub_source_policy,
     open_sources_policy,
@@ -50,14 +51,42 @@ ASSET_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
         "use_current_generic_routing": True,
     },
     "ROMPIENDO_CIRCULO": {
-        "status": "not_ready",
-        "reason": "canonical Asset Hub title slug not configured",
+        "status": "ready",
+        "providers": (PROVIDER_ATLAS,),
+        # This is Atlas namespace identity, not an Asset Hub title scope and
+        # never a signal to enable Atlas by itself.
+        "atlas_title_id": "romper-el-circulo",
     },
     "CF_MIX": {
         "status": "not_ready",
         "reason": "ROMPIENDO_CIRCULO dependency is not configured",
     },
 }
+
+
+def asset_profile_metadata(profile_id: str) -> dict[str, Any]:
+    """Return declarative profile metadata after policy resolution authorized it.
+
+    Callers must resolve the profile through ``resolve_asset_profile`` first.
+    Keeping identity metadata separate from the policy prevents a title ID from
+    becoming an implicit provider opt-in.
+    """
+    profile = ASSET_PROFILE_CONFIG.get(profile_id)
+    if profile is None:
+        raise AssetProfileError(f"asset profile configuration not found: {profile_id}")
+    return {
+        key: value
+        for key, value in profile.items()
+        if key not in {"providers", "asset_hub_titles", "use_current_generic_routing"}
+    }
+
+
+def asset_profile_atlas_title_id(profile_id: str) -> str | None:
+    """Return the explicit Atlas identity configured for a resolved profile."""
+    value = asset_profile_metadata(profile_id).get("atlas_title_id")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
 
 
 def resolve_asset_profile(
@@ -100,12 +129,13 @@ def resolve_asset_profile(
             asset_hub=open_policy.asset_hub,
         )
 
-    return MaterialSourcePolicy(
-        providers=MaterialProviderPolicy(profile["providers"]),
-        asset_hub=AssetHubCatalogPolicy(
+    providers = MaterialProviderPolicy(profile["providers"])
+    asset_hub = AssetHubCatalogPolicy()
+    if providers.is_enabled(PROVIDER_ASSET_HUB):
+        asset_hub = AssetHubCatalogPolicy(
             include=AssetHubIncludePolicy(titles=profile["asset_hub_titles"])
-        ),
-    )
+        )
+    return MaterialSourcePolicy(providers=providers, asset_hub=asset_hub)
 
 
 def _source_labels(policy: MaterialSourcePolicy) -> str:

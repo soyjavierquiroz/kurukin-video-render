@@ -24,12 +24,17 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.custom import human_review
 from app.custom.video_terms import normalize_video_terms
 from app.custom.material_source_policy import (
+    PROVIDER_ATLAS,
     PROVIDER_ASSET_HUB,
     build_asset_hub_source_policy,
     open_sources_policy,
 )
 from scripts import produce_batch
-from scripts.asset_profile_resolver import AssetProfileError, resolve_asset_profile
+from scripts.asset_profile_resolver import (
+    AssetProfileError,
+    asset_profile_atlas_title_id,
+    resolve_asset_profile,
+)
 from scripts.content_ingest import asset_policy_summary
 from scripts.niche_registry import DEFAULT_REGISTRY_PATH, NicheRegistryError, load_niche
 from app.custom.mpt_defaults import resolve_effective_mpt_settings
@@ -116,13 +121,17 @@ def legacy_review_arguments(policy: Any) -> tuple[str, str]:
     if policy_dict == open_sources_policy().to_dict():
         # The existing worker maps an empty title to its established open policy.
         return "", "open"
+    if policy.providers.enabled == (PROVIDER_ATLAS,):
+        # Atlas has no representation in the legacy title/source fields.  Its
+        # explicit policy and independent title ID are carried in the manifest.
+        return "", ""
     raise ContentJobReviewError(
         "resolved asset policy cannot be represented safely by the existing Human Review manifest"
     )
 
 
 def content_job_provenance(metadata: dict[str, Any], policy: Any) -> dict[str, Any]:
-    return {
+    provenance = {
         "content_id": metadata["content_id"],
         "niche_id": metadata["niche_id"],
         "asset_profile": metadata["asset_profile"],
@@ -133,6 +142,9 @@ def content_job_provenance(metadata: dict[str, Any], policy: Any) -> dict[str, A
         "effective_mpt_settings": metadata.get("effective_mpt_settings") or resolve_effective_mpt_settings(metadata.get("mpt_defaults")),
         "video_terms": metadata.get("video_terms"),
     }
+    if metadata.get("atlas_title_id") is not None:
+        provenance["atlas_title_id"] = metadata["atlas_title_id"]
+    return provenance
 
 
 _REVIEW_SEMANTIC_MPT_FIELDS = ("video_aspect", "video_clip_duration")
@@ -195,7 +207,7 @@ def plan_identity_matches_content_job(
             return False
         fields = (
             "niche_id", "asset_profile", "audio_sha256", "script_sha256",
-            "resolved_asset_policy", "video_terms",
+            "resolved_asset_policy", "atlas_title_id", "video_terms",
         )
         existing_settings = dict(provenance)
         for field in ("mpt_defaults", "effective_mpt_settings"):
@@ -253,6 +265,7 @@ def _plan_matches_except_video_terms(plan: dict[str, Any], provenance_expected: 
         provenance.get("content_id") == content_id
         and all(provenance.get(field) == provenance_expected.get(field) for field in (
             "niche_id", "asset_profile", "audio_sha256", "script_sha256", "resolved_asset_policy",
+            "atlas_title_id",
         ))
         and provenance.get("video_terms") != provenance_expected.get("video_terms")
     )
@@ -349,6 +362,11 @@ def create_content_job_review(
         policy = resolve_asset_profile(niche_id, profile, registry_path)
     except (NicheRegistryError, AssetProfileError) as exc:
         raise ContentJobReviewError(str(exc)) from exc
+    atlas_title_id = asset_profile_atlas_title_id(profile)
+    if metadata.get("atlas_title_id") != atlas_title_id:
+        raise ContentJobReviewError(
+            "content.json Atlas title identity differs from resolved asset profile"
+        )
 
     batch_id = deterministic_batch_id(niche_id, content_id)
     stem = produce_batch.sanitize_id(title)
@@ -397,6 +415,7 @@ def create_content_job_review(
         job, index=1, total=1, batch_output_dir=batch_output_dir, report=report,
         report_path=report_path, preset="editorial-gold", position="bottom",
         human_review_mode=True, material_title=material_title, source_policy=source_policy,
+        material_source_policy=policy.to_dict(), atlas_title_id=atlas_title_id,
         mpt_defaults=metadata.get("mpt_defaults"), effective_mpt_settings=effective_mpt_settings,
         video_terms=raw_video_terms,
     )
@@ -409,6 +428,9 @@ def create_content_job_review(
     ):
         raise ContentJobReviewError("generated review plan identity differs from content job")
     plan["content_job"] = provenance
+    # Preserve Atlas identity beside the plan's provider policy as durable
+    # review state; it remains independent of provider enablement.
+    plan["atlas_title_id"] = atlas_title_id
     plan["mpt_defaults"] = deepcopy(metadata.get("mpt_defaults"))
     plan["effective_mpt_settings"] = effective_mpt_settings
     plan["aspect_ratio"] = effective_mpt_settings["video_aspect"]
