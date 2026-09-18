@@ -136,6 +136,55 @@ class ContentJobHumanReviewTests(unittest.TestCase):
         self.assertEqual(payload["atlas_title_id"], "romper-el-circulo")
         self.assertEqual(payload["content_job"]["atlas_title_id"], "romper-el-circulo")
 
+    def test_atlas_only_existing_review_never_builds_asset_hub_source_policy(self):
+        job, _ = self._job(profile="ROMPIENDO_CIRCULO")
+        data = json.loads((job / "content.json").read_text(encoding="utf-8"))
+        data["atlas_title_id"] = "romper-el-circulo"
+        (job / "content.json").write_text(json.dumps(data), encoding="utf-8")
+
+        def fake_process(job, **kwargs):
+            plan = human_review.plan_path(job.batch_id, job.stem, self.root)
+            human_review.write_json_atomic(plan, {
+                "batch_id": job.batch_id,
+                "task_id": job.task_id,
+                "stem": job.stem,
+                "job_name": job.stem,
+                "audio_path": job.mp3.as_posix(),
+                "script_path": job.txt.as_posix(),
+                "material_source_policy": kwargs["material_source_policy"],
+                "asset_hub_source_policy": {},
+                "review_status": human_review.STATUS_PENDING,
+            })
+            return human_review.STATUS_PENDING
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), patch.object(
+            produce_batch, "process_job", side_effect=fake_process,
+        ):
+            _, plan = adapter.create_content_job_review(job, registry_path=self.registry)
+
+        with patch.object(produce_batch, "HOST_ROOT", self.root), patch.object(
+            adapter, "build_asset_hub_source_policy",
+            side_effect=AssertionError("disabled Asset Hub must not be invoked"),
+        ) as build_source_policy, patch.object(produce_batch, "process_job") as process:
+            result, repeated = adapter.create_content_job_review(job, registry_path=self.registry)
+
+        self.assertEqual((result, repeated), ("already_exists", plan))
+        build_source_policy.assert_not_called()
+        process.assert_not_called()
+
+    def test_asset_hub_only_existing_review_still_builds_source_policy(self):
+        job, _ = self._job()
+        (_, plan), _ = self._create(job)
+        with patch.object(produce_batch, "HOST_ROOT", self.root), patch.object(
+            adapter, "build_asset_hub_source_policy",
+            wraps=adapter.build_asset_hub_source_policy,
+        ) as build_source_policy, patch.object(produce_batch, "process_job") as process:
+            result, repeated = adapter.create_content_job_review(job, registry_path=self.registry)
+
+        self.assertEqual((result, repeated), ("already_exists", plan))
+        build_source_policy.assert_called_once()
+        process.assert_not_called()
+
     def test_provenance_is_added_to_generated_plan(self):
         job, data = self._job()
         (result, plan), process = self._create(job)

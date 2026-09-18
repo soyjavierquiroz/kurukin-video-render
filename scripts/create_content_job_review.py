@@ -309,7 +309,11 @@ def _existing_plan_matches_content_job(
     # Policy models use tuples internally while review plans are JSON, so
     # compare the JSON representation rather than their Python containers.
     expected_material_policy = json.loads(json.dumps(policy.to_dict()))
-    expected_asset_hub_policy = build_asset_hub_source_policy(policy)
+    expected_asset_hub_policy = (
+        build_asset_hub_source_policy(policy)
+        if policy.providers.is_enabled(PROVIDER_ASSET_HUB)
+        else {}
+    )
     if (
         plan.get("material_source_policy") != expected_material_policy
         or plan.get("asset_hub_source_policy") != expected_asset_hub_policy
