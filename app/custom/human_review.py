@@ -1861,11 +1861,12 @@ def _thumbnail_url(candidate: Any) -> str:
 
 
 def _atlas_public_thumbnail_url(candidate: Any) -> str:
-    """Resolve an Atlas logical thumbnail through its configured public API.
+    """Resolve an Atlas logical thumbnail through its configured runtime URL.
 
     Atlas candidates intentionally have no URL before acquisition.  Do not
     fall back to their content locator: the thumbnail locator is the sole
-    public preview contract at this stage.
+    preview contract at this stage.  The resolved URL is server-side only: it
+    is copied into Human Review's local preview cache before a browser sees it.
     """
     info = getattr(candidate, "source_info", None)
     if not isinstance(info, Mapping):
@@ -1955,14 +1956,22 @@ def _preview_warning(candidate: Any, code: str, message: str) -> dict[str, str]:
 
 def _unavailable_preview(candidate: Any, thumbnails_dir: Path, uid: str) -> tuple[dict[str, str], list[dict[str, str]]]:
     placeholder = thumbnails_dir / f"{uid}.svg"
-    if not placeholder.exists():
-        _write_placeholder_thumbnail(placeholder, candidate_uid(candidate))
+    placeholder_path = ""
+    try:
+        if not placeholder.exists():
+            _write_placeholder_thumbnail(placeholder, candidate_uid(candidate))
+        if placeholder.exists():
+            placeholder_path = _project_relative_path(placeholder)
+    except OSError:
+        # Preview-cache failures must not make the review preparation fail.
+        # The preview contract remains unavailable either way.
+        pass
     return (
         {
             "type": "none",
             "value": "",
             "status": "unavailable",
-            "placeholder_path": _project_relative_path(placeholder),
+            "placeholder_path": placeholder_path,
         },
         [_preview_warning(candidate, "preview_unavailable", "NO PREVIEW AVAILABLE")],
     )
@@ -2006,9 +2015,11 @@ def _cache_remote_image(
     *,
     headers: Mapping[str, str] | None = None,
     allow_redirects: bool = True,
+    require_image_content_type: bool = False,
 ) -> Path | None:
     if _looks_like_video(url):
         return None
+    target: Path | None = None
     try:
         with requests.get(
             url,
@@ -2019,7 +2030,7 @@ def _cache_remote_image(
         ) as response:
             response.raise_for_status()
             content_type = str(response.headers.get("content-type") or "").split(";", 1)[0].lower()
-            if content_type and not content_type.startswith("image/"):
+            if (require_image_content_type or content_type) and not content_type.startswith("image/"):
                 return None
             extension = mimetypes.guess_extension(content_type) if content_type else ""
             if extension == ".jpe":
@@ -2040,6 +2051,8 @@ def _cache_remote_image(
                     handle.write(chunk)
             return target if target.exists() and target.stat().st_size > 0 else None
     except Exception:
+        if target is not None:
+            target.unlink(missing_ok=True)
         return None
 
 
@@ -2080,14 +2093,28 @@ def _cache_frame_from_remote_video(candidate: Any, thumbnails_dir: Path, uid: st
 
 
 def ensure_candidate_preview(candidate: Any, thumbnails_dir: Path) -> tuple[dict[str, str], list[dict[str, str]]]:
-    thumbnails_dir.mkdir(parents=True, exist_ok=True)
     uid = _safe_preview_filename(candidate_uid(candidate))
+    try:
+        thumbnails_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return _unavailable_preview(candidate, thumbnails_dir, uid)
     is_atlas = _provider(candidate) == "atlas"
 
     if is_atlas:
         atlas_thumbnail_url = _atlas_public_thumbnail_url(candidate)
         if atlas_thumbnail_url:
-            return {"type": "url", "value": atlas_thumbnail_url, "status": "available"}, []
+            cached = _existing_local_preview(thumbnails_dir, uid)
+            if cached:
+                return {"type": "local", "value": _project_relative_path(cached), "status": "available"}, []
+            cached = _cache_remote_image(
+                atlas_thumbnail_url,
+                thumbnails_dir,
+                uid,
+                allow_redirects=False,
+                require_image_content_type=True,
+            )
+            if cached:
+                return {"type": "local", "value": _project_relative_path(cached), "status": "available"}, []
         return _unavailable_preview(candidate, thumbnails_dir, uid)
 
     url = _thumbnail_url(candidate)

@@ -1225,28 +1225,55 @@ class TestHumanReviewPlan(unittest.TestCase):
         get.assert_called_once()
         ffmpeg.assert_not_called()
 
-    def test_atlas_logical_thumbnail_is_an_inspectable_public_url_without_acquisition(self):
+    def test_atlas_thumbnail_is_fetched_server_side_and_cached_as_local_preview(self):
         thumbnails = self.root / "thumbs"
         locator = f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/thumbnail"
         item = atlas_review_candidate(thumbnail_locator=locator)
 
         with patch.dict(os.environ, {
             "ATLAS_ENABLED": "true",
-            "ATLAS_BASE_URL": "http://atlas.example:18765/api/",
+            "ATLAS_BASE_URL": "http://172.18.0.1:18765/api/",
             "ATLAS_TIMEOUT_SECONDS": "15",
+        }, clear=True), patch(
+            "app.custom.human_review.requests.get",
+            return_value=FakeImageResponse(),
+        ) as get:
+            preview, warnings = human_review.ensure_candidate_preview(item, thumbnails)
+
+        self.assertIsNone(item.url)
+        self.assertEqual(preview["type"], "local")
+        self.assertEqual(preview["status"], "available")
+        self.assertTrue(preview["value"].endswith(".jpg"))
+        self.assertTrue(Path(preview["value"]).is_file())
+        self.assertTrue(human_review.review_previewable(preview))
+        self.assertEqual(warnings, [])
+        self.assertNotIn("172.18.0.1", preview["value"])
+        self.assertNotIn("rclone", preview["value"])
+        self.assertNotIn("drive", preview["value"])
+        self.assertEqual(get.call_args.args[0], f"http://172.18.0.1:18765/api{locator}")
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+
+    def test_atlas_cached_thumbnail_stays_browser_local_without_refetch(self):
+        thumbnails = self.root / "thumbs"
+        locator = f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/thumbnail"
+        item = atlas_review_candidate(thumbnail_locator=locator)
+        cached = thumbnails / f"{ATLAS_REVIEW_UID}-horizontal.jpg"
+        thumbnails.mkdir(parents=True)
+        cached.write_bytes(b"jpeg-bytes")
+
+        with patch.dict(os.environ, {
+            "ATLAS_ENABLED": "true",
+            "ATLAS_BASE_URL": "http://172.18.0.1:18765",
         }, clear=True), patch("app.custom.human_review.requests.get") as get:
             preview, warnings = human_review.ensure_candidate_preview(item, thumbnails)
 
         self.assertIsNone(item.url)
         self.assertEqual(preview, {
-            "type": "url",
-            "value": f"http://atlas.example:18765/api{locator}",
+            "type": "local",
+            "value": cached.as_posix(),
             "status": "available",
         })
-        self.assertTrue(human_review.review_previewable(preview))
         self.assertEqual(warnings, [])
-        self.assertNotIn("rclone", preview["value"])
-        self.assertNotIn("drive", preview["value"])
         get.assert_not_called()
 
     def test_atlas_missing_thumbnail_locator_is_unavailable(self):
@@ -1293,6 +1320,52 @@ class TestHumanReviewPlan(unittest.TestCase):
         with patch.dict(os.environ, {"ATLAS_ENABLED": "false"}, clear=True):
             preview, _warnings = human_review.ensure_candidate_preview(item, self.root / "thumbs")
         self.assertEqual(preview["status"], "unavailable")
+
+    def test_atlas_non_image_thumbnail_fails_closed_without_content_fallback(self):
+        thumbnails = self.root / "thumbs"
+        locator = f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/thumbnail"
+        item = atlas_review_candidate(
+            thumbnail_locator=locator,
+            source_info={"content_locator": f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/content"},
+        )
+
+        with patch.dict(os.environ, {
+            "ATLAS_ENABLED": "true",
+            "ATLAS_BASE_URL": "http://atlas.example:18765",
+        }, clear=True), patch(
+            "app.custom.human_review.requests.get",
+            return_value=FakeHttpResponse(content_type="video/mp4"),
+        ) as get, patch("app.custom.human_review.subprocess.run") as ffmpeg:
+            preview, warnings = human_review.ensure_candidate_preview(item, thumbnails)
+
+        self.assertIsNone(item.url)
+        self.assertEqual(preview["type"], "none")
+        self.assertEqual(preview["status"], "unavailable")
+        self.assertEqual(warnings[0]["code"], "preview_unavailable")
+        self.assertEqual(get.call_args.args[0], f"http://atlas.example:18765{locator}")
+        ffmpeg.assert_not_called()
+
+    def test_atlas_thumbnail_cache_failure_fails_closed(self):
+        locator = f"/v1/assets/{ATLAS_REVIEW_UID}/renditions/horizontal/thumbnail"
+        item = atlas_review_candidate(thumbnail_locator=locator)
+
+        with patch.dict(os.environ, {
+            "ATLAS_ENABLED": "true",
+            "ATLAS_BASE_URL": "http://atlas.example:18765",
+        }, clear=True), patch(
+            "app.custom.human_review.requests.get",
+            return_value=FakeImageResponse(),
+        ) as get, patch("pathlib.Path.open", side_effect=OSError("disk full")), patch(
+            "app.custom.human_review.subprocess.run",
+        ) as ffmpeg:
+            preview, warnings = human_review.ensure_candidate_preview(item, self.root / "thumbs")
+
+        self.assertIsNone(item.url)
+        self.assertEqual(preview["type"], "none")
+        self.assertEqual(preview["status"], "unavailable")
+        self.assertEqual(warnings[0]["code"], "preview_unavailable")
+        self.assertEqual(get.call_args.args[0], f"http://atlas.example:18765{locator}")
+        ffmpeg.assert_not_called()
 
     def test_pixabay_preview_url_falls_back_to_url_when_cache_fails(self):
         thumbnails = self.root / "thumbs"
