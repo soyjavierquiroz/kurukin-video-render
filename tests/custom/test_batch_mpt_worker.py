@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from app.custom.material_source_policy import PROVIDER_ATLAS
 from app import services
+from app.models.schema import MaterialInfo
 from scripts import batch_mpt_worker
 
 
@@ -78,3 +79,80 @@ class TestTaskLocalCustomAudio(unittest.TestCase):
                 services, "task", SimpleNamespace(start=start), create=True,
             ):
                 batch_mpt_worker.run_review(manifest)
+
+
+class TestApprovedMaterializationIntegrity(unittest.TestCase):
+    asset_uid = "123e4567-e89b-12d3-a456-426614174000"
+
+    def atlas_selection(self, *, asset_uid=None, rendition_kind="vertical"):
+        uid = asset_uid or self.asset_uid
+        return SimpleNamespace(decisions=(
+            SimpleNamespace(candidate=SimpleNamespace(
+                provider="atlas",
+                canonical_id=f"{uid}:{rendition_kind}",
+            )),
+        ))
+
+    def atlas_acquisition(self, *, asset_uid=None, rendition_kind="vertical"):
+        uid = asset_uid or self.asset_uid
+        return SimpleNamespace(materials=(
+            MaterialInfo(
+                provider="atlas",
+                url="/tmp/atlas.mp4",
+                duration=5,
+                source_info={"asset_uid": uid, "rendition_kind": rendition_kind},
+            ),
+        ))
+
+    def test_atlas_same_asset_and_rendition_passes(self):
+        batch_mpt_worker._validate_approved_materialization(
+            self.atlas_selection(), self.atlas_acquisition(),
+        )
+
+    def test_atlas_same_asset_different_rendition_fails(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            rf"unapproved asset_uids={self.asset_uid}:horizontal.*"
+            rf"missing approved asset_uids={self.asset_uid}:vertical",
+        ):
+            batch_mpt_worker._validate_approved_materialization(
+                self.atlas_selection(), self.atlas_acquisition(rendition_kind="horizontal"),
+            )
+
+    def test_atlas_different_asset_fails(self):
+        other_uid = "123e4567-e89b-12d3-a456-426614174001"
+        with self.assertRaisesRegex(RuntimeError, rf"unapproved asset_uids={other_uid}:vertical"):
+            batch_mpt_worker._validate_approved_materialization(
+                self.atlas_selection(), self.atlas_acquisition(asset_uid=other_uid),
+            )
+
+    def test_atlas_missing_approved_asset_fails(self):
+        with self.assertRaisesRegex(RuntimeError, rf"missing approved asset_uids={self.asset_uid}:vertical"):
+            batch_mpt_worker._validate_approved_materialization(
+                self.atlas_selection(), SimpleNamespace(materials=()),
+            )
+
+    def test_atlas_extra_unapproved_asset_fails(self):
+        other_uid = "123e4567-e89b-12d3-a456-426614174001"
+        acquisition = SimpleNamespace(materials=(
+            *self.atlas_acquisition().materials,
+            self.atlas_acquisition(asset_uid=other_uid).materials[0],
+        ))
+        with self.assertRaisesRegex(RuntimeError, rf"unapproved asset_uids={other_uid}:vertical"):
+            batch_mpt_worker._validate_approved_materialization(
+                self.atlas_selection(), acquisition,
+            )
+
+    def test_non_atlas_identity_semantics_are_unchanged(self):
+        selection = SimpleNamespace(decisions=(
+            SimpleNamespace(candidate=SimpleNamespace(provider="pexels", canonical_id="pexels:1")),
+        ))
+        acquisition = SimpleNamespace(materials=(
+            MaterialInfo(
+                provider="pexels",
+                url="/tmp/pexels.mp4",
+                duration=5,
+                source_info={"asset_id": "pexels:1"},
+            ),
+        ))
+        batch_mpt_worker._validate_approved_materialization(selection, acquisition)

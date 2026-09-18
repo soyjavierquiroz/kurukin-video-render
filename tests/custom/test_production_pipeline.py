@@ -503,8 +503,8 @@ class ProductionPipelineTests(unittest.TestCase):
                 "duration": 4.9,
                 "selected_asset": {
                     "asset_uid": asset_uid,
-                    "canonical_id": asset_uid,
-                    "dedupe_key": f"atlas:{asset_uid}",
+                    "canonical_id": f"{asset_uid}:vertical",
+                    "dedupe_key": f"atlas:{asset_uid}:vertical",
                     "provider": "atlas",
                     "duration": 5,
                     "source_duration": 5,

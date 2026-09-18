@@ -406,17 +406,67 @@ def _stage_human_review_timeline(
 
 def _validate_approved_materialization(selection: object, acquisition: object) -> None:
     """Fail before staging/render if materialization drifted from frozen UIDs."""
+
+    def approved_identity(decision: object) -> str:
+        """Return the frozen canonical identity for one selected candidate."""
+        candidate = getattr(decision, "candidate", None)
+        return str(getattr(candidate, "canonical_id", "") or "")
+
+    def materialized_identity(info: object) -> str:
+        """Return the durable identity recorded by material acquisition.
+
+        Atlas rendition is part of the frozen asset identity.  Its material
+        record deliberately stores the two durable fields separately, so
+        reconstruct the exact canonical ID here rather than comparing a bare
+        asset UUID.  Other providers retain their established identity field.
+        """
+        source_info = getattr(info, "source_info", {}) or {}
+        provider = str(getattr(info, "provider", "") or "")
+        if provider == "atlas":
+            if not isinstance(source_info, dict):
+                raise RuntimeError(
+                    "approved renderer manifest integrity failed: "
+                    "Atlas materialization is missing source identity"
+                )
+            asset_uid = source_info.get("asset_uid")
+            rendition_kind = source_info.get("rendition_kind")
+            if not (
+                isinstance(asset_uid, str)
+                and asset_uid
+                and isinstance(rendition_kind, str)
+                and rendition_kind
+            ):
+                raise RuntimeError(
+                    "approved renderer manifest integrity failed: "
+                    "Atlas materialization is missing asset_uid or rendition_kind"
+                )
+            from app.custom.atlas_client import (
+                AtlasInvalidRequestError,
+                validate_asset_uid,
+                validate_rendition_kind,
+            )
+
+            try:
+                return (
+                    f"{validate_asset_uid(asset_uid)}:"
+                    f"{validate_rendition_kind(rendition_kind)}"
+                )
+            except AtlasInvalidRequestError as exc:
+                raise RuntimeError(
+                    "approved renderer manifest integrity failed: "
+                    "Atlas materialization has invalid asset_uid or rendition_kind"
+                ) from exc
+        if not isinstance(source_info, dict):
+            return ""
+        return str(source_info.get("asset_id") or source_info.get("asset_uid") or "")
+
     expected = {
-        str(getattr(decision.candidate, "canonical_id", "") or "")
+        approved_identity(decision)
         for decision in (getattr(selection, "decisions", ()) or ())
     }
     expected.discard("")
     materialized = {
-        str(
-            (getattr(info, "source_info", {}) or {}).get("asset_id")
-            or (getattr(info, "source_info", {}) or {}).get("asset_uid")
-            or ""
-        )
+        materialized_identity(info)
         for info in (getattr(acquisition, "materials", ()) or ())
     }
     materialized.discard("")
