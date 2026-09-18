@@ -163,6 +163,42 @@ def _as_dict(value: Any) -> dict[str, Any]:
 def _safe_metadata(candidate: Any) -> dict[str, Any]:
     source_info = getattr(candidate, "source_info", None)
     metadata = dict(source_info) if isinstance(source_info, dict) else {}
+    if str(getattr(candidate, "provider", "") or "") == "atlas":
+        # Atlas delivery locators are useful only while the private runtime is
+        # preparing a preview.  A review plan needs the stable rendition
+        # identity for later materialization, but must not carry storage or
+        # delivery details into the operator-facing candidate payload.
+        evidence = metadata.get("evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        safe_atlas = {
+            key: metadata[key]
+            for key in ("asset_uid", "rendition_kind", "duration_seconds")
+            if key in metadata
+        }
+        for key in (
+            "visual_summary",
+            "standalone_meaning",
+            "subjects",
+            "actions",
+            "setting",
+            "visible_emotions",
+            "use_cases",
+            "negative_use_cases",
+        ):
+            value = evidence.get(key, metadata.get(key))
+            if value not in (None, "", [], {}):
+                safe_atlas[key] = value
+        editorial_confidence = evidence.get(
+            "editorial_confidence", metadata.get("editorial_confidence", metadata.get("confidence")),
+        )
+        if editorial_confidence not in (None, "", [], {}):
+            safe_atlas["editorial_confidence"] = editorial_confidence
+        editorial_status = evidence.get(
+            "editorial_status", evidence.get("status", metadata.get("editorial_status", metadata.get("status"))),
+        )
+        if editorial_status not in (None, "", [], {}):
+            safe_atlas["editorial_status"] = editorial_status
+        metadata = safe_atlas
     for key in ("duration", "width", "height", "orientation", "filename"):
         value = getattr(candidate, key, None)
         if value not in (None, ""):

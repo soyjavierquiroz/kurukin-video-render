@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from math import isfinite
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -155,6 +156,18 @@ def validate_logical_locator(locator: str, asset_uid: str, rendition_kind: str, 
     return locator
 
 
+def _rendition_duration_seconds(value: Any) -> float | None:
+    """Return only a finite, positive stored Atlas rendition duration.
+
+    Atlas owns this value.  In particular, an absent or unusable value stays
+    absent here rather than being estimated from retrieval or timeline data.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    duration = float(value)
+    return duration if isfinite(duration) and duration > 0 else None
+
+
 def atlas_candidate_to_material_candidate(candidate: Mapping[str, Any], *, search_term: str, ordinal: int) -> MaterialCandidate:
     """Convert one frozen Atlas result without promoting its local score to rank."""
     if not isinstance(candidate, Mapping):
@@ -173,6 +186,7 @@ def atlas_candidate_to_material_candidate(candidate: Mapping[str, Any], *, searc
     content_locator = validate_logical_locator(rendition.get("content_locator"), uid, kind, "content")
     thumbnail_value = rendition.get("thumbnail_locator")
     thumbnail_locator = None if thumbnail_value is None else validate_logical_locator(thumbnail_value, uid, kind, "thumbnail")
+    duration_seconds = _rendition_duration_seconds(rendition.get("duration_seconds"))
     required = (
         "source_provenance", "catalog_placement", "confidence", "atlas_local_score",
         "score_components", "requirement_matches", "contradictions", "evidence",
@@ -184,6 +198,7 @@ def atlas_candidate_to_material_candidate(candidate: Mapping[str, Any], *, searc
     source_info = {
         "asset_uid": uid,
         "rendition_kind": kind,
+        "duration_seconds": duration_seconds,
         "provenance": candidate["source_provenance"],
         "catalog_placement": candidate["catalog_placement"],
         "confidence": candidate["confidence"],
@@ -202,6 +217,7 @@ def atlas_candidate_to_material_candidate(candidate: Mapping[str, Any], *, searc
         search_term=search_term,
         rank=ordinal,
         url=None,
+        duration=duration_seconds,
         orientation={"horizontal": "landscape", "vertical": "portrait"}[kind],
         source_info=source_info,
     )

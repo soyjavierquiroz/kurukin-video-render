@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 from urllib.parse import urlencode
@@ -276,8 +277,17 @@ def _asset_ratio(metadata: dict) -> str:
     return f"{width // divisor}x{height // divisor}"
 
 
+def _editorial_text(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return " · ".join(
+            text for item in value
+            if (text := _clean_text(item))
+        )
+    return _clean_text(value)
+
+
 def show_asset_metadata(asset: dict) -> None:
-    """Render concise, optional editorial metadata supplied by Asset Hub."""
+    """Render concise, optional editorial metadata from any provider."""
     metadata = _asset_metadata(asset)
     duration = _asset_duration(asset)
     ratio = _asset_ratio(metadata)
@@ -288,6 +298,10 @@ def show_asset_metadata(asset: dict) -> None:
         technical.append(ratio)
     if technical:
         st.caption(" · ".join(technical))
+
+    summary = _editorial_text(metadata.get("visual_summary"))
+    if summary:
+        st.caption(summary)
 
     for label, key in (("Topic", "primary_topic"), ("Theme", "primary_theme")):
         value = str(metadata.get(key) or "").strip()
@@ -309,6 +323,30 @@ def show_asset_metadata(asset: dict) -> None:
         value = str(metadata.get(key) or "").strip()
         if value:
             st.caption(f"{label}: {value}")
+
+    details = []
+    for label, key in (
+        ("Meaning", "standalone_meaning"),
+        ("Subjects", "subjects"),
+        ("Actions", "actions"),
+        ("Setting", "setting"),
+        ("Emotions", "visible_emotions"),
+        ("Use cases", "use_cases"),
+        ("Avoid for", "negative_use_cases"),
+        ("Editorial confidence", "editorial_confidence"),
+        ("Editorial status", "editorial_status"),
+        ("Rendition", "rendition_kind"),
+        ("Orientation", "orientation"),
+    ):
+        value = _editorial_text(metadata.get(key))
+        if value:
+            details.append((label, value))
+    if details:
+        expander = getattr(st, "expander", None)
+        container = expander("Editorial details", expanded=False) if callable(expander) else nullcontext()
+        with container:
+            for label, value in details:
+                st.caption(f"{label}: {value}")
 
 
 def _reorder_backup(plan_file: Path, segment_id: str, backups: list[dict], index: int, delta: int) -> None:
