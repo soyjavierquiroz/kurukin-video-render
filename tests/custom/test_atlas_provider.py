@@ -4,6 +4,7 @@ from uuid import uuid4
 from app.custom.atlas_client import AtlasInvalidRequestError, AtlasProtocolError
 from app.custom.atlas_provider import AtlasProvider, build_atlas_search_payload
 from app.custom.material_selection import _is_orientation_compatible
+from app.models.schema import VideoAspect
 
 
 UID = str(uuid4())
@@ -70,6 +71,30 @@ class TestAtlasProvider(unittest.TestCase):
 
         self.assertEqual(payload["preferences"]["preferred_rendition_kind"], "horizontal")
         self.assertEqual(payload["requirements"]["rendition"], {
+            "acceptable_kinds": ["horizontal", "vertical"],
+            "preferred_kind": "horizontal",
+            "preferred_required": True,
+        })
+
+    def test_video_aspect_portrait_requires_vertical_rendition(self):
+        client = FakeClient([])
+        AtlasProvider(client).search({
+            "atlas_scope": {"kind": "general"}, "aspect_ratio": VideoAspect.portrait,
+        })
+
+        self.assertEqual(client.payload["requirements"]["rendition"], {
+            "acceptable_kinds": ["horizontal", "vertical"],
+            "preferred_kind": "vertical",
+            "preferred_required": True,
+        })
+
+    def test_video_aspect_landscape_requires_horizontal_rendition(self):
+        client = FakeClient([])
+        AtlasProvider(client).search({
+            "atlas_scope": {"kind": "general"}, "aspect_ratio": VideoAspect.landscape,
+        })
+
+        self.assertEqual(client.payload["requirements"]["rendition"], {
             "acceptable_kinds": ["horizontal", "vertical"],
             "preferred_kind": "horizontal",
             "preferred_required": True,

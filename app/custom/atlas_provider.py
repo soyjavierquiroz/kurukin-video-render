@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -79,7 +80,10 @@ def _orientation_preference(request_data: Mapping[str, Any]) -> str | None:
         request_data.get("orientation"), request_data.get("aspect_ratio"),
         request_data.get("format"), request_data.get("video_orientation"),
     )
-    normalized = {str(value or "").strip().lower().replace(" ", "") for value in values}
+    normalized = {
+        str(value.value if isinstance(value, Enum) else value or "").strip().lower().replace(" ", "")
+        for value in values
+    }
     if normalized & {"landscape", "16:9", "16/9", "horizontal"}:
         return "horizontal"
     if normalized & {"portrait", "9:16", "9/16", "vertical"}:
