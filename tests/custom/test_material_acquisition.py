@@ -221,6 +221,22 @@ class TestMaterialAcquisition(unittest.TestCase):
         self.assertEqual(result.materials[0].source_info, candidate.source_info)
         self.assertEqual(calls, [("123e4567-e89b-12d3-a456-426614174000", "vertical", Path(self.tmp.name) / "tasks/t1/materials")])
 
+    def test_atlas_without_materializer_fails_closed(self):
+        candidate = MaterialCandidate(
+            "atlas", "not-used", "atlas:selected", "atlas scene",
+            source_info={
+                "asset_uid": "123e4567-e89b-12d3-a456-426614174000",
+                "rendition_kind": "vertical",
+            },
+        )
+        with patch("app.custom.material_acquisition.utils.storage_dir", self.storage), \
+             patch("app.custom.material_acquisition.material.download_material_candidate", side_effect=AssertionError("no fallback"), create=True):
+            with self.assertRaisesRegex(MaterialAcquisitionError, "Atlas materializer capability is required"):
+                acquire_selected_materials(
+                    selection_result=SimpleNamespace(decisions=(decision(candidate),)),
+                    task_id="t1",
+                )
+
     def test_atlas_materialization_failure_does_not_fallback(self):
         candidate = MaterialCandidate(
             "atlas", "not-used", "atlas:selected", "atlas scene",

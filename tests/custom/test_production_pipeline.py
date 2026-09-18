@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 from scripts import produce_batch
@@ -488,6 +488,69 @@ class ProductionPipelineTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual([item.candidate.canonical_id for item in acquire.call_args.kwargs["selection_result"].decisions], ["approved-A"])
+        terms.assert_not_called(); discover.assert_not_called(); select.assert_not_called()
+        start_task.assert_called_once()
+
+    def test_master_materializes_frozen_atlas_selection_with_runtime_capability(self):
+        """Approved Atlas selections use delivery, never a new discovery pass."""
+        asset_uid = "123e4567-e89b-12d3-a456-426614174000"
+        plan_path = self.root / "atlas-approved-plan.json"
+        plan_path.write_text(json.dumps({
+            "review_status": "approved",
+            "duration": 4.9,
+            "segments": [{
+                "segment_id": "segment-001",
+                "duration": 4.9,
+                "selected_asset": {
+                    "asset_uid": asset_uid,
+                    "canonical_id": asset_uid,
+                    "dedupe_key": f"atlas:{asset_uid}",
+                    "provider": "atlas",
+                    "duration": 5,
+                    "source_duration": 5,
+                    "metadata": {
+                        "asset_uid": asset_uid,
+                        "rendition_kind": "vertical",
+                        "duration": 5,
+                    },
+                },
+                "backup_assets": [],
+            }],
+        }), encoding="utf-8")
+        delivered = self.artifact("atlas-delivery.mp4")
+        materializer = SimpleNamespace(materialize=Mock(return_value=delivered))
+        runtime = SimpleNamespace(materializer=materializer)
+
+        def start(_task_id, _params, *, stop_at):
+            self.assertEqual(stop_at, "video")
+            self.assertEqual(_params.video_source, "local")
+            self.artifact("final-1.mp4")
+            return {}
+
+        with patch("app.custom.atlas_runtime.build_atlas_runtime_from_env", return_value=runtime) as build_runtime, \
+             patch("app.custom.material_acquisition.utils.storage_dir", return_value=self.root / "storage"), \
+             patch("app.custom.material_acquisition.KurukinAssetProvider") as asset_hub, \
+             patch("app.custom.material_acquisition.material.download_material_candidate", side_effect=AssertionError("no provider fallback"), create=True) as download, \
+             patch.object(batch_mpt_worker, "_stage_human_review_timeline", return_value=([], self.root / "timeline")), \
+             patch("app.services.task.start", side_effect=start) as start_task, \
+             patch("app.services.task.generate_terms") as terms, \
+             patch("app.services.task.discover_material_candidates") as discover, \
+             patch("app.services.task.select_material_candidates") as select:
+            result = batch_mpt_worker.run_master({
+                "production_plan_path": plan_path.as_posix(),
+                "task_id": "task-atlas",
+                "task_dir": self.task_dir.as_posix(),
+                "stem": "story",
+                "script": "script",
+                "audio_file": self.mp3.as_posix(),
+            })
+
+        self.assertTrue(result["ok"])
+        build_runtime.assert_called_once_with()
+        materializer.materialize.assert_called_once()
+        self.assertEqual(materializer.materialize.call_args.args[:2], (asset_uid, "vertical"))
+        asset_hub.assert_not_called()
+        download.assert_not_called()
         terms.assert_not_called(); discover.assert_not_called(); select.assert_not_called()
         start_task.assert_called_once()
 

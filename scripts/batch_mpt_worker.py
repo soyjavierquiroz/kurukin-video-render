@@ -412,7 +412,11 @@ def _validate_approved_materialization(selection: object, acquisition: object) -
     }
     expected.discard("")
     materialized = {
-        str((getattr(info, "source_info", {}) or {}).get("asset_id") or "")
+        str(
+            (getattr(info, "source_info", {}) or {}).get("asset_id")
+            or (getattr(info, "source_info", {}) or {}).get("asset_uid")
+            or ""
+        )
         for info in (getattr(acquisition, "materials", ()) or ())
     }
     materialized.discard("")
@@ -431,6 +435,7 @@ def _validate_approved_materialization(selection: object, acquisition: object) -
 
 def run_master(manifest: dict) -> dict:
     from app.custom import human_review
+    from app.custom.atlas_runtime import build_atlas_runtime_from_env
     from app.custom.material_acquisition import acquire_selected_materials
     from app.models.schema import VideoParams
     from app.services import task
@@ -470,11 +475,23 @@ def run_master(manifest: dict) -> dict:
             f"backups={getattr(selection, 'backup_count', 0)} "
             f"total={len(getattr(selection, 'decisions', ()))}"
         )
-        acquisition = acquire_selected_materials(
-            selection_result=selection,
-            task_id=manifest["task_id"],
-            approved_plan=plan,
-        )
+        acquisition_kwargs = {
+            "selection_result": selection,
+            "task_id": manifest["task_id"],
+            "approved_plan": plan,
+        }
+        # Frozen review selections retain Atlas' durable identity, so master
+        # needs the same delivery capability as autonomous acquisition.  This
+        # is materialization only: it neither re-runs discovery nor changes
+        # the approved selection.
+        if any(
+            getattr(decision.candidate, "provider", "") == "atlas"
+            for decision in getattr(selection, "decisions", ())
+        ):
+            atlas_runtime = build_atlas_runtime_from_env()
+            if atlas_runtime is not None:
+                acquisition_kwargs["atlas_materializer"] = atlas_runtime.materializer
+        acquisition = acquire_selected_materials(**acquisition_kwargs)
         _validate_approved_materialization(selection, acquisition)
 
         staged_materials, timeline_dir = (
